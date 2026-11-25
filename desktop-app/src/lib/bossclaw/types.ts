@@ -16,9 +16,10 @@ export type ExecutionMode = 'review' | 'auto';
 // 招聘平台（多平台适配：BOSS 基础上新增 猎聘 / 智联招聘 / 前程无忧 51Job）
 export type JobPlatform = 'boss' | 'liepin' | 'zhaopin' | 'job51';
 
-// 预设提供商：OpenAI / DeepSeek / 通义千问 / 智谱 GLM / 硅基流动 / 火山方舟 / 自定义
-// （硅基流动、火山方舟参考 AI-BossJob 的多模型接入，均为 OpenAI 兼容端点）
-export type ModelProvider = 'openai' | 'deepseek' | 'qwen' | 'zhipu' | 'siliconflow' | 'volces' | 'custom';
+// 预设提供商：OpenAI / DeepSeek / 通义千问 / 智谱 GLM / 硅基流动 / 火山方舟 / WorkBuddy / 自定义
+// （硅基流动、火山方舟参考 AI-BossJob 的多模型接入，均为 OpenAI 兼容端点；
+//  workbuddy 走本机桌面端登录态 + 主进程代理，不是 OpenAI 兼容端点，也不需要 apiKey）
+export type ModelProvider = 'openai' | 'deepseek' | 'qwen' | 'zhipu' | 'siliconflow' | 'volces' | 'workbuddy' | 'custom';
 
 // HR 活跃度过滤：由用户在设置中指定（确定性规则，非 AI 判断），用于跳过长期不活跃的岗位
 // 7 级口径对齐 AI-BossJob（在线/刚刚活跃/今日活跃/3日内活跃/本周活跃/本月活跃/半年前活跃）

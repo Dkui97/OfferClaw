@@ -62,6 +62,7 @@ import {
   FolderOpenOutlined,
   SaveOutlined,
   GlobalOutlined,
+  CloudOutlined,
   ArrowUpOutlined,
   ArrowDownOutlined,
   SwapOutlined,
@@ -328,6 +329,85 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
     refreshAICacheStats();
   }, []);
 
+  // ===== WorkBuddy 本机登录态（token 只留在主进程，渲染层只拿状态 / 模型 / 文本）=====
+  const [wbStatus, setWbStatus] = useState<{
+    ok: boolean; loggedIn: boolean; nickname?: string; uid?: string;
+    code?: string; message?: string; expiresAt?: number;
+  } | null>(null);
+  const [wbModels, setWbModels] = useState<WorkBuddyModel[]>([]);
+  const [wbModelsError, setWbModelsError] = useState('');
+  const [wbSelectedModel, setWbSelectedModel] = useState('');
+  const [wbLoading, setWbLoading] = useState(false);
+  const [wbTesting, setWbTesting] = useState(false);
+  const [wbTestResult, setWbTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+
+  const refreshWorkBuddy = useCallback(async (force = false) => {
+    setWbLoading(true);
+    try {
+      const [st, ms] = await Promise.all([
+        electronApi.workbuddy.status(),
+        electronApi.workbuddy.models(force),
+      ]);
+      setWbStatus(st);
+      setWbModels(ms.ok ? (ms.models || []) : []);
+      setWbModelsError(ms.ok ? '' : (ms.error || '模型列表获取失败'));
+    } finally {
+      setWbLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!wbModels.length) return;
+    setWbSelectedModel((cur) =>
+      cur && wbModels.some((m) => m.id === cur) ? cur : (wbModels.find((m) => m.default)?.id || wbModels[0].id)
+    );
+  }, [wbModels]);
+
+  /** 连接自检：真实发一次最小请求，空内容按失败处理；允许用未保存的草稿模型测试 */
+  const runWorkBuddyTest = async (modelName?: string): Promise<{ ok: boolean; msg: string }> => {
+    const r = await electronApi.workbuddy.chat(
+      {
+        model: modelName || config.model.model || 'auto',
+        messages: [
+          { role: 'system', content: '你只需要回复 OK 两个字母，不要输出其他内容。' },
+          { role: 'user', content: 'ping' },
+        ],
+        temperature: 0,
+        max_tokens: 16,
+      },
+      { test: true, timeoutMs: 30000 }
+    );
+    if (!r.ok) return { ok: false, msg: r.error || 'WorkBuddy 请求失败' };
+    let text = '';
+    try { text = String(JSON.parse(r.text)?.choices?.[0]?.message?.content || '').trim(); } catch { /* 响应不可解析按空内容处理 */ }
+    if (!text) return { ok: false, msg: '接口返回空内容（可能模型不可用或积分不足）' };
+    return { ok: true, msg: `模型输出：${text.slice(0, 40)}` };
+  };
+
+  const onWorkBuddyTest = async () => {
+    setWbTesting(true);
+    setWbTestResult(null);
+    try {
+      const r = await runWorkBuddyTest(wbSelectedModel || config.model.model);
+      setWbTestResult(r);
+      if (r.ok) message.success('WorkBuddy 连接成功');
+      else message.error('连接失败：' + r.msg);
+    } catch (e: any) {
+      setWbTestResult({ ok: false, msg: e?.message || String(e) });
+    } finally {
+      setWbTesting(false);
+    }
+  };
+
+  const onUseWorkBuddy = () => {
+    const id = wbSelectedModel || 'auto';
+    // 只切 provider / 模型，保留手动接口的 Base URL / API Key 作为回退
+    setModel({ provider: 'workbuddy', model: id });
+    setTestResult(null);
+    setWbTestResult(null);
+    message.success(`已切换到 WorkBuddy，模型：${id}`);
+  };
+
   const [bridge, setBridge] = useState<{ ok: boolean; version?: string } | null>(null);
   const [bridgeLoading, setBridgeLoading] = useState(false);
   const importRef = useRef<HTMLInputElement>(null);
@@ -370,6 +450,7 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
     refreshCamoufox(true);
     refreshAllPlatformStatus();
     refreshWebviewStatus();
+    refreshWorkBuddy();
     if (cloakE.cloakStatus) {
       cloakE.cloakStatus().then((st: any) => setCloakReady(Boolean(st?.ready))).catch(() => {});
     }
@@ -575,6 +656,21 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
   };
 
   const testConnection = async () => {
+    if (config.model.provider === 'workbuddy') {
+      setTesting(true);
+      setTestResult(null);
+      try {
+        const r = await runWorkBuddyTest();
+        setTestResult(r);
+        if (r.ok) message.success('WorkBuddy 连接成功！');
+        else message.error('连接失败：' + r.msg);
+      } catch (e: any) {
+        setTestResult({ ok: false, msg: e?.message || String(e) });
+      } finally {
+        setTesting(false);
+      }
+      return;
+    }
     if (!isLLMConfigured()) {
       message.warning('请先填写 Base URL / API Key / 模型名');
       return;
@@ -1830,8 +1926,8 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
                 </div>
                 大模型服务商与 API 接入
               </div>
-              <Tag color={llmReady ? 'green' : 'orange'}>
-                {llmReady ? '配置完整' : '待完善配置'}
+              <Tag color={llmReady && !(config.model.provider === 'workbuddy' && !wbStatus?.loggedIn) ? 'green' : 'orange'}>
+                {!llmReady ? '待完善配置' : (config.model.provider === 'workbuddy' && !wbStatus?.loggedIn) ? '待登录 WorkBuddy' : '配置完整'}
               </Tag>
             </div>
 
@@ -2075,6 +2171,141 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
 
             <Paragraph type="secondary" style={{ marginTop: 14, marginBottom: 0, fontSize: 13 }}>
               🔒 API Key 保存在本机 localStorage（<strong>明文存储，应用未做额外加密</strong>），仅用于直连你在上方配置的模型服务商，绝不会上传至第三方服务器；请避免在共用设备上使用。未配置时职业画像与岗位匹配将自动回退到本地规则初稿。
+            </Paragraph>
+          </div>
+
+          {/* WorkBuddy：复用本机桌面端登录态，无需 API Key；凭据始终留在主进程内存 */}
+          <div className="settings-section-card">
+            <div className="settings-section-header">
+              <div className="settings-section-header__title">
+                <div className="section-icon-box">
+                  <CloudOutlined />
+                </div>
+                WorkBuddy 本机登录态
+              </div>
+              <Space size={4}>
+                {wbStatus?.loggedIn
+                  ? <Tag color="green">已登录{wbStatus.nickname ? ` · ${wbStatus.nickname}` : ''}</Tag>
+                  : <Tag color="orange">未登录</Tag>}
+                <Tag color={config.model.provider === 'workbuddy' ? 'purple' : 'default'}>
+                  {config.model.provider === 'workbuddy' ? '当前使用中' : '备用通道'}
+                </Tag>
+              </Space>
+            </div>
+
+            <Paragraph type="secondary" style={{ marginTop: 0, marginBottom: 12, fontSize: 13 }}>
+              读取本机 WorkBuddy / CodeBuddy 桌面端已保存的登录态调用大模型，<b>无需填写 API Key 或 Base URL</b>。
+              Token 只在本应用主进程内存中使用，不会下发到界面、写入日志或上传；上方手动 OpenAI 兼容接口继续保留作为回退。
+              该接入属于非官方用法，客户端升级后接口可能变化。
+            </Paragraph>
+
+            {!wbStatus?.loggedIn && (
+              <Alert
+                type="warning"
+                showIcon
+                style={{ borderRadius: 8, marginBottom: 12 }}
+                message="未检测到 WorkBuddy 桌面端登录态"
+                description={wbStatus?.message || '请先安装并登录 WorkBuddy / CodeBuddy 桌面端，然后点击「重新检测」。'}
+              />
+            )}
+
+            <div className="settings-grid">
+              <div className="sg-item">
+                <span className="field-label">登录状态</span>
+                <Space wrap>
+                  <Button size="small" icon={<RedoOutlined />} loading={wbLoading} onClick={() => refreshWorkBuddy(false)}>
+                    重新检测
+                  </Button>
+                  {wbStatus?.loggedIn && (
+                    <Text type="secondary" style={{ fontSize: 12 }}>账号：{wbStatus.nickname || wbStatus.uid || '已登录'}</Text>
+                  )}
+                </Space>
+              </div>
+              <div className="sg-item">
+                <span className="field-label">
+                  可用模型
+                  <Tooltip title="列表来自当前账号的 WorkBuddy 接口，已过滤图片 / 视频类模型；缓存 5 分钟，点「刷新列表」可强制更新。">
+                    <InfoCircleOutlined className="field-label__hint" />
+                  </Tooltip>
+                </span>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <Select
+                    style={{ flex: 1, minWidth: 0 }}
+                    value={wbSelectedModel || undefined}
+                    onChange={(v) => { setWbSelectedModel(v); setWbTestResult(null); }}
+                    placeholder={wbStatus?.loggedIn ? '选择模型' : '请先登录桌面端'}
+                    disabled={!wbStatus?.loggedIn || !wbModels.length}
+                    options={wbModels.map((m) => ({
+                      value: m.id,
+                      label: (
+                        <Space size={6} wrap={false}>
+                          <Text>{m.name}</Text>
+                          {m.credits ? <Text type="secondary" style={{ fontSize: 12 }}>{m.credits}</Text> : null}
+                          {m.default ? <Tag style={{ margin: 0 }}>默认</Tag> : null}
+                          {m.badges.slice(0, 2).map((b) => (
+                            <Tag key={b.text} color={b.color} style={{ margin: 0 }}>{b.text}</Tag>
+                          ))}
+                        </Space>
+                      ),
+                    }))}
+                  />
+                  <Button
+                    size="small"
+                    icon={<RedoOutlined />}
+                    loading={wbLoading}
+                    disabled={!wbStatus?.loggedIn}
+                    onClick={() => refreshWorkBuddy(true)}
+                  >
+                    刷新列表
+                  </Button>
+                </div>
+                {wbModelsError && wbStatus?.loggedIn && (
+                  <Text type="warning" style={{ fontSize: 12 }}>{wbModelsError}（可点「刷新列表」重试）</Text>
+                )}
+              </div>
+              <div className="sg-item">
+                <span className="field-label">
+                  推理强度
+                  <Tooltip title="对应上游 reasoning_effort；不认识该参数的老网关会自动去掉后重试。连接自检不带该参数。">
+                    <InfoCircleOutlined className="field-label__hint" />
+                  </Tooltip>
+                </span>
+                <Segmented
+                  block
+                  value={['low', 'medium', 'high'].includes(String(config.model.thinking?.effort)) ? String(config.model.thinking.effort) : 'medium'}
+                  onChange={(v) => setModel({ thinking: { ...config.model.thinking, effort: v as string } })}
+                  options={[
+                    { value: 'low', label: '低' },
+                    { value: 'medium', label: '中' },
+                    { value: 'high', label: '高' },
+                  ]}
+                />
+              </div>
+            </div>
+
+            <div className="setting-actions" style={{ marginTop: 12 }}>
+              <Space wrap>
+                <Button type="primary" icon={<CheckCircleOutlined />} disabled={!wbStatus?.loggedIn || !wbSelectedModel} onClick={onUseWorkBuddy}>
+                  启用 WorkBuddy 模型
+                </Button>
+                <Button icon={<ApiOutlined />} loading={wbTesting} disabled={!wbStatus?.loggedIn} onClick={onWorkBuddyTest}>
+                  测试连接
+                </Button>
+              </Space>
+            </div>
+
+            {wbTestResult && (
+              <Alert
+                style={{ marginTop: 12, borderRadius: 8 }}
+                type={wbTestResult.ok ? 'success' : 'error'}
+                showIcon
+                message={wbTestResult.ok ? 'WorkBuddy 连接成功' : 'WorkBuddy 连接失败'}
+                description={wbTestResult.msg}
+              />
+            )}
+
+            <Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0, fontSize: 12 }}>
+              仅服务本机当前登录用户，不支持多账号池或对外 API 转发；429 多为频控 / 积分不足，请降低并发稍后重试。AI 生成内容可能有误，请核对后再使用。
             </Paragraph>
           </div>
 

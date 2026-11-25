@@ -15,9 +15,21 @@
 //     为已退役别名（官方仍接收但已由 V4.1-Flash 承接），第三方网关会直接 400 拒绝，故一律不再推荐；
 //   glm-4.x/5.0 → glm-5.3 / glm-5.3-flash / glm-5.2 / glm-5.1 / glm-5；Qwen3.5/3.6 → Qwen3.8；
 //   doubao 2.0 → doubao-seed-2.1（保留 2.0-lite 作为低成本档）。
-import type { ModelProvider } from './types';
+import type { AppConfig, ModelProvider } from './types';
 
 export type LLMProvider = ModelProvider;
+
+/**
+ * 统一判据：当前模型配置能否发起 AI 调用。
+ * WorkBuddy 没有 API Key / Base URL（凭据取本机登录态，留在主进程），只需选定模型；
+ * 其余服务商沿用原有 apiKey + baseUrl + model 口径。
+ * 上层业务必须调用本函数而不是直接判 apiKey，否则 WorkBuddy 会在到达 callModel 前被误判为「未配置」。
+ */
+export function isModelConfigured(model: Pick<AppConfig['model'], 'provider' | 'apiKey' | 'baseUrl' | 'model'> | null | undefined): boolean {
+  if (!model) return false;
+  if (model.provider === 'workbuddy') return Boolean(model.model);
+  return Boolean(model.apiKey && model.baseUrl && model.model);
+}
 
 export interface ProviderPreset {
   baseUrl: string;
@@ -71,6 +83,14 @@ export const PROVIDER_DEFAULTS: Record<LLMProvider, ProviderPreset> = {
     model: 'doubao-seed-2.1-pro',
     models: ['doubao-seed-2.1-pro', 'doubao-seed-2.1-turbo', 'doubao-seed-evolving', 'doubao-seed-2.0-lite'],
     label: '火山方舟',
+  },
+  // WorkBuddy：不使用 baseUrl / apiKey（凭据取本机桌面端登录态，只留在主进程内存）。
+  // 这里的 models 是「模型列表接口不可用时的兜底 id」，实际可用模型以设置页拉取到的列表为准。
+  workbuddy: {
+    baseUrl: '',
+    model: 'auto',
+    models: ['auto', 'deepseek-v4-flash', 'deepseek-v4-pro', 'glm-5.2', 'kimi-k2.7'],
+    label: 'WorkBuddy（本机登录态）',
   },
   custom: { baseUrl: '', model: '', models: [], label: '自定义（OpenAI 兼容）' },
 };

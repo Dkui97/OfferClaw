@@ -16,7 +16,7 @@ import {
   type CamoufoxChatResult, type ChatHistoryEntry, type ChatWatchConversation,
 } from '@/lib/bossclaw/camoufox';
 import {
-  isLockedOut, SAFETY_LIMITS, classifyRiskCode, nextCooldownUntil, checkDeliveryGuards,
+  isLockedOut, cooldownRemaining, SAFETY_LIMITS, classifyRiskCode, nextCooldownUntil, checkDeliveryGuards,
 } from '@/lib/bossclaw/safety';
 import { sharedPacer, markDelivered, resetDeliveredSinceRest } from '@/lib/bossclaw/deliveryThrottle';
 import { batchRestDelayMs } from '@/lib/bossclaw/activityWindow';
@@ -906,6 +906,16 @@ export const useAutoChatStore = create<AutoChatState>((set) => ({
 
   start: (scope?: AutoChatScope) => {
     if (currentRun || useAutoChatStore.getState().chatRunning) return;
+    // 冷却期不得启动：定时任务与控制桥都会直接调 start()，此前它们能绕过引擎内的冷却检查
+    const cfgNow = useSettingsStore.getState().config;
+    if (isLockedOut(cfgNow)) {
+      useRuntimeLogsStore.getState().addChatLog({
+        level: 'warn',
+        stage: 'risk',
+        msg: `账号处于安全冷却期，本次启动已取消（剩余约 ${Math.ceil(cooldownRemaining(cfgNow) / 60000)} 分钟）`,
+      });
+      return;
+    }
     const run: EngineRun = { token: ++nextRunToken, processedIds: new Set<string>(), cancelRequested: false };
     currentRun = run; // 建立互斥（busy）：单一真值，null = 空闲
     const cfg = useSettingsStore.getState().config;

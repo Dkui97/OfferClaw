@@ -30,6 +30,7 @@ import { useAppStore } from '@/store/useAppStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import electronApi from '@/lib/electronApi';
 import { PLATFORM_META, PLATFORM_IDS, PLATFORM_CHIP_PALETTE, platformEnabled, resolvePlatform, type JobPlatform } from '@/lib/bossclaw/platforms';
+import { classifyRiskUrl } from '@/lib/bossclaw/safety';
 import { isWhitelistedUrl, whitelistSitesOf, WHITELIST_GROUPS, type BrowserSite as BrowserWhitelistSite } from '@/lib/bossclaw/browserWhitelist';
 import { registerBrowser, unregisterBrowser, type BrowserApplyOutcome } from '@/lib/browserRegistry';
 import CloakView from '@/components/CloakView';
@@ -159,6 +160,8 @@ interface Props {
   onJoinTask?: (info: { url: string; title: string }) => void;
   onJobExtracted?: (job: any) => void;
   onApplyStage?: (stage: string, data: any, tabId?: string) => void;
+  /** 导航到风控/验证重定向页（403.html?code=32 / verify-slider / security-check）时上报 */
+  onRiskRedirect?: (data: { url: string; code: number | null; message: string }) => void;
   onLoginState?: (data: any) => void;
   onCollectProgress?: (data: any) => void;
   onCollectDone?: (data: any) => void;
@@ -201,7 +204,7 @@ export default function BrowserView(props: Props) {
   return <BrowserViewImpl {...props} />;
 }
 
-function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJobExtracted, onApplyStage, onLoginState, onCollectProgress, onCollectDone, onDomDump, apiRef, overlaySuppressed = false }: Props) {
+function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJobExtracted, onApplyStage, onRiskRedirect, onLoginState, onCollectProgress, onCollectDone, onDomDump, apiRef, overlaySuppressed = false }: Props) {
   const homeMeta = PLATFORM_META[defaultPlatform] || PLATFORM_META.boss;
   const [tabs, setTabs] = useState<TabState[]>(() => {
     const tab = makeTab(homeMeta.homeUrl, homeMeta.label, 'main');
@@ -308,11 +311,13 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
 
   // ===== 事件回调全部用 ref，避免闭包捕获旧值 =====
   const callbacksRef = useRef({
-    onNavigate, onJobExtracted, onApplyStage, onLoginState, onCollectProgress, onCollectDone, onDomDump,
+    onNavigate, onJobExtracted, onApplyStage, onRiskRedirect, onLoginState, onCollectProgress, onCollectDone, onDomDump,
   });
   useEffect(() => {
-    callbacksRef.current = { onNavigate, onJobExtracted, onApplyStage, onLoginState, onCollectProgress, onCollectDone, onDomDump };
+    callbacksRef.current = { onNavigate, onJobExtracted, onApplyStage, onRiskRedirect, onLoginState, onCollectProgress, onCollectDone, onDomDump };
   });
+  // 同一风控页可能连续触发多次导航事件（重定向链），去重避免重复叠加冷却
+  const lastRiskUrlRef = useRef('');
 
   // ===== onNavigate 变化去重：webview 高频回传 nav（URL/标题未变的导航事件、SPA 内重复上报）=====
   // 若每次都调用，Workbench 的 setNav 会以新对象触发整树重渲染（该页是最大组件之一）。
@@ -617,12 +622,22 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
     // ===== 前进/后退状态实时同步 =====
     // 状态由 preload 的 SPA 历史栈经 'nav' 消息上报（canGoBack/canGoForward 基于真实索引）；
     // 此处仅做 URL 兜底同步。did-go-back/did-go-forward 在 SPA 内基本不触发，留作整页导航兜底。
+    // 403.html?code=32 / verify-slider / security-check：此前这些 URL 只留下 ERR_ABORTED 噪音，
+    // 上层从未收到风控信号，冷却 / 降频 / 重登入口都不会触发。
+    const reportRiskUrl = (url: string) => {
+      const risk = classifyRiskUrl(url);
+      if (!risk || lastRiskUrlRef.current === url) return;
+      lastRiskUrlRef.current = url;
+      callbacksRef.current.onRiskRedirect?.({ url, code: risk.code ?? null, message: risk.message });
+    };
+
     el.addEventListener('did-navigate', (event: any) => {
       const url = event?.url;
       if (!url) return;
       touchTab(tabId);
       patchTab(tabId, { url });
       if (tabId === activeIdRef.current) reportNavigate(url, '');
+      reportRiskUrl(url);
       forceResizeWebview(tabId);
     });
     el.addEventListener('did-navigate-in-page', (event: any) => {
@@ -632,6 +647,7 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
           touchTab(tabId);
           patchTab(tabId, { url });
           if (tabId === activeIdRef.current) reportNavigate(url, '');
+          reportRiskUrl(url);
         }
         forceResizeWebview(tabId);
       }

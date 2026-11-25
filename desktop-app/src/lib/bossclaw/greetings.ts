@@ -3,6 +3,7 @@
 // 安全不变量（对齐 AGENTS.md 2.1）：所有提示词与招呼语必须使用求职者第一人称口吻，
 // 仅引用真实简历事实；禁止承诺薪资、到岗时间、面试时间或不存在的能力/经历。
 import type { AppConfig, Profile } from './types';
+import { isModelConfigured } from './providerPresets';
 import { callModel } from './llm';
 import { resolveContextBudget } from './contextBudget';
 import { prepareContextText } from './oversizedContext';
@@ -198,8 +199,8 @@ export async function generateReply(opts: {
   const localResult = (warning: string): ReplyResult => ({
     text: localFallback, method: 'local', outcome: 'continue', sendResume: false, interview: false, warning,
   });
-  if (!opts.model?.apiKey) {
-    return localResult('AI 尚未配置，本次使用通用回复。');
+  if (!isModelConfigured(opts.model)) {
+    return localResult('AI 尚未配置（填写 API Key 或启用 WorkBuddy），本次使用通用回复。');
   }
   const comm = String(opts.communicationInfo || '').trim();
   try {

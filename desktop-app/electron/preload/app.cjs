@@ -135,6 +135,11 @@ const api = {
   // LLM 主进程代理（P05）：渲染层经此转发 OpenAI 兼容请求，规避渲染层 CORS，超时/错误到主进程统一处理
   llmProxy: (url, payload, apiKey, timeoutMs) => ipcRenderer.invoke('jc:llm-proxy', url, payload, apiKey, timeoutMs),
 
+  // WorkBuddy 本机登录态：只暴露状态 / 模型列表 / 对话文本三个受限入口，token 始终留在主进程
+  workbuddyStatus: () => ipcRenderer.invoke('jc:workbuddy-status'),
+  workbuddyModels: (force) => ipcRenderer.invoke('jc:workbuddy-models', force),
+  workbuddyChat: (payload, opts) => ipcRenderer.invoke('jc:workbuddy-chat', payload, opts),
+
   // 网关模型能力探测（/v1/models）：设置页「大模型接入」动态判定上下文/思考等级/模态能力
   modelsProbe: (url, apiKey, timeoutMs) => ipcRenderer.invoke('jc:models-probe', url, apiKey, timeoutMs),
 

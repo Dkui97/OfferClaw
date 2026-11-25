@@ -923,10 +923,22 @@ export default function Workbench() {
 
   const onRetryAllFailed = () => {
     // needsReview（发送结果证据不足）不参与批量重试：可能其实已经发出，重试会造成重复消息。
-    const retryable = pending.filter((p) => p.status === 'failed' && !p.riskBlocked && !p.needsReview);
-    if (!retryable.length) { message.info('没有可重试的失败任务（需人工核对的岗位请单独确认后再重试）'); return; }
-    setPending(pending.map((p) => (p.status === 'failed' && !p.riskBlocked && !p.needsReview ? { ...p, status: 'approved_queue' as const, retryCount: (p.retryCount || 0) + 1, error: '', riskBlocked: false, needsReview: false, approvedAt: Date.now() } : p)));
-    addLog('info', `已重新投递 ${retryable.length} 个失败任务`);
+    // 重试上限 3 次：此前 retryCount 只增不比较，失败任务会被无限次「全部重试」反复打向平台。
+    const MAX_AUTO_RETRY = 3;
+    const eligible = (p: typeof pending[number]) =>
+      p.status === 'failed' && !p.riskBlocked && !p.needsReview && (p.retryCount || 0) < MAX_AUTO_RETRY;
+    const retryable = pending.filter(eligible);
+    const exhausted = pending.filter(
+      (p) => p.status === 'failed' && !p.riskBlocked && !p.needsReview && (p.retryCount || 0) >= MAX_AUTO_RETRY,
+    ).length;
+    if (!retryable.length) {
+      message.info(exhausted
+        ? `失败任务已达自动重试上限（${MAX_AUTO_RETRY} 次），请人工核对后再处理`
+        : '没有可重试的失败任务（需人工核对的岗位请单独确认后再重试）');
+      return;
+    }
+    setPending(pending.map((p) => (eligible(p) ? { ...p, status: 'approved_queue' as const, retryCount: (p.retryCount || 0) + 1, error: '', riskBlocked: false, needsReview: false, approvedAt: Date.now() } : p)));
+    addLog('info', `已重新投递 ${retryable.length} 个失败任务${exhausted ? `（${exhausted} 个已达重试上限，未重试）` : ''}`);
     recomputeStats();
     startDelivery();
   };
@@ -1186,31 +1198,44 @@ export default function Workbench() {
   enrichWelfareRef.current = enrichCollectedWelfare;
 
   // ===== 统一风控处理（API 投递码 / DOM 兜底 risk 事件共用）=====
-  const handleRisk = useCallback((code: number | null | undefined, rawMessage: string) => {
+  const handleRisk = useCallback((code: number | null | undefined, rawMessage: string, opts?: { deferPending?: boolean }) => {
     const signal = classifyRiskCode(code);
     const msg = String(rawMessage || signal?.message || '检测到平台风控信号');
     const severity = signal?.severity || 'challenge';
     // 唯一权威解析：按「设置页的风控冷却（autoCooldownMinutes）」× 风险级别比例，
     // 并受该级别绝对下限约束（详见 safety.ts::resolveCooldownMs）。
     const cooldownMs = resolveCooldownMs(useSettingsStore.getState().config, signal);
-    if (activeId) {
+    // deferPending：非当前投递标签/采集标签撞风控时只做账号保护，不误标正在投递的岗位
+    if (activeId && !opts?.deferPending) {
       updatePending(activeId, { status: 'failed', error: msg, retryable: signal?.retryable === true, riskBlocked: severity === 'banned' });
     }
     addLog(severity === 'banned' || severity === 'challenge' ? 'error' : 'warn', `风控拦截：${msg}`);
     setApplyStage(null);
     recomputeStats();
-    if (severity === 'banned') {
+    // ⚠️ 所有非「登录失效」的风控码都必须写冷却（32/1006 之外还有 35/36/37/38）。
+    // 旧实现只在 banned / rate_limited 分支写 pausedUntil：工作台停了，但自动沟通 / 跟聊 /
+    // 控制桥仍会立即继续发送，等于账号保护只覆盖了一个引擎。
+    if (severity !== 'login') {
       useSettingsStore.getState().setConfig({ pausedUntil: nextCooldownUntil(useSettingsStore.getState().config, signal) });
+    }
+    if (severity === 'banned') {
       pauseAssist(`${msg}。已强制暂停并进入冷却 ${Math.ceil(cooldownMs / 60000)} 分钟，请人工处理，切勿重复重试以免升级封禁。`);
     } else if (severity === 'rate_limited') {
-      useSettingsStore.getState().setConfig({ pausedUntil: nextCooldownUntil(useSettingsStore.getState().config, signal) });
       pauseAssist(`${msg}。已暂停并进入退避冷却 ${Math.ceil(cooldownMs / 60000)} 分钟，之后可重新投递。`);
+    } else if (severity === 'login') {
+      pauseAssist(`${msg}。已暂停投递，请重新登录后再继续。`);
     } else {
-      pauseAssist(`${msg}。已暂停投递：若右侧浏览器出现安全验证，请人工完成后再点"重新投递"。`);
+      pauseAssist(`${msg}。已暂停并冷却 ${Math.ceil(cooldownMs / 60000)} 分钟：若右侧浏览器出现安全验证，请人工完成后再点"重新投递"。`);
     }
     // 窗口可能在托盘里：风控暂停必须让人看见（不是程序坏了，是被平台拦了，需要人工处理）
     notifyRiskPaused(code ?? '-', msg);
   }, [activeId, updatePending, addLog, recomputeStats, pauseAssist]);
+
+  // 内置浏览器导航到 403.html?code=32 / verify-slider / security-check 时由 BrowserView 回传。
+  // 只做账号级保护（冷却 + 通知），不标当前投递岗位 —— 这些 URL 也可能来自采集标签或用户手动浏览。
+  const handleRiskRedirect = useCallback((data: { url: string; code: number | null; message: string }) => {
+    handleRisk(data.code, data.message, { deferPending: true });
+  }, [handleRisk]);
 
   // ===== 投递成功处理（API / DOM 兜底共用）=====
   const handleDelivered = useCallback((candidateId: string, tabId?: string) => {
@@ -2544,6 +2569,14 @@ export default function Workbench() {
     if (stage === 'log') { addLog('info', String(data?.message || '')); return; }
     const current = useDataStore.getState();
     const active = activeId ? current.pending.find((p) => p.id === activeId) : undefined;
+    // 风控优先于跨标签/活跃岗守卫：任何标签撞上安全验证都必须触发账号级冷却，
+    // 否则用户在别的标签或采集过程中撞滑块时，账号保护完全不生效。
+    if (stage === 'risk') {
+      if (domWaitRef.current) { domWaitRef.current('risk', { code: data?.code, message: data?.message || '' }, tabId); return; }
+      const crossTab = Boolean(tabId && activeTabRef.current && tabId !== activeTabRef.current);
+      handleRisk(data?.code, data?.message || '', { deferPending: crossTab || !activeId });
+      return;
+    }
     // 跨标签防串台：只有「本次投递所用标签页」回传的阶段才驱动当前岗位的状态机。
     // 历史现象：上一个岗位超时/失败后其标签页虽有 closeTab，但关闭是异步的，在途回传仍会到达；
     // 这些外来事件会被当成当前岗位的进度（日志里冒出上一个岗位的标题，甚至把阶段写错）。
@@ -2552,13 +2585,6 @@ export default function Workbench() {
     // 暂停时会保留在途投递的 activeId；但若 activeId 已被清空而 DOM 等待槽仍在途，
     // 终态仍必须回写 —— 否则页面照常把招呼语发出去，工作台只能等兜底超时 → 误判「投递失败」。
     if (!active && !domWaitRef.current) return;
-
-    if (stage === 'risk') {
-      if (domWaitRef.current) { domWaitRef.current('risk', { code: data?.code, message: data?.message || '' }, tabId); return; }
-      if (!activeId) return;
-      handleRisk(data?.code, data?.message || '');
-      return;
-    }
     if (stage === 'continue_chat') {
       // 「继续沟通」入口：该岗位已与 HR 建立过会话（此前已沟通过/已投递过），
       // 不再按新投递发招呼语并计成功——移入「自动沟通」队列（status=opened，AutoChat 接管），
@@ -3369,6 +3395,7 @@ export default function Workbench() {
           onJoinTask={onJoinTask}
           onJobExtracted={handleJobExtracted}
           onApplyStage={handleApplyStage}
+          onRiskRedirect={handleRiskRedirect}
           onLoginState={handleLoginState}
           onCollectProgress={handleCollectProgress}
           onCollectDone={handleCollectDone}

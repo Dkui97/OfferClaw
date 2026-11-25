@@ -8,6 +8,17 @@ declare module '@internal/store' {
   export const SALT: number;
 }
 
+/** WorkBuddy 账号可用模型（主进程从本机登录态接口拉取，不含任何凭据） */
+interface WorkBuddyModel {
+  id: string;
+  name: string;
+  credits: string;
+  badges: Array<{ text: string; color: string }>;
+  description: string;
+  context: number;
+  default: boolean;
+}
+
 // 主窗口 preload 暴露的安全接口（electron/preload/app.cjs）
 interface ElectronBridgeApi {
   versions?: { electron?: string; chrome?: string; node?: string };
@@ -20,6 +31,13 @@ interface ElectronBridgeApi {
   // 本地桥（OpenClaw）访问令牌（随机生成，存于 ~/.bossclaw/bridge-token）
   bridgeToken?: () => Promise<string>;
   webviewPreload?: string;
+  // WorkBuddy 本机登录态（token 只在主进程内存，渲染层只能拿到状态 / 模型 / 文本）
+  workbuddyStatus?: () => Promise<{ ok: boolean; loggedIn: boolean; nickname?: string; uid?: string; code?: string; message?: string; expiresAt?: number }>;
+  workbuddyModels?: (force?: boolean) => Promise<{ ok: boolean; models?: WorkBuddyModel[]; error?: string; code?: string; fallbackModels?: string[] }>;
+  workbuddyChat?: (
+    payload: { model?: string; messages: Array<{ role: string; content: string }>; [key: string]: unknown },
+    opts?: { effort?: string; test?: boolean; timeoutMs?: number }
+  ) => Promise<{ ok: boolean; status: number; text: string; error?: string; code?: string }>;
   invoke?: (channel: string, ...args: unknown[]) => Promise<unknown>;
   send?: (channel: string, ...args: unknown[]) => void;
   on?: (channel: string, callback: (...args: unknown[]) => void) => () => void;

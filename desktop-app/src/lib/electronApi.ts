@@ -172,6 +172,51 @@ export const electronApi = {
     }
   },
 
+  // WorkBuddy 本机登录态：token 只在主进程内存，这里只能拿到状态 / 模型 / 文本结果。
+  // 与 llmProxy 一样做「API 缺失即安全降级」，浏览器预览下不会导致 UI 崩溃。
+  workbuddy: {
+    status: async (): Promise<{
+      ok: boolean; loggedIn: boolean; nickname?: string; uid?: string;
+      code?: string; message?: string; expiresAt?: number;
+    }> => {
+      try {
+        const fn = api().workbuddyStatus;
+        if (!fn) return { ok: false, loggedIn: false, message: 'WorkBuddy API 不可用（仅 Electron 可用）' };
+        return (await fn()) as { ok: boolean; loggedIn: boolean; nickname?: string; uid?: string; code?: string; message?: string; expiresAt?: number };
+      } catch (e) {
+        return { ok: false, loggedIn: false, message: (e as Error).message };
+      }
+    },
+    models: async (force = false): Promise<{ ok: boolean; models?: WorkBuddyModel[]; error?: string; code?: string; fallbackModels?: string[] }> => {
+      try {
+        const fn = api().workbuddyModels;
+        if (!fn) return { ok: false, error: 'workbuddyModels 不可用（仅 Electron 可用）' };
+        return (await fn(force)) as { ok: boolean; models?: WorkBuddyModel[]; error?: string; code?: string; fallbackModels?: string[] };
+      } catch (e) {
+        return { ok: false, error: (e as Error).message };
+      }
+    },
+    chat: async (
+      payload: { model?: string; messages: Array<{ role: string; content: string }>; [key: string]: unknown },
+      opts?: { effort?: string; test?: boolean; timeoutMs?: number }
+    ): Promise<{ ok: boolean; status: number; text: string; error?: string; code?: string }> => {
+      try {
+        const fn = api().workbuddyChat;
+        if (!fn) return { ok: false, status: 0, text: '', error: 'workbuddyChat 不可用（仅 Electron 可用）' };
+        const r = (await fn(payload, opts)) as { ok?: boolean; status?: number; text?: string; error?: string; code?: string };
+        return {
+          ok: Boolean(r?.ok),
+          status: Number(r?.status || 0),
+          text: String(r?.text || ''),
+          error: r?.error || undefined,
+          code: r?.code || undefined,
+        };
+      } catch (e) {
+        return { ok: false, status: 0, text: '', error: (e as Error).message };
+      }
+    },
+  },
+
   fetchUrl: async (url: string): Promise<{ ok: boolean; status?: number; text?: string; error?: string }> => {
     try {
       const fn = (api() as { fetchUrl?: (u: string) => Promise<{ ok: boolean; status?: number; text?: string; error?: string }> }).fetchUrl;

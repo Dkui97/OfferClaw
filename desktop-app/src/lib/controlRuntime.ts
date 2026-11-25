@@ -17,7 +17,7 @@ import { writeLocalBackup, restoreFromLocalBackup } from '@/lib/localBackup';
 import { electronApi } from '@/lib/electronApi';
 import { PLATFORM_IDS, platformEnabled, type JobPlatform } from '@/lib/bossclaw/platforms';
 import { isWhitelistedUrl, whitelistHostOf } from '@/lib/bossclaw/browserWhitelist';
-import { SAFETY_LIMITS, isLockedOut, effectiveDailyCap, enabledSentCount, cooldownRemaining } from '@/lib/bossclaw/safety';
+import { SAFETY_LIMITS, isLockedOut, effectiveDailyCap, enabledSentCount, cooldownRemaining, mergeCooldownUntil } from '@/lib/bossclaw/safety';
 import { analyzeJob } from '@/lib/bossclaw/matching';
 import { tailorForJob } from '@/lib/bossclaw/jobAssistant';
 import { buildProfile } from '@/lib/bossclaw/profile';
@@ -224,13 +224,26 @@ const handlers: Record<string, Handler> = {
   pauseDelivery: ({ minutes }) => {
     const m = Math.min(Math.max(Number(minutes) || 30, 1), 1440);
     const prev = useSettingsStore.getState().config.pausedUntil;
-    const next = Date.now() + m * 60_000;
+    // 只放大不缩短：与已有风控冷却合并，避免「暂停 1 分钟」把 120 分钟封禁冷却砍短
+    const next = mergeCooldownUntil(prev, m * 60_000);
     useSettingsStore.getState().setConfig({ pausedUntil: next });
     return { applied: true, message: `投递已暂停 ${m} 分钟（至 ${new Date(next).toLocaleString()}）`, previous: prev, next };
   },
 
   resumeDelivery: () => {
-    const prev = useSettingsStore.getState().config.pausedUntil;
+    const cfg = useSettingsStore.getState().config;
+    const prev = cfg.pausedUntil;
+    const remaining = cooldownRemaining(cfg);
+    // 未到期的安全冷却不允许经控制桥解除：否则 agent 可把 120 分钟封禁冷却一键清零，
+    // 直接击穿「遇险即停」。确认风控已解除后请在应用设置页手动恢复。
+    if (remaining > 0) {
+      return {
+        applied: false,
+        message: `安全冷却未结束（剩余约 ${Math.ceil(remaining / 60000)} 分钟），不允许经控制桥解除；请在应用内确认风控已解除后手动恢复`,
+        previous: prev,
+        next: prev,
+      };
+    }
     useSettingsStore.getState().setConfig({ pausedUntil: 0 });
     return { applied: true, message: '已解除暂停', previous: prev, next: 0 };
   },
@@ -531,9 +544,19 @@ const handlers: Record<string, Handler> = {
   },
   deliverySendNow: async ({ greeting }) => {
     // 安全护栏：仅当用户已开启「全自动」（executionMode==='auto'）时，agent 才能触发自动投递
-    const mode = useSettingsStore.getState().config.executionMode;
+    const cfg = useSettingsStore.getState().config;
+    const mode = cfg.executionMode;
     if (mode !== 'auto') {
       return { applied: false, accepted: false, sent: false, message: '全自动未开启（executionMode 为 review），自动投递已被拒绝；请先在应用内开启全自动，或用 delivery.draft 草拟后由用户发送' };
+    }
+    // 冷却期禁止真实发送：此前只校验 executionMode，MCP 可在 120 分钟封禁冷却内直接派发投递
+    if (isLockedOut(cfg)) {
+      return {
+        applied: false,
+        accepted: false,
+        sent: false,
+        message: `账号处于安全冷却期（剩余约 ${Math.ceil(cooldownRemaining(cfg) / 60000)} 分钟），自动投递已拒绝，请冷却结束后再试`,
+      };
     }
     const b = getBrowser();
     if (!b) return { applied: false, accepted: false, sent: false, message: '浏览器控制不可用（需 webview 引擎运行）' };

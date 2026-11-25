@@ -370,6 +370,26 @@ async function requestModel(url: string, payload: any, apiKey: string, timeoutMs
   }
 }
 
+/**
+ * WorkBuddy 通道：经主进程读取本机登录态并代理对话，渲染层拿不到 token。
+ * 返回与 requestModel 相同的 HttpResponseLike，让 callModel 的重试 / JSON 解析 / 用量统计链路完全复用。
+ * 上游只返回 SSE，由主进程聚合成标准 chat.completion；reasoning_effort 的兼容重试也在主进程完成。
+ */
+async function requestWorkBuddyChat(payload: any, timeoutMs: number, effort: string): Promise<HttpResponseLike> {
+  try {
+    const r = await electronApi.workbuddy.chat(payload, { effort, timeoutMs });
+    if (!r.ok && r.error) throw new AIError('AI_NETWORK', `WorkBuddy 请求失败：${r.error}`);
+    return {
+      ok: r.ok,
+      status: r.status,
+      text: () => Promise.resolve(r.text),
+    };
+  } catch (error: any) {
+    if (error instanceof AIError) throw error;
+    throw new AIError('AI_NETWORK', `WorkBuddy 请求失败：${error?.message || '连接异常'}`);
+  }
+}
+
 const REPAIR_JSON_SYSTEM =
   '你是 JSON 修复助手。下面是一段可能被截断或损坏的 json 文本（可能含 ```json 围栏或多余说明文字）。' +
   '请把它修复、补全为一段合法且完整的 JSON：保持原有字段名与层级不变，只补全被截断的结构，' +
@@ -389,7 +409,7 @@ async function repairJsonViaModel(
   originalPayload: any,
   apiKey: string,
   timeoutMs: number,
-  opts: { maxTokens?: number; systemPrompt?: string } = {}
+  opts: { maxTokens?: number; systemPrompt?: string; send?: (payload: any) => Promise<HttpResponseLike> } = {}
 ): Promise<any | null> {
   const content = String(brokenContent || '').trim();
   if (content.length < 12 || !/[[{]/.test(content)) return null; // 太短/不像 JSON，不值得二次调用
@@ -417,7 +437,7 @@ async function repairJsonViaModel(
   payload[tokenField] = Math.min(Math.max(600, requested), MODEL_MAX_OUTPUT_TOKENS);
   delete payload.thinking; // 修复不需要思考模式
   try {
-    const r = await requestModel(url, payload, apiKey, timeoutMs);
+    const r = await (opts.send ? opts.send(payload) : requestModel(url, payload, apiKey, timeoutMs));
     const body = await r.text();
     if (!r.ok) return null;
     const parsed = JSON.parse(body);
@@ -466,12 +486,15 @@ export async function callModel(messages: ChatMessage[], config: AppConfig['mode
   // P1-11：apiKey 去空白——粘贴进设置时经常带首尾空格，「  sk-xxx  」会被当成有效 Key 发送
   // 并拿到含糊的鉴权报错；统一 trim 后再判定「未配置 → agent 代答」
   const apiKey = String(config?.apiKey || '').trim();
+  // WorkBuddy 不需要 apiKey / baseUrl：凭据取本机桌面端登录态，由主进程代理鉴权与 SSE 聚合
+  const useWorkBuddy = config?.provider === 'workbuddy';
   // 官方要求②兜底：JSON 模式 prompt 必须含 json 字样，并统一注入 JSON 输出契约（幂等）。
   // 已合规时原样透传，不改动 messages（保住服务端 prompt cache 前缀）。
   const effectiveMessages = jsonMode ? ensureJsonPromptContract(messages) : messages;
   // 未配置 API Key：优先交给外部 agent 代答（agent 在线时把任务挂进本地队列，等 agent 用自有模型回填，
   // 结果形态与真实模型调用完全一致）；agent 不在线 / 超时未答 / 主动放弃 → 抛 AIError 由上层走本地规则兜底。
-  if (!apiKey) {
+  // WorkBuddy 例外：它没有 API Key 概念，直接走本机登录态通道。
+  if (!apiKey && !useWorkBuddy) {
     // 「AI 未用上」的行为事实：只在**首次**发生时记一条 WARN（本会话内去重），避免批量分析时刷屏。
     // 归因说清楚是「未配置 API Key」，不是网络超时；引导去设置页配置，不暴露代答通道 / MCP 工具名。
     if (!aiMissingKeyLogged) {
@@ -506,6 +529,15 @@ export async function callModel(messages: ChatMessage[], config: AppConfig['mode
   const thinkingEffort = String(config.thinking?.effort || thinkingProfile.defaultEffort || '');
   const timeoutMs = Number(options.timeoutMs || 90000);
   const temperature = Number(options.temperature ?? config.temperature ?? 0.1);
+  // WorkBuddy 的推理强度是上游 reasoning_effort（low/medium/high），与 OpenAI 兼容端的思考参数无关
+  const workbuddyEffort = ['low', 'medium', 'high'].includes(String(config.thinking?.effort))
+    ? String(config.thinking.effort)
+    : 'medium';
+  /** 唯一传输出口：手动接口走 llmProxy，WorkBuddy 走主进程登录态代理 */
+  const sendModel = (payload: any): Promise<HttpResponseLike> =>
+    useWorkBuddy
+      ? requestWorkBuddyChat(payload, timeoutMs, workbuddyEffort)
+      : requestModel(url, payload, apiKey, timeoutMs);
   // 参数口径的会话记忆键（见 modelParams.ts）：纠偏结论按「服务商|模型|端点」记住
   const paramKey = modelParamKey(config.provider, config.model, config.baseUrl);
 
@@ -553,7 +585,7 @@ export async function callModel(messages: ChatMessage[], config: AppConfig['mode
       }
     }
 
-    let response = await requestModel(url, payload, apiKey, timeoutMs);
+    let response = await sendModel(payload);
     let bodyText = await response.text();
     // 4xx 的两条自适应重试（每次只改一处、总次数有界，避免反复改写把请求刷成死循环）：
     //   ① 参数口径不符 → 按服务端点名的字段改写（issue #28：max_tokens ⇄ max_completion_tokens、
@@ -569,7 +601,7 @@ export async function callModel(messages: ChatMessage[], config: AppConfig['mode
       }
       if (!next) break;
       payload = next; // 记下「真正成功的那份请求体」，供 JSON 补齐调用沿用同一参数口径
-      response = await requestModel(url, next, apiKey, timeoutMs);
+      response = await sendModel(next);
       bodyText = await response.text();
     }
     if (!response.ok) {
@@ -666,6 +698,7 @@ export async function callModel(messages: ChatMessage[], config: AppConfig['mode
   if (parsed === undefined) {
     const viaModel = await repairJsonViaModel(url, content, payload, apiKey, timeoutMs, {
       maxTokens: truncatedFinal ? Math.min(baseMaxTokens * 2, MODEL_MAX_OUTPUT_TOKENS) : baseMaxTokens,
+      send: sendModel,
       systemPrompt: effectiveMessages
         .filter((m) => m.role === 'system')
         .map((m) => m.content)

@@ -4,7 +4,7 @@
 // CloakBrowser 隐身引擎作为**可选**内置浏览器（用户设置切换；与 webview 平行运行）。
 'use strict';
 
-const { app, BrowserWindow, ipcMain, shell, Menu, session, clipboard, dialog, nativeImage, Tray, Notification } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Menu, session, clipboard, dialog, nativeImage, Tray, Notification, net } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
@@ -16,6 +16,10 @@ const { startControlBridge, resolveEnablement } = require('./control-bridge.cjs'
 const stealth = require('./preload/stealth.cjs');
 // 模拟面试会话仓储（主进程文件数据；不进 localStorage / 现有备份体系，见 mockInterviewRepo.cjs 头注释）
 const mockInterviewRepo = require('./mockInterviewRepo.cjs');
+// WorkBuddy 本机登录态：用 net.fetch 走 Chromium 网络栈（系统证书 + 系统代理），
+// 避免公司 TLS 拦截下 Node fetch 的 UNABLE_TO_VERIFY_LEAF_SIGNATURE。
+const { createWorkBuddyClient } = require('./workbuddy-client.cjs');
+const workbuddyClient = createWorkBuddyClient({ fetchImpl: (...args) => net.fetch(...args) });
 // 模拟面试题库（内置库随包、用户库写 userData；索引缓存也是派生文件）
 const mockInterviewBankRepo = require('./mockInterviewBankRepo.cjs');
 // 岗位队列文件仓储（issue #10：把 pending / qualifiedExports 从 localStorage 迁到 <userData>/queue/）
@@ -2885,6 +2889,40 @@ safeHandle('jc:llm-proxy', async (_event, url, payload, apiKey, timeoutMs = 9000
     };
   } finally {
     clearTimeout(timer);
+  }
+});
+
+// ===== WorkBuddy 本机登录态（非官方用法；token 不出主进程）=====
+// 只读本机桌面端 *.info 登录文件；渲染层通过下面三个受限 IPC 拿到状态 / 模型 / 文本结果，
+// 拿不到 accessToken / refreshToken。手动 OpenAI 兼容 provider（jc:llm-proxy）保留为回退。
+safeHandle('jc:workbuddy-status', async () => workbuddyClient.status());
+
+safeHandle('jc:workbuddy-models', async (_event, force) => workbuddyClient.listModels({ force: Boolean(force) }));
+
+safeHandle('jc:workbuddy-chat', async (_event, payload, opts) => {
+  const body = { ...(payload || {}) };
+  // 流式与推理强度由客户端强制控制，忽略渲染层传来的同名字段
+  delete body.stream;
+  delete body.stream_options;
+  delete body.reasoning_effort;
+  try {
+    const result = await workbuddyClient.chat(Array.isArray(body.messages) ? body.messages : [], {
+      model: body.model || 'auto',
+      effort: opts && opts.effort,
+      test: Boolean(opts && opts.test),
+      timeoutMs: opts && opts.timeoutMs,
+    });
+    // 返回与 jc:llm-proxy 相同的 {ok,status,text} 形态，llm.ts 可直接复用响应解析链路
+    return { ok: true, status: 200, text: JSON.stringify(result) };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    return {
+      ok: false,
+      status: Number((e && e.status) || 0) || 400,
+      text: JSON.stringify({ error: msg }),
+      error: msg,
+      code: (e && e.code) || '',
+    };
   }
 });
 

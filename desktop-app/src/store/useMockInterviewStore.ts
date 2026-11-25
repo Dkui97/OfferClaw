@@ -11,6 +11,7 @@
 import { create } from 'zustand';
 import { useDataStore } from './useDataStore';
 import { useSettingsStore } from './useSettingsStore';
+import { isModelConfigured } from '@/lib/bossclaw/providerPresets';
 import { indexSnapshot, recallCandidates } from './useBankStore';
 import { classifyQuestion, type BankCandidate, type BankDirection } from '@/lib/bossclaw/mockInterviewBank';
 import type { JobMeta } from '@/lib/bossclaw/types';
@@ -153,7 +154,7 @@ function engineCtx(): MockEngineContext {
 }
 
 function hasApiKey(): boolean {
-  return Boolean(String(useSettingsStore.getState().config.model.apiKey || '').trim());
+  return isModelConfigured(useSettingsStore.getState().config.model);
 }
 
 export type MockInterviewTab = 'interview' | 'bank';

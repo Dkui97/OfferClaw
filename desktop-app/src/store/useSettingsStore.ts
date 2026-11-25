@@ -3,7 +3,7 @@ import { persist } from 'zustand/middleware';
 import { createSafePersistStorage } from '@/lib/persistSafe';
 import type { AppConfig } from '@/lib/bossclaw/types';
 import { DEFAULT_CONFIG } from '@/lib/bossclaw/defaults';
-import { PROVIDER_DEFAULTS, type LLMProvider } from '@/lib/bossclaw/providerPresets';
+import { PROVIDER_DEFAULTS, isModelConfigured, type LLMProvider } from '@/lib/bossclaw/providerPresets';
 import {
   applyMigrations,
   extractLegacyBatchDelivery,
@@ -60,10 +60,7 @@ export const useSettingsStore = create<SettingsState>()(
             },
           },
         })),
-      isLLMConfigured: () => {
-        const { model } = get().config;
-        return Boolean(model.apiKey && model.baseUrl && model.model);
-      },
+      isLLMConfigured: () => isModelConfigured(get().config.model),
     }),
     {
       // v2 命名空间：本次回滚强制重置旧 bossclaw-settings（含已被删除的 engineMode:'cloak' 持久化值）

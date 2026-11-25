@@ -39,6 +39,7 @@ import {
   normalizeDirectionPlan,
   selectedDirectionItems,
 } from '@/lib/bossclaw/directions';
+import { isModelConfigured } from '@/lib/bossclaw/providerPresets';
 import { generateDirectionKeywords } from '@/lib/bossclaw/directionKeywordsAI';
 import { refineDirectionCapabilities, applyDirectionDetails } from '@/lib/bossclaw/directionDetailAI';
 import { normalizeStringList } from '@/lib/bossclaw/helpers';
@@ -137,7 +138,7 @@ export default function Directions() {
     // 无论本地还是 AI 的缺口，写入前都统一剔除「画像已具备」项，防止已具备技能误报为缺口。
     const guardGaps = (list: DirectionItem[]) => list.map((it) => ({ ...it, gaps: filterGapsCoveredByProfile(it.gaps, profile) }));
     const sanitized = guardGaps(fresh.items);
-    if (fresh.items.length && config.model?.apiKey) {
+    if (fresh.items.length && isModelConfigured(config.model)) {
       setAiDetailBusy(true);
       try {
         const details = await refineDirectionCapabilities(
@@ -312,8 +313,8 @@ export default function Directions() {
   const onGenerateKeywords = async (id: string) => {
     const target = items.find((it) => it.id === id);
     if (!target || aiBusyId) return;
-    if (!config.model?.apiKey) {
-      message.warning('请先在「设置」页填写 AI API Key 后使用 AI 生成搜索词');
+    if (!isModelConfigured(config.model)) {
+      message.warning('请先在「设置」页填写 AI API Key，或启用 WorkBuddy 本机登录态后使用 AI 生成搜索词');
       return;
     }
     setAiBusyId(id);

@@ -31,6 +31,7 @@ import { bridgeParseResume } from '@/lib/bridgeClient';
 import { markPersistDirty } from '@/lib/persistSafe';
 import { TailorResultView } from '@/components/TailorResultView';
 import { buildTailorJobInput, listTailorJobs, tailorJobLabel } from '@/lib/bossclaw/tailorJob';
+import { isModelConfigured } from '@/lib/bossclaw/providerPresets';
 import type { JobMeta, PendingItem } from '@/lib/bossclaw/types';
 import { batchPdfFileName, createTailorBatch, runTailorBatch, TAILOR_HISTORY_MAX, upsertTailorHistory, type TailorBatchItem, type TailorHistoryItem } from '@/lib/bossclaw/tailorBatch';
 
@@ -448,7 +449,7 @@ export default function JobAssistant() {
   const canGenerate = Boolean(jobTitle.trim() && jobDesc.trim() && hasResume);
 
   // 实时匹配度预览：优先 AI（工作台导入分）；AI 未配置时回退本地确定性计算（不调用 AI）
-  const aiConfigured = Boolean(config.model?.apiKey);
+  const aiConfigured = isModelConfigured(config.model);
   const liveMatch = useMemo(() => {
     if (!jobDesc.trim() || !hasResume) return null;
     const { keywords, weights } = extractJdKeywords(jobDesc, profile);
@@ -650,7 +651,7 @@ export default function JobAssistant() {
             <Button type="text" disabled={generating || exporting} onClick={() => setBatchItems([])}>关闭批量列表</Button>
           </Space>
           {!hasResume && <Alert type="warning" message="请先在简历中心上传简历并生成职业画像" />}
-          {!config.model?.apiKey && <Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>未配置 AI，当前会生成本地结果。配置 AI 后可从工作台重新选择岗位生成。</Text>}
+          {!isModelConfigured(config.model) && <Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>未配置 AI，当前会生成本地结果。配置 AI 或启用 WorkBuddy 后可从工作台重新选择岗位生成。</Text>}
           <List size="small" dataSource={batchItems} pagination={batchItems.length > 10 ? { pageSize: 10, showSizeChanger: false } : false}
             renderItem={(item) => (
               <List.Item actions={[
@@ -746,9 +747,9 @@ export default function JobAssistant() {
               <Text type="warning" style={{ fontSize: 12 }}>未解析简历：请先到「简历中心」上传并生成职业画像</Text>
             )}
           </Space>
-          {!config.model?.apiKey && (
+          {!isModelConfigured(config.model) && (
             <Text type="secondary" style={{ fontSize: 12 }}>
-              未配置 AI 时将按本地模板生成（摘要 + 打招呼语占位），建议在「设置 → AI」中填写密钥。
+              未配置 AI 时将按本地模板生成（摘要 + 打招呼语占位），建议在「设置 → AI」中填写密钥或启用 WorkBuddy 本机登录态。
             </Text>
           )}
         </div>

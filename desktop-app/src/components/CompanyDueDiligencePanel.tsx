@@ -17,6 +17,7 @@
 import { useCallback, useMemo, useState } from 'react';
 import { Button, Dropdown, Tag, Tooltip } from 'antd';
 import { useSettingsStore } from '@/store/useSettingsStore';
+import { isModelConfigured } from '@/lib/bossclaw/providerPresets';
 import {
   DueDiligenceRating, DueDiligenceScan, DueDiligenceState, RISK_LEVEL_LABEL, SOURCE_TIER_LABEL,
   appendScan, buildDueDiligenceReport, buildOfficialLinks, buildSearchLinks,
@@ -53,7 +54,7 @@ export default function CompanyDueDiligencePanel({ company, biz, state, openUrl,
   const [busy, setBusy] = useState(false);
   const [rating, setRating] = useState(false);
   const [notice, setNotice] = useState<{ type: 'ok' | 'warn' | 'error'; text: string } | null>(null);
-  const aiKeyReady = useSettingsStore((s) => Boolean(s.config.model?.apiKey));
+  const aiKeyReady = useSettingsStore((s) => isModelConfigured(s.config.model));
 
   const signals = useMemo(() => state?.signals || [], [state]);
   const current = state?.rating;

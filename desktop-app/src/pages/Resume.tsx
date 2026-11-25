@@ -46,6 +46,7 @@ import { buildProfile, profileFromDraft, profileToDraft, profileHasCore } from '
 import { mergeTargetLocations, normalizeTargetLocations, sameTargetLocations } from '@/lib/bossclaw/targetLocations';
 import { getTargetLocations, writeTargetLocations } from '@/lib/bossclaw/targetLocationSync';
 import { analyzeJob, fallbackApplicantGreeting } from '@/lib/bossclaw/matching';
+import { isModelConfigured } from '@/lib/bossclaw/providerPresets';
 import { DEFAULT_ANALYZE_GREETING_INSTRUCTIONS } from '@/lib/bossclaw/prompts';
 import { normalizeStringList } from '@/lib/bossclaw/helpers';
 import { desensitizeResumeText } from '@/lib/bossclaw/resumeDesensitize';
@@ -182,8 +183,8 @@ export default function Resume() {
   };
 
   const onAiPolish = async () => {
-    if (!config.model?.apiKey) {
-      message.warning('请先在「设置」页填写 AI API Key 后使用 AI 整理');
+    if (!isModelConfigured(config.model)) {
+      message.warning('请先在「设置」页填写 AI API Key，或启用 WorkBuddy 本机登录态后使用 AI 整理');
       return;
     }
     setAiBusy(true);

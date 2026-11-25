@@ -22,6 +22,7 @@
 //   - 求职信必须求职者第一人称口吻，禁止招聘方口吻（复用打招呼语校验口径）；
 //   - AI 输出不达标一律回退本地规则兜底，绝不把招聘方口吻的文本交给用户。
 import type { AppConfig, JobMeta, Profile } from './types';
+import { isModelConfigured } from './providerPresets';
 import { cachedCallModel, aiFailureKind } from './llm';
 import { reloadSkills, skillInstructionsFor } from './skills';
 import { stableProfileView, fallbackApplicantGreeting, settleGreetingLength } from './matching';
@@ -124,7 +125,7 @@ export async function writeTailorPointSupplement(input: {
   model: AppConfig['model']; extraMaterials?: string; supplements?: TailorSupplement[];
 }): Promise<TailorPointDraft> {
   if (!input.text.trim()) throw new Error('请先写几句实际技能或经历，再让 AI 整理');
-  if (!input.model?.apiKey) throw new Error('请先配置 AI 模型');
+  if (!isModelConfigured(input.model)) throw new Error('请先配置 AI 模型（填写 API Key 或启用 WorkBuddy）');
   const budget = allocateContextBudget(input.model, { resume: 0.4, extra: 0.25, profile: 0.1, text: 0.15, point: 0.1 }, { outputTokens: 1200 });
   const resume = (await prepareContextText(input.resumeText, input.model, {
     tokenBudget: budget.resume, focus: '与当前岗位要点相关的真实技能和经历，保留能力水平、项目职责与数字',
@@ -762,7 +763,7 @@ export async function tailorForJob(
     };
   };
   if (!profile) return localFallback('尚未生成职业画像，当前为本地规则生成的定制内容。');
-  if (!model?.apiKey) return localFallback('AI 尚未配置，当前为本地规则生成的定制内容。');
+  if (!isModelConfigured(model)) return localFallback('AI 尚未配置（填写 API Key 或启用 WorkBuddy），当前为本地规则生成的定制内容。');
 
   // ===== 上下文预算（唯一口径见 contextBudget.ts）=====
   // 简历、导入材料、画像、岗位描述，以及迭代时的用户补充和上一版共享输入预算。
