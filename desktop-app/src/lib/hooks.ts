@@ -1,6 +1,12 @@
 // 渲染端通用 hooks 集合。
 // 仅做无副作用、可在任意组件复用的工具函数；不包含与 BOSS/业务强耦合的逻辑。
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import {
+  getPersistHealthVersion,
+  listPersistFailures,
+  subscribePersistHealth,
+  type PersistFailureInfo,
+} from './persistSafe';
 
 /**
  * 浅比较两个值是否相等。
@@ -22,20 +28,36 @@ export function useInterval(fn: () => void | Promise<void>, delayMs: number | nu
   const fnRef = useRef(fn);
   fnRef.current = fn;
   const immediate = Boolean(opts?.immediate);
-  // P30：in-flight 守卫——上一轮回调尚未结束（如网络慢导致心跳请求挂起）时跳过本轮，
-  // 避免慢网络下心跳逐次重叠堆积（请求积压 → 卡顿/内存增长）。
-  const busyRef = useRef(false);
 
   useEffect(() => {
     if (delayMs == null || delayMs <= 0) return undefined;
     let cancelled = false;
+    // P30：in-flight 守卫——上一轮回调尚未结束（如网络慢导致心跳请求挂起）时跳过本轮，
+    // 避免慢网络下心跳逐次重叠堆积（请求积压 → 卡顿/内存增长）。
+    let busy = false;
+    let watchdog: ReturnType<typeof setTimeout> | null = null;
     const run = () => {
-      if (cancelled || busyRef.current) return;
-      busyRef.current = true;
+      if (cancelled || busy) return;
+      busy = true;
+      // 审查 #31：**必须**有看门狗。原实现只在 `finally` 里解锁 busy，只要有一次回调永不 settle
+      // （IPC 无响应、Promise 被吞、await 了一个不会 resolve 的握手），busy 就永久为真 →
+      // 该轮询**永久停摆且无任何日志**（表现：心跳/登录态/桥状态再也不刷新）。
+      // 看门狗按「3×间隔、下限 10s」超时解锁，并留一条 warn 便于定位。
+      const limitMs = Math.max(10_000, delayMs * 3);
+      watchdog = setTimeout(() => {
+        watchdog = null;
+        if (cancelled) return;
+        busy = false;
+        console.warn(`[useInterval] 回调超过 ${Math.round(limitMs / 1000)}s 未结束，已解锁等待下一轮（防永久停摆）`);
+      }, limitMs);
       Promise.resolve(fnRef.current())
         .catch(() => {})
         .finally(() => {
-          busyRef.current = false;
+          if (watchdog) {
+            clearTimeout(watchdog);
+            watchdog = null;
+          }
+          busy = false;
         });
     };
     if (immediate) run();
@@ -43,6 +65,10 @@ export function useInterval(fn: () => void | Promise<void>, delayMs: number | nu
     return () => {
       cancelled = true;
       clearInterval(t);
+      if (watchdog) {
+        clearTimeout(watchdog);
+        watchdog = null;
+      }
     };
   }, [delayMs, immediate]);
 }
@@ -108,6 +134,25 @@ export function useMediaQuery(query: string): boolean {
  * 单一空对象：用于 useEffect 依赖是对象/函数时的稳定占位。
  */
 export const EMPTY: Readonly<Record<string, never>> = Object.freeze({});
+
+/** 无持久化写失败时的稳定空数组（避免订阅方每轮渲染拿到新引用） */
+const NO_FAILURES: PersistFailureInfo[] = [];
+
+/**
+ * 订阅「本地存储写入失败」状态（issue #10）。
+ * 返回当前仍处于失败态的键；成功写入后自动清除（界面告警随之消失）。
+ * 用 useSyncExternalStore 而非 zustand：失败状态来自 persist 存储层，不属于任何业务 store。
+ */
+export function usePersistFailures(): PersistFailureInfo[] {
+  const version = useSyncExternalStore(subscribePersistHealth, getPersistHealthVersion, getPersistHealthVersion);
+  return useMemo(() => {
+    // version 是「外部存储变过」的信号：回调内容不读它，但必须留在依赖里 ——
+    // 否则写入失败态更新后列表永远不刷新。显式 void 一下，既满足 exhaustive-deps 也不改行为。
+    void version;
+    const list = listPersistFailures();
+    return list.length > 0 ? list : NO_FAILURES;
+  }, [version]);
+}
 
 /**
  * 同步执行但防抖的「调用一次」函数：连点按钮只触发最后一次。

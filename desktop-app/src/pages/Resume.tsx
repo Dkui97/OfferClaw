@@ -245,7 +245,18 @@ export default function Resume() {
 
   // 外部（如 agent 经 MCP dataSetResume 写过简历）更新 store 后，同步到本地输入框 state，
   // 否则输入框仍显示旧原文。用户手动输入时 store 不变，不会打断编辑。
+  //
+  // 审查 #16：原实现无条件 `setText(resumeText)` —— 只要 store 侧发生变化（外部写入、导入简历、
+  // 清空数据后重建），**用户正在编辑、尚未保存的文本会被静默覆盖**。现只在「本地无未保存编辑」时
+  // 才用外部值刷新输入框；有未保存编辑时保留用户输入（保存时以本页内容为准），避免丢字。
+  const lastSyncedTextRef = useRef(resumeText);
+  const textRef = useRef(text);
+  textRef.current = text;
   useEffect(() => {
+    if (resumeText === lastSyncedTextRef.current) return; // 值未变（含本页自己回写）：不动输入框
+    const dirty = textRef.current !== lastSyncedTextRef.current; // 本地有未保存编辑
+    lastSyncedTextRef.current = resumeText;
+    if (dirty) return; // 不覆盖用户正在编辑的文本
     setText(resumeText);
   }, [resumeText]);
 
@@ -343,18 +354,32 @@ export default function Resume() {
       setGreetingPromptStore(trimmed && trimmed !== DEFAULT_ANALYZE_GREETING_INSTRUCTIONS ? trimmed : '');
       const p = useDataStore.getState().profile;
       const job: JobMeta = { title: testJobTitle.trim() || '测试岗位', description: testJobDesc.trim(), company: '' };
-      // 复用工作台同一分析链路（同提示词、同校验），保证预览与工作台真实生成一致
-      const analysis = await analyzeJob(job, p, text, config, config.model, trimmed || undefined);
+      // 复用工作台同一分析链路（同提示词、同校验），保证预览与工作台真实生成一致；
+      // 但预览只验证「提示词 → 招呼语」，测试岗位命中学历/求职类型等本地硬条件时不早退，
+      // 否则恒回退本地规则、看不到提示词效果。
+      const analysis = await analyzeJob(job, p, text, config, config.model, trimmed || undefined, {
+        skipHardBlockShortCircuit: true,
+      });
       const isLocal = analysis.scoreSource === 'local';
       setPreviewGreeting(analysis.greeting);
-      setPreviewMeta(isLocal ? { method: 'local', warning: 'AI 未配置或生成失败，已使用本地规则打招呼语。' } : { method: 'ai', warning: undefined });
+      setPreviewMeta(
+        isLocal
+          ? {
+              method: 'local',
+              warning: analysis.hardBlocks?.length
+                ? `AI 未配置或生成失败；且测试岗位命中本地硬条件（${analysis.hardBlocks.slice(0, 2).join('；')}），已使用本地规则打招呼语。`
+                : 'AI 未配置或生成失败，已使用本地规则打招呼语。',
+            }
+          : { method: 'ai', warning: undefined }
+      );
       message.success(isLocal ? 'AI 不可用，已按本地规则生成打招呼语' : '已按工作台提示词生成 1 条针对该岗位 JD 的打招呼语');
     } catch (err: any) {
       const job: JobMeta = { title: testJobTitle.trim() || '测试岗位', description: testJobDesc.trim(), company: '' };
       const local = fallbackApplicantGreeting(job, useDataStore.getState().profile);
+      const reason = String(err?.message || '未知原因');
       setPreviewGreeting(local);
-      setPreviewMeta({ method: 'local', warning: `AI 生成失败（${err?.message || '未知原因'}），已回退本地规则打招呼语。` });
-      message.warning('未生成 AI 招呼语，已回退本地规则');
+      setPreviewMeta({ method: 'local', warning: `${reason.includes('职业画像') ? reason : `AI 生成失败（${reason}）`}，已回退本地规则打招呼语。` });
+      message.warning(reason.includes('职业画像') ? '请先生成并保存职业画像，再预览招呼语' : '未生成 AI 招呼语，已回退本地规则');
     } finally {
       setGreetingBusy(false);
     }
@@ -431,7 +456,8 @@ export default function Resume() {
           message="解析提示"
           description={
             <ul style={{ margin: 0, paddingLeft: 18 }}>
-              {warnings.map((w, i) => <li key={i}>{w}</li>)}
+              {/* 审查 §四表 24：解析提示是纯文本、内容即身份 → 用文本作 key（比下标稳定） */}
+              {warnings.map((w) => <li key={w}>{w}</li>)}
             </ul>
           }
         />
@@ -687,7 +713,7 @@ export default function Resume() {
                 <span className="resume-block__title">打招呼语预览（测试岗位 JD）</span>
               </div>
               <p className="resume-block__hint" style={{ marginTop: 0 }}>
-                按上面的提示词为指定岗位生成 1 条招呼语，与工作台真实生成完全一致。
+                按上面的提示词为指定岗位生成 1 条招呼语（与工作台同一 AI 链路；测试岗位命中本地硬条件时也不会跳过 AI）。
               </p>
               <div className="resume-preview-form">
                 <Input

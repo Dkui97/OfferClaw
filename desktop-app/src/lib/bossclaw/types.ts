@@ -4,6 +4,12 @@
 // 岗位适配档位（类型定义在 fitLevel.ts，与档位→分数/决策的映射放在一起，便于离线回归测试）。
 // 这里只做 type-only 引用，编译期擦除，不构成运行时循环依赖。
 import type { FitLevel } from './fitLevel';
+// 活跃时段 / 批次休息配置（实现与默认值在 activityWindow.ts —— 纯函数模块，无运行时循环依赖）
+import type { ActiveHoursConfig, BatchRestConfig } from './activityWindow';
+// 企业工商字段（P1-5 A 层：解析与风险提示在 companyProfile.ts，同样是纯函数模块，type-only 引用）
+import type { CompanyBizProfile } from './companyProfile';
+// 企业背调 B/C 层（负面信号 + AI 评级）的类型与纯函数在 companyDueDiligence.ts，type-only 引用
+import type { DueDiligenceState } from './companyDueDiligence';
 
 export type ExecutionMode = 'review' | 'auto';
 
@@ -68,7 +74,30 @@ export interface AppConfig {
   financing: string[];
   sendResumeImage: boolean;
   sendOnlineResume: boolean;
+  /**
+   * 关闭窗口时收进系统托盘（默认 true）。
+   * 定时任务调度器是渲染层单例、投递引擎也在窗口里 —— 关窗即退出会让「半夜定时投递」必须一直开着窗口。
+   * 关掉此项回到「关窗即退出」。主进程侧还会校验托盘是否真的创建成功，失败时同样按关窗退出处理。
+   */
+  closeToTray?: boolean;
+  /** 关键事件发系统通知（首次投递验收 / 风控暂停 / 定时任务完成），默认 true；关掉即静默 */
+  systemNotify?: boolean;
+  /**
+   * HR 回复提醒（默认 true）：AI 跟聊扫到 HR 新消息时弹一条系统通知。
+   * 与 systemNotify 是两层开关 —— 两者同时为 false 才静默；关掉本项只关「HR 新消息」，
+   * 首次投递验收 / 风控暂停等关键事件仍会提醒（它们的口径强于普通新消息）。
+   * 同一会话 10 分钟内只提醒一次（连发多条不刷屏），HR 明确拒绝绕过聚合且文案不同。
+   */
+  hrReplyNotify?: boolean;
   betweenJobsSeconds: number;
+  /**
+   * 活跃时段（模拟真人作息）：时段外**自动暂停投递**。
+   * 服务端的操作时间戳统计是账号维度的长期特征，**无法靠指纹补丁掩盖** —— 详见 activityWindow.ts。
+   * 默认 8:00–23:00，每日边界带 ±25 分钟抖动（按日期确定性生成，同日多次判断结果一致）。
+   */
+  activeHours: ActiveHoursConfig;
+  /** 批次休息：连续投递 N 个岗位后长休息一次（避免「连续上百次不中断」这种机器特征） */
+  batchRest: BatchRestConfig;
   attachmentDelaySeconds: number;
   /** 沟通阶段卡住超时（秒）：投递进入「沟通」阶段（打开岗位/打开沟通窗口/核对 HR 与岗位）超过该时长且无进展时，跳过当前岗位转投下一个 */
   commStuckTimeoutSec: number;
@@ -93,6 +122,14 @@ export interface AppConfig {
   minSalaryPerMonth: number;
   /** 是否排除猎头岗位（对齐 AI-BossJob 的 excludeHeadhunters） */
   excludeHeadhunters: boolean;
+  /**
+   * 是否排除「JD 已过截止日期」的岗位（确定性硬约束，非 AI 判断）。
+   * 猎聘 JD 正文末尾常带「截止日期：2027年07月16日」，过期后仍然投递纯属浪费配额。
+   * 判定口径见 jobExpiry.ts（唯一权威）：只在 JD 显式写了截止日期时才判定，
+   * 日期不可解析 / 未写截止日期一律放行；截止日当天仍算有效。
+   * 未配置时按 PLATFORM_EXPIRY_DEFAULT 兜底（仅猎聘默认开启）。
+   */
+  excludeExpiredJobs: boolean;
   /** 搜索采集时是否自动下拉加载更多岗位卡片（BOSS 列表为无限滚动，默认开启以收集更多岗位） */
   listAutoScroll: boolean;
   /** 自动下拉最大轮数：每轮滚到底并等待新卡片出现，连续无新卡片即停止；0 视为使用默认 12 轮 */
@@ -169,7 +206,11 @@ export interface AppConfig {
     enabled: boolean;
     /** 指纹伪装的操作系统（windows / macos / linux），默认 windows（与国内求职者真实环境一致） */
     os: string;
-    /** 隐身搜索页数（1-5），默认 1 */
+    /**
+     * 搜索结果页数（仅 Camoufox 隐身采集生效；每页约 30 条），默认 1。
+     * 上限见 camoufox.ts 的 CAMOUFOX_MAX_PAGES（=10，服务端 BOSCLAW_MAX_SEARCH_PAGES 可覆盖）。
+     * 内置浏览器可视化采集不走本字段：BOSS 无限加载靠滚动、猎聘/智联/51Job 只采第 1 页。
+     */
     pages: number;
     /** 隐身搜索/发送时是否强制走 Camoufox（true）或仅在 webview 失败时兜底（false） */
     prefer: boolean;
@@ -398,6 +439,18 @@ export interface JobMeta {
   encryptUserId?: string;
   /** 招聘方职位（BOSS 官方接口 bossTitle） */
   recruiterTitle?: string;
+  /**
+   * 企业工商信息（P1-5 A 层，来自招聘平台公司主页自身字段，见 companyProfile.ts）。
+   * 只做展示与确定性提示：**不参与投递判定**（不改 status、不影响排序、不自动跳过）。
+   * 缺失 = 从未采集过；非空但字段缺项时用 `missing` 明确「没采到」，不要当成「企业没有」。
+   */
+  companyProfile?: CompanyBizProfile;
+  /**
+   * 企业背调 B/C 层（负面信号 + AI 评级，见 companyDueDiligence.ts）。
+   * 与 A 层同样**只做提示**：不参与投递判定、不改 status、不影响排序与队列。
+   * 每条信号与每条 AI 依据都必须挂到具体来源（编号），挂不上的依据在解析阶段就被丢弃。
+   */
+  dueDiligence?: DueDiligenceState;
   [key: string]: unknown;
 }
 
@@ -411,6 +464,18 @@ export type PendingStatus =
   | 'skipped'
   | 'rejected'
   | 'ignored';
+
+/**
+ * 求职流程进展（P1-6）。**与 PendingStatus 正交**：
+ * status 描述「投递到哪一步」，progressStage 描述「HR 那边到哪一步」。
+ * 刻意不扩 PendingStatus 枚举 —— 全仓 40+ 处按 status 分支渲染 / 统计，加值会静默架空它们。
+ */
+export type ProgressStage =
+  | 'replied'
+  | 'interview_scheduled'
+  | 'interviewed'
+  | 'offer'
+  | 'rejected_by_hr';
 
 export interface PendingItem {
   id: string;
@@ -431,10 +496,24 @@ export interface PendingItem {
   sentAt?: number;
   /** HR 来消息后 AI 跟聊回复的成功时间戳（不计入单日投递上限统计；sentAt 仍为空表示仅回复未投递） */
   replySentAt?: number;
+  /** AI 跟聊：最近一次「已回复 / 已收口」的 HR 消息指纹（=HR 最后一条消息文本），防止同一条消息重复回复 */
+  hrRepliedFingerprint?: string;
+  /** AI 跟聊：HR 明确拒绝的时间戳（>0 时该会话停止继续跟聊） */
+  hrRejectedAt?: number;
+  /**
+   * 求职流程进展（P1-6）：只做流程跟踪，**不改 status、不进投递队列、不影响排序与过滤**。
+   * 写入点：AI 跟聊识别到面试邀约 → interview_scheduled；HR 明确拒绝 → rejected_by_hr；
+   * 其余（已回复 / 已面试 / 已获 Offer）由用户手动标记。缺失 = 未标记（统计归「未标记」）。
+   */
+  progressStage?: ProgressStage;
+  /** 求职流程进展最后一次更新时间（仅展示；手动清除时一并清空） */
+  progressUpdatedAt?: number;
   /** 已打开沟通窗口时间戳（工作台「点击立即沟通」后、尚未发送文字） */
   openedAt?: number;
   /** 是否因风控（验证/封禁）被禁止重试 */
   riskBlocked?: boolean;
+  /** 发送后未能确认「本次新增己方气泡」：证据不足，保留页面/标签交人工核对（不自动重发） */
+  needsReview?: boolean;
 }
 
 /** 达标岗位导出记录：从工作台队列收集评分≥最低分的岗位，按「日期 → 该日已导出的达标岗位」持久化。

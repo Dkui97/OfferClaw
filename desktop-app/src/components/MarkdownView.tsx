@@ -27,6 +27,8 @@ function renderInline(text: string, keySeed: string | number): React.ReactNode[]
             <a
               key={`${keySeed}-${i}`}
               href={url}
+              // L-29：纵深防御 —— 除 preventDefault 外，明确声明 opener/referrer 不传递
+              rel="noreferrer noopener"
               onClick={(e) => {
                 e.preventDefault();
                 electronApi.external.open(url);
@@ -177,6 +179,15 @@ function renderBlocks(md: string): React.ReactNode[] {
         buf.push(lines[i]);
         i += 1;
       }
+      // 防御（P-死循环）：该行非空、却命中了块级排除正则而没有任何块规则接手 —— 例如
+      // 「#### 四级标题」（标题正则只认 #{1,3}）、「#无空格标题」（标题要求 # 后有空格）、
+      // 孤立「|」行（下一行不是 |---| 分隔行）。此时 while 一次都不执行、buf 为空且 i 不前进，
+      // 会在外层 while 原地打转 → 同步死循环、挂死渲染进程。此处按普通文本渲染该行并前进一位。
+      if (buf.length === 0) {
+        push(<p className="md-p">{renderInline(line, key)}</p>);
+        i += 1;
+        continue;
+      }
       push(<p className="md-p">{renderInline(buf.join('\n'), key)}</p>);
       continue;
     }
@@ -187,6 +198,10 @@ function renderBlocks(md: string): React.ReactNode[] {
   return out;
 }
 
-export default function MarkdownView({ text }: { text: string }) {
+/**
+ * 审查 #93：`memo` 包裹 —— 无它时 Home 每次渲染（采集/投递期间高频）都会重新解析整篇文档
+ * 生成 React 节点树。props 只有一个 `text: string`，浅比较即可完全防住无效重解析。
+ */
+export default React.memo(function MarkdownView({ text }: { text: string }) {
   return <div className="md-view">{renderBlocks(text)}</div>;
-}
+});

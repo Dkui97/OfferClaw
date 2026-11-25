@@ -1,6 +1,6 @@
 // src/tools/runtime.mjs —— 运行控制工具组（启动 / 停止 / 状态）
 import path from 'node:path';
-import { PATHS, DESKTOP_DIR, MODE, ok, fail, statSafe, probePort, tailTextFile, spawnDetached, killTree, isPidAlive, controlCall, resolveInstalledExe } from '../context.mjs';
+import { PATHS, DESKTOP_DIR, MODE, ok, fail, statSafe, probePort, tailTextFile, spawnDetached, waitForSpawn, killTree, isPidAlive, controlCall, resolveInstalledExe } from '../context.mjs';
 import { obj, str, num, bool, arr, WRITE_LOCAL, READ_ONLY } from '../schema.mjs';
 import { listBossclawProcesses } from '../procs.mjs';
 
@@ -27,7 +27,7 @@ export const runtimeTools = [
       noGpu: bool('追加 BOSSCLAW_NO_GPU=1 并加 --no-sandbox（无 GPU / 沙箱环境用，默认 false）', { default: false }),
       dev: bool('以 --dev 模式启动（加载 Vite 5173 开发服务，需先跑 npm run dev）', { default: false }),
       installed: bool('启动已安装的打包版应用（自动探测 BossClaw.exe，如 <安装目录>\\BossClaw.exe；找不到时可用 exe 参数显式指定）', { default: false }),
-      exe: str('直接指定要启动的应用可执行文件路径（优先级最高，如 <安装目录>\\BossClaw.exe）'),
+      exe: str('直接指定要启动的应用可执行文件路径（优先级最高，如 <安装目录>\\BossClaw.exe；仅接受 BossClaw.exe / electron.exe）'),
       extraArgs: arr('追加给 electron 的命令行参数'),
       waitSec: num('启动后等待秒数再判定存活（默认 8）', { default: 8 }),
       force: bool('已有实例在运行时先强制结束再启动（默认 false）', { default: false }),
@@ -41,6 +41,15 @@ export const runtimeTools = [
         exePath = String(args.exe).trim();
         cwd = path.dirname(exePath);
         mode = 'installed';
+        // 审查 2026-10-21 B-9：exe 是 agent 可填的自由参数，直接 spawn 等于把 MCP 变成
+        // 「任意可执行文件启动器」。与 procs.mjs 对「杀进程」的克制口径对齐：只允许
+        // BossClaw.exe / electron.exe —— 其余一律拒绝，并给出可操作提示。
+        if (!/^(BossClaw|electron)(\.exe)?$/i.test(path.basename(exePath))) {
+          return fail(
+            `exe 只接受 BossClaw 自身的可执行文件（BossClaw.exe / electron.exe），收到：${path.basename(exePath)}。` +
+              '请传 <安装目录>\\BossClaw.exe，或改用 installed:true / dev:true。'
+          );
+        }
       } else if (args.installed) {
         exePath = await resolveInstalledExe();
         if (!exePath) {
@@ -81,7 +90,14 @@ export const runtimeTools = [
         mode === 'installed'
           ? [...(args.noGpu ? ['--no-sandbox'] : []), ...(args.control !== false ? ['--control-bridge'] : []), ...(args.extraArgs || [])]
           : ['.', ...(args.dev ? ['--dev'] : []), ...(args.noGpu ? ['--no-sandbox'] : []), ...(args.extraArgs || [])];
-      const { pid, cmd } = spawnDetached(exePath, argv, { cwd, env });
+      const { pid, cmd, child } = spawnDetached(exePath, argv, { cwd, env });
+
+      // 审查 #20：先确认 spawn 真的成功（ENOENT/EPERM 只在异步 'error' 事件里体现），
+      // 否则后续 probePort/日志会对着一个不存在的 pid 忙活，而真正的原因（路径不对/无权限）被吞掉。
+      const spawned = await waitForSpawn(child);
+      if (!spawned.ok) {
+        return fail(`启动失败：无法创建进程（${spawned.error}）。可执行文件：${exePath}`);
+      }
 
       const waitSec = Math.min(Math.max(Number(args.waitSec) || 8, 1), 60);
       await sleep(waitSec * 1000);

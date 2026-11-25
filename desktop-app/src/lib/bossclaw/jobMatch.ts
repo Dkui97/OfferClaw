@@ -14,6 +14,7 @@ import { isNonSkillJdToken, equivalentSkillKeys, coveringSkillKeys, skillKeysInT
 import { isCompanyExcluded } from './companyFilter';
 import { isLocationExcluded } from './locationFilter';
 import { detectInterviewMode } from './interviewMode';
+import { checkJobExpiry, isExpiryFilterEnabled, PLATFORM_EXPIRY_DEFAULT } from './jobExpiry';
 import { decodeSalaryDigits } from './jobDisplay';
 import {
   detectWorkSchedule,
@@ -41,6 +42,35 @@ const SEGMENT_RE = /(\d+(?:\.\d+)?)\s*(万|千|[Kk])?/g;
 // 年薪口径：串里出现「年薪/年包/每年/万/年」等（「13薪」已在上游清洗，不会误伤）
 const ANNUAL_RE = /年薪|年包|每年|万\s*[-\/]\s*年|[-\/]\s*年/;
 
+/**
+ * 薪资文本归一化（**唯一权威**，parseSalaryRange 入口必过）。
+ *
+ * 为什么必须有这一步（2026-10-01 猎聘「薪资解析错误」根因）：
+ * 采集链路（webview.cjs 的 `pickFromCard` / 节点文本，以及部分平台的链接文本兜底）
+ * 会把**链接尾部的 query / hash 残留**带进 salary 字段，实测形如：
+ *   `200-300元?salary=1`、`15-22k?salary=1`
+ * `SEGMENT_RE` 会把 query 里的 `1` 当成第三个薪资段，于是「元/天」日期口径丢失、
+ * 数字被当成月薪 K 值处理：「200-300元」→ 200-300（K）→ 触发 `high > 200` → ÷1000
+ * → 月薪 0.2K → 日薪等效 9.1 元/天 → 被「最低日薪 100 元/天」硬拦截。
+ * 表现为「岗位页面明写 200-300 元/天，日志却报日薪约 9.1 元/天」。
+ *
+ * 归一化内容：
+ *   ① 截断 URL 残留：`?…` / `#…` 之后一律丢弃（薪资串里不可能合法出现这两个字符）；
+ *   ② 统一区间连字符与空白（`至`/`到`/全角波浪线 → `-`，压缩连续空白），
+ *      避免下游 `desc`/`salary` 拼接形态差异导致漏判。
+ * 注意：只做「剔除噪声 + 规范化」，**不猜数字、不补单位**——无单位段的单位继承仍由
+ * parseSalarySegments 的前向优先规则决定，保持既有口径不变。
+ */
+export function normalizeSalaryText(input: string | undefined | null): string {
+  return String(input || '')
+    // ① URL query / hash 残留（含全角问号）：连同其后内容一并丢弃
+    .replace(/[?#？＃][\s\S]*$/, '')
+    // ② 区间连接词与空白统一：至 / 到 / ~ / ～ / – / — → `-`
+    .replace(/[~～–—]|至|到/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /** 把「数字 + 可选单位」逐段解析；单位缺失的段继承最近的显式单位（前向优先）：「1.5-2万」→ 1.5 继承 万。 */
 function parseSalarySegments(cleaned: string): SalarySeg[] | null {
   const segs: SalarySeg[] = [];
@@ -67,8 +97,10 @@ export function parseSalaryRange(
   monthlyWorkDays = monthlyWorkDaysOf(DEFAULT_WEEKLY_DAYS)
 ): SalaryRange {
   const invalid: SalaryRange = { low: 0, high: 0, daily: false, hourly: false, valid: false };
-  // 先还原平台字体混淆（BOSS 把薪资数字映射到 Unicode 私有区），否则一律落到「未识别」
-  const raw = decodeSalaryDigits(String(salary || '')).trim();
+  // 先还原平台字体混淆（BOSS 把薪资数字映射到 Unicode 私有区），再剥离 URL 残留
+  // （形如 `200-300元?salary=1` 会把 query 里的 1 当成第三段，见 normalizeSalaryText），
+  // 否则一律落到「未识别」或算出严重偏低的等效薪资。
+  const raw = normalizeSalaryText(decodeSalaryDigits(String(salary || '')));
   if (!raw || /面议/.test(raw)) return invalid;
   // 去掉「13薪/14薪/15薪」等年终奖月数，避免「13」被误当作薪资区间上限
   const cleaned = raw.replace(/[·*＊xX×\s]*1[2-8]\s*薪/g, '').trim();
@@ -168,17 +200,74 @@ function degreeLevel(text: string): number {
 //   - 本地经验维度恒为 null（UI 自动过滤；AI 路径由 AI 分值填充）。
 // 注意：`profile.hardConstraints.experience` 仍是「求职条件」的展示字段（profile.ts 维护），此处不涉及。
 
-/** 从 JD 文本提取要求的学历等级；未明确要求返回 null */
+/** 学历词（承载学历的字面词；「研究生」与「硕士」同级，均为 3 档） */
+const DEGREE_WORD_SRC = '博士|硕士|研究生|本科|学士|大专|专科';
+
+/**
+ * 整段/整句「是」一个学历要求表达式（如「本科」「本科及以上」「统招本科」「学历：硕士」）。
+ * 注意：`(?:及以上|以上)` 只承接前面的档位，**绝不升档**——「本科及以上」要求的就是本科。
+ */
+const DEGREE_CLAUSE_RE = new RegExp(
+  `^(?:学历|学位)?\\s*[:：]?\\s*(?:全日制|统招|正规)?\\s*(?:${DEGREE_WORD_SRC})\\s*(?:及以上|以上|或以上|学历|学位)?$`
+);
+
+/** 该分句是否属于「薪酬 / 福利」口径（「硕士研究生实习薪资 3500 元/月」不是学历要求） */
+function isSalaryBenefitClause(clause: string): boolean {
+  return /薪|工资|待遇|补贴|津贴|保险|住宿|报销|元\s*\/\s*[个]?\s*[月天日]|每月|转正后/.test(clause);
+}
+
+/**
+ * 从 JD 文本提取「硬性要求」的学历等级；未明确要求返回 null。
+ *
+ * 为什么不能对整个文本取「出现过的最高学历档」（旧实现的两类误判，均在真实 JD 上复现）：
+ *   ① 「本科及以上学历在读（本科大四、研究生优先）」→ 全文中了「研究生」判成要求硕士 →
+ *      本科画像被硬拦（画像学历=本科，岗位只需本科）；
+ *   ② 「本科及以上，计算机相关专业优先」+ 福利段「硕士研究生实习薪资 3500 元/月」→
+ *      从薪酬福利句里取到「研究生」，同样判成要求硕士。
+ * 故改为「分句 → 剔除薪酬福利句 → 逐学历词判语用」：
+ *   - 「X 及以上 / X 以上」= 要求 X（**不升档**，这是本函数的核心不变量）；
+ *   - 「X 优先 / 优先考虑 X」= 加分项，不构成要求；
+ *   - 只有被「学历/要求/需」引导、或被「及以上/以上/学历/在读/统招/全日制」承接的学历词才计为要求。
+ * 岗位要求只从明确岗位字段（title/description）解析，不拼接 cardText——
+ * cardText 是列表卡片文本（含「急聘/高薪/相似岗位/导航」等噪声），极易把
+ * 相似岗位或周边内容的学历要求误当成当前岗位要求，造成「正常岗位被判学历不足→35 分」。
+ */
 function jdRequiredDegreeLevel(job: JobMeta): number | null {
-  // 岗位要求只从明确岗位字段（title/description）解析，不拼接 cardText——
-  // cardText 是列表卡片文本（含「急聘/高薪/相似岗位/导航」等噪声），极易把
-  // 相似岗位或周边内容的学历要求误当成当前岗位要求，造成「正常岗位被判学历不足→35 分」。
   const text = `${String(job.title || '')} ${String(job.description || '')}`;
-  const level = degreeLevel(text);
-  if (level <= 0) return null; // 未明确要求
-  // 「不限学历/学历不限」不构成要求
-  if (/不限|以上|学历不限|无学历要求/.test(text) && !/本科及以上|硕士及以上|博士及以上/.test(text)) return null;
-  return level;
+  if (!text.trim()) return null;
+  // 「不限学历 / 学历不限 / 无学历要求」不构成要求
+  if (/不限学历|学历不限|无学历要求|不限制学历|学历无要求|学历\s*[:：]\s*不限|学历要求不限/.test(text)) return null;
+
+  let required = 0;
+  // 分句：逗号 / 顿号 / 分号 / 句号 / 换行 / 括号 都是天然边界
+  // （括号内多为「本科大四、研究生优先」这类补充说明，不该独立构成要求）
+  for (const rawClause of text.split(/[，,、；;。！？!?\n\r（）()【】[\]]+/)) {
+    const seg = rawClause.trim();
+    if (!seg || isSalaryBenefitClause(seg)) continue;
+    // 整句就是一个学历要求表达式 → 直接取该档位
+    if (DEGREE_CLAUSE_RE.test(seg)) {
+      required = Math.max(required, degreeLevel(seg));
+      continue;
+    }
+    const re = new RegExp(DEGREE_WORD_SRC, 'g');
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(seg))) {
+      const word = m[0];
+      const start = m.index;
+      const before = seg.slice(0, start);
+      const after = seg.slice(start + word.length);
+      // ① 偏好语气：「…优先」/「优先考虑、录取…」→ 加分项，不是硬性要求
+      if (/优先/.test(after.slice(0, 6))) continue;
+      if (/优先(?:考虑|录取|录用|招)?\s*$/.test(before)) continue;
+      // ② 语用闸门：必须由前面的「学历/要求/需」引导，或由后面的「及以上/以上/学历/在读…」承接
+      const requiredCtx =
+        /(?:学历|学位|要求|需求|需|须|具备)\s*[:：]?\s*$/.test(before) ||
+        /^[\s和或及、]*?(?:及以上|以上|学历|学位|在读|统招|全日制|起|毕业)/.test(after);
+      if (!requiredCtx) continue;
+      required = Math.max(required, degreeLevel(word));
+    }
+  }
+  return required > 0 ? required : null;
 }
 
 // ===== 岗位求职类型判定（实习/全职）=====
@@ -530,6 +619,21 @@ function collectHardBlocksFromCtx(ctx: LocalMatchContext): string[] {
       }
       return null;
     },
+    // 10. JD 截止日期已过（设置 → 排除已过截止日期岗位）
+    //     触发源是猎聘 JD 正文末尾的「截止日期：YYYY年MM月DD日」字段（口径见 jobExpiry.ts 唯一权威）。
+    //     只在 JD **显式写了**截止日期时才判定；未写 / 日期不可解析（如「长期有效」「招满即止」）→ 放行，
+    //     避免把绝大多数不写截止日期的岗位误拦。截止日当天仍算有效。
+    //     ⚠️ 新增硬约束必须追加在数组末尾（matching.ts 取前 2 条生成拦截文案，插中间会改展示）。
+    () => {
+      const enabled = isExpiryFilterEnabled(
+        config,
+        job.platform,
+        PLATFORM_EXPIRY_DEFAULT[String(job.platform || '')] ?? false
+      );
+      if (!enabled) return null;
+      const res = checkJobExpiry(job);
+      return res.expired ? res.reason : null;
+    },
   ];
   const hardBlocks: string[] = [];
   for (const rule of rules) {
@@ -603,7 +707,10 @@ function computeDirectionScore(ctx: LocalMatchContext, evidence: string[]): numb
     const dirKeywordKeys = (rule?.keywords || []).map((kw) => normalizeDirectionKeyForMatch(String(kw))).filter((k) => k && k.length >= 2);
     const titleHitByDir = dirKey.length >= 2 && titleKey && (titleKey.includes(dirKey) || dirKey.includes(titleKey));
     const titleHitByRule = Boolean(rule && rule.test.test(titleKey));
-    const titleHitByKw = dirKeywordKeys.some((k) => titleKey.includes(k) || k.includes(titleKey));
+    // ⚠️ 必须要求 titleKey 非空：`k.includes('')` 恒为 true → 岗位无标题（cleanTitle 后为空串）时
+    // 每一个方向都会被判「标题命中」并给满分（审查：空标题恒真的方向维误判）。
+    // 上游 titleHitByDir 已有 `titleKey &&` 守卫，此处同口径补齐。
+    const titleHitByKw = Boolean(titleKey) && dirKeywordKeys.some((k) => titleKey.includes(k) || k.includes(titleKey));
     if (titleHitByDir || titleHitByRule || titleHitByKw) {
       titleHits += 1;
       evidence.push(`方向命中：岗位「${ctx.title.trim() || '未知'}」匹配方向「${dir}」`);

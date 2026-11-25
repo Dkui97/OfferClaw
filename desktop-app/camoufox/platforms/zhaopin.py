@@ -15,6 +15,7 @@
 搜索·投递·登录三段骨架统一由 `base.CollectorBase` 提供（对齐 BossHunter 分层）。
 """
 import re
+from urllib.parse import quote
 
 from .base import CollectorBase
 from .common import DAILY_LIMIT_RE, human_sleep, log
@@ -82,13 +83,16 @@ def build_search_url(query: str, city: str, salary: str, page: int = 1,
     """
     code = _resolve_city(city)
     sal = _resolve_salary(salary or ((criteria or {}).get('salary') or ''))
-    url = f"https://www.zhaopin.com/sou/{f'jl{code}' if code else ''}/p{max(1, page)}"
+    # M-13：无城市码时原实现生成 `.../sou//p1`（双斜杠）→ 修正为不带空段；仍需 sl= 等 query。
+    seg = f'jl{code}' if code else ''
+    url = 'https://www.zhaopin.com/sou/' + (f'{seg}/' if seg else '') + f'p{max(1, page)}'
     parts = []
     if sal:
         parts.append(f"sl={sal}")
     q = str(query or '').strip()
     if q:
-        parts.append(f"kw={q}")
+        # M-12：关键词 URL 编码（原直拼 → `C++`、含 &/#/空格 的 query 会截断或错位）
+        parts.append(f"kw={quote(q, safe='')}")
     for k, v in build_filter_params(PLATFORM, criteria).items():
         parts.append(f"{k}={v}")
     if parts:
@@ -173,25 +177,34 @@ JS_FIND_DELIVER_BTN = r"""() => {
     const all = Array.from(document.querySelectorAll('button, a, [role="button"], span, div'));
     const text = (el) => (el.textContent || '').trim().replace(/\s+/g, ' ');
     const visible = (el) => { try { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; } catch(e) { return false; } };
-    const hits = all.filter(el => visible(el) && text(el).length <= 10 && /投递/.test(text(el)));
+    // M-14：原实现按「文本最长」取 hits[0]，容易命中含「投递」字样的容器/导航条。
+    // 改为：只看**叶节点**（无子元素）且文本 ≤10 的候选；优先精确按钮文案，再取文本最短者。
+    const LEAF = (el) => el.children.length === 0;
+    const hits = all.filter(el => visible(el) && LEAF(el) && text(el).length <= 10 && /投递/.test(text(el)));
     if (!hits.length) return 'not_found';
-    hits.sort((a, b) => text(b).length - text(a).length);
-    const label = text(hits[0]);
-    const el = hits[0];
+    const EXACT = /^(立即投递|投递简历|投递|申请职位|投个简历|马上投递)$/;
+    const exact = hits.filter(el => EXACT.test(text(el)));
+    const pool = exact.length ? exact : hits;
+    pool.sort((a, b) => text(a).length - text(b).length);
+    const label = text(pool[0]);
+    const el = pool[0];
     if (/已\s*投递/.test(label)) return 'delivered';
     if (/网申|前往申请|企业官网/.test(label)) return 'external';
     el.setAttribute('data-zhaopin-deliver', '1');
     return 'ready';
 }"""
 
-# 投递成功确认：弹层/toast 含「投递成功/投递完成」或按钮态「已投递」
+# 投递成功确认：**只看弹层 / toast 容器内**文本（M-15：原实现查整页 innerText，
+# 点击前页面既有的「投递成功」字样会造成误判），或按钮态「已投递」。
 JS_DELIVER_CONFIRMED = r"""() => {
     const text = (el) => (el.textContent || '').trim().replace(/\s+/g, ' ');
     const visible = (el) => { try { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; } catch(e) { return false; } };
-    const body = (document.body ? document.body.innerText : '') || '';
-    if (/投递成功|投递完成/.test(body.slice(0, 4000))) return true;
+    const OVERLAY = '[class*="toast"],[class*="Toast"],[class*="message"],[class*="Message"],[class*="dialog"],[class*="Dialog"],[class*="modal"],[class*="Modal"],[role="alert"],[role="dialog"],[class*="popup"],[class*="Popup"]';
+    const overlays = Array.from(document.querySelectorAll(OVERLAY)).filter(visible);
+    const overlayText = overlays.map(el => el.innerText || '').join(' ');
+    if (/投递成功|投递完成|投递已发送/.test(overlayText)) return true;
     const all = Array.from(document.querySelectorAll('button, a, [role="button"], span, div'));
-    return all.some(el => visible(el) && /^已\s*投递$/.test(text(el)) && text(el).length <= 8);
+    return all.some(el => visible(el) && el.children.length === 0 && /^已\s*投递$/.test(text(el)) && text(el).length <= 8);
 }"""
 
 
@@ -226,19 +239,27 @@ class ZhaopinCollector(CollectorBase):
     def dom_cards_js(self) -> str:
         return JS_DOM_CARDS
 
-    def after_navigate(self, page, query: str, page_num: int) -> None:
-        """路径式 URL 不带关键词 → 第 1 页在页内搜索框输入并回车。"""
+    def after_navigate(self, page, query: str, page_num: int) -> bool | None:
+        """路径式 URL 不带关键词 → 第 1 页在页内搜索框输入并回车。
+
+        返回 True 表示**已切换视图**：骨架（base.py 的 `if self.after_navigate(...): captured.clear()`）
+        据此丢弃切换前捕获的响应。智联第 1 页的页内搜索会整体替换结果列表，若不返回 True，
+        首屏**未筛选**列表的响应会残留并与新关键词结果一起交给 `format_jobs`
+        （结果串词、`sourceKeyword` 归属错误）。与 job51.py 页内跳页返回 True 同口径（审查 #9）。
+        """
         if page_num != 1:
-            return
+            return None
         q = str(query or '').strip()
         if not q:
-            return
+            return None
         try:
             if page.evaluate(JS_TYPE_KEYWORD, q):
                 page.keyboard.press('Enter')
                 human_sleep(2.2, 0.3, 1.2)
+                return True
         except Exception as e:
             log('⚠️', f'[{self.platform}] 搜索框输入失败：{e}')
+        return None
 
     # ---------- 投递差异 ----------
     def find_action_button(self, page):

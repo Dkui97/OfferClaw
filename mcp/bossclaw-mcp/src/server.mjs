@@ -40,8 +40,38 @@ const ERR = {
  */
 export function createServer({ tools, instructions }) {
   const byName = new Map(tools.map((t) => [t.name, t]));
+  // ===== stdout 背压（审查 #37 · 批次 12）=====
+  // `process.stdout` 对 MCP 客户端是**管道**（非 TTY），管道写满时 `write()` 返回 false 并缓冲后续数据。
+  // 单条 `tools/call` 的响应可能很大（岗位池 / 简历文本 / 代答全文），客户端读取慢时：
+  //   · 忽略返回值继续 write → 数据在**进程内无限缓冲**，内存持续上涨；
+  //   · 更关键的是 stdio 协议要求**逐行有序**，若在背压期间插入别的写操作，客户端可能按
+  //     「已 flush 的顺序」解析出错乱的 JSON-RPC 帧。
+  // 处置：维护一条**写队列** —— 一旦 `write()` 返回 false，后续写全部排队，直到 `drain` 再放行，
+  // 保证：① 内存有界（最多积压一份未 drain 的队列，且队列本身受协议调用节奏约束）；
+  // ② 帧顺序严格与调用顺序一致。日志仍直写 stderr（stderr 不参与协议，且本就用于诊断）。
+  let outQueue = [];
+  let draining = false;
+  const flushQueue = () => {
+    while (outQueue.length) {
+      const line = outQueue.shift();
+      // 仍在背压中：把该行放回队首，等下一次 drain
+      if (process.stdout.write(line) === false) {
+        outQueue.unshift(line);
+        return;
+      }
+    }
+  };
+  process.stdout.on('drain', () => {
+    draining = false;
+    flushQueue();
+  });
   const send = (msg) => {
-    process.stdout.write(`${JSON.stringify(msg)}\n`);
+    const line = `${JSON.stringify(msg)}\n`;
+    if (draining) { outQueue.push(line); return; }
+    if (process.stdout.write(line) === false) {
+      // write 返回 false 表示「本行已接受、但需等待 drain」→ 后续行必须排队
+      draining = true;
+    }
   };
   const reply = (id, result) => send({ jsonrpc: '2.0', id, result });
   const replyError = (id, code, message, data) =>
@@ -168,10 +198,18 @@ export function createServer({ tools, instructions }) {
         return;
       }
       inFlight += 1;
-      void dispatch(msg).finally(() => {
-        inFlight -= 1;
-        maybeExit();
-      });
+      // 审查 #13：`dispatch` 内 `reply()` → `process.stdout.write` 在客户端断开（EPIPE）时会抛错，
+      // 使这个 Promise 进入 rejected 状态；原实现只有 `.finally`、没有 `.catch` → 产生
+      // **unhandledRejection**（Node 15+ 默认直接终止进程，MCP 服务被一个断开的客户端打崩）。
+      // 这里显式吞掉并记一行 stderr 日志，保证「单个请求失败」不会升级为「服务退出」。
+      void dispatch(msg)
+        .catch((e) => {
+          log(`请求处理异常（已捕获，不影响服务）：${e?.stack || e?.message || e}`);
+        })
+        .finally(() => {
+          inFlight -= 1;
+          maybeExit();
+        });
     });
     rl.on('close', () => {
       stdinClosed = true;

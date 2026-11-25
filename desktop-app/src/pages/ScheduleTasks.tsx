@@ -58,7 +58,9 @@ function formatLastRun(stamp: number): string {
 
 function weekdayText(days: number[]): string {
   if (!days || days.length === 0) return '每天';
-  return days.sort((a, b) => a - b).map((d) => WEEKDAY_LABELS[d]).join('/');
+  // 必须复制后再排序：`days` 直接来自 store 的持久化数据（ScheduleEntry.daysOfWeek），
+  // 原地 sort 会在**渲染期静默重排持久化数组**（见审查 #62）。
+  return [...days].sort((a, b) => a - b).map((d) => WEEKDAY_LABELS[d]).join('/');
 }
 
 interface DraftTask {
@@ -221,7 +223,7 @@ export default function ScheduleTasks() {
 
       <Card
         size="small"
-        className="mb-16"
+        style={{ marginBottom: 16 }}
         title={
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <ThunderboltOutlined style={{ color: 'var(--brand)' }} />

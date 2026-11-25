@@ -6,33 +6,47 @@
 
 ***
 
+## 目录
+
+[功能闭环](#功能闭环) · [技术栈](#技术栈) · [目录结构](#目录结构) · [环境准备](#环境准备首次运行) · [常用命令](#常用命令) · [打包产出](#打包产出) · [功能侧栏入口](#功能侧栏入口) · [公开架构](#公开架构) · [常见问题](#常见问题) · [变更记录](#变更记录)
+
+功能与安全边界见仓库根 [`README.md`](../README.md)；本地决策文档见 [`docs/`](../docs/README.md)（`.gitignore` 忽略，未随仓库分发）。
+
+***
+
 ## 功能闭环
 
-* **岗位来源**：内置浏览器打开招聘平台岗位 → 中栏点「加入任务」→ 自动识别 HR 活跃度（在线 / 刚刚活跃 / N 日内活跃）作为匹配判断依据；岗位详情自动清洗页面噪音（`jdCleaner.ts` 渲染层 + `webview.cjs` 同步）。岗位卡片带**平台标识 chip**（BOSS 直聘绿 / 智联招聘蓝 / 猎聘橙 / 前程无忧紫，`PlatformChip` 组件，配色集中定义于 `platforms.ts`）。
+### 采集 · 匹配 · 投递闭环
+
+* **岗位来源**：内置浏览器打开招聘平台岗位 → 中栏点「加入任务」→ 自动识别 HR 活跃度（在线 / 刚刚活跃 / N 日内活跃）作为匹配判断依据；岗位详情自动清洗页面噪音（`jdCleaner.ts` 渲染层 + `webview.cjs` 同步）；采集同时透传岗位**发布时间**（`publishTime`），供「新鲜度」维度参与排序。岗位卡片带**平台标识 chip**（BOSS 直聘绿 / 智联招聘蓝 / 猎聘橙 / 前程无忧紫，`PlatformChip` 组件，配色集中定义于 `platforms.ts`）。
 
 * **多平台（BOSS 直聘 / 猎聘 / 智联招聘 / 前程无忧 51Job）**：设置页「招聘平台」分区启用平台、调整平台优先级（数字 1 = 最高，决定工作台搜索顺序与自动沟通先完成高优先级平台再切换）、配置每平台「每日投递目标」（BOSS / 猎聘 / 前程无忧默认 120/日，智联 100/日，0 = 不限，均受平台侧上限 / `MAX_SAFE_DAILY=150` 收窄，智联平台侧约 100/日）并查看两通道登录状态。各平台登录态本地独立持久化：内置浏览器经 Electron 分区会话（工作台扫码登录），Camoufox 自动沟通经 `~/.bossclaw/camoufox-cookies-{platform}.json`（BOSS 保持 `camoufox-cookies.json`）。至少保留一个启用平台（唯一启用平台不可取消）。
 
 * **半自动投递**：中栏批准岗位 → 浏览器跳转 → AI 草稿预填沟通框 → 用户发送。
 
-* **AI 匹配与评分（v2.5.3）**：岗位匹配改为 **AI 四层整体裁决**（硬门槛 → 优先条件 → 职责信号 → 团队信号，一次判断给出 `fitLevel` 档位：strong / match / cautious / unfit），**分数由档位映射、不跨档，AI 分即最终分**（本地五维仅用于界面展示与 AI 不可用时兜底，不再做融合或降级调整）；五维语义锚点与「仅显著命中才给高分」的反通胀口径全链路统一；入队门槛改为设置页可配 `minQueueScore`；工作台会话级去重 + `addSkipLogOnce` 合并重复跳过日志。
+* **AI 匹配与评分（v2.5.3）**：岗位匹配改为 **AI 四层整体裁决**（硬门槛 → 优先条件 → 职责信号 → 团队信号，一次判断给出 `fitLevel` 档位：strong / match / cautious / unfit），**分数由档位映射、不跨档，AI 分即最终分**（本地五维仅用于界面展示与 AI 不可用时兜底，不再做融合或降级调整）；五维语义锚点与「仅显著命中才给高分」的反通胀口径全链路统一；入队门槛改为设置页可配 `minQueueScore`；工作台岗位去重（归一化 URL / `jobId` / 软匹配）+ `addSkipLogOnce` 合并重复跳过日志。
 
-* **多平台投递入口**：工作台「一键投递」仅处理 **BOSS 直聘岗位**（webview 链路）；猎聘 / 智联 / 前程无忧岗位确认后保持投递队列，由「自动沟通」批量引擎投递。
+* **多平台投递入口**：工作台「一键投递 / 开始投递」按岗位平台**分派三条通道**（`runNext` 只做「选岗位 + 预检 + 分派」，三条通道各自 try/finally 持有投递锁）：**通道 A 非 BOSS DOM** —— 猎聘 / 智联 / 前程无忧，新建该平台自己的标签页打开岗位详情后下发 `platform-apply`（猎聘 = 点「聊一聊」`a.btn-main[data-selector="chat-chat"]` + 等 IM 窗口就绪；智联 = 投递按钮 + 简历面板二次确认，命中「继续沟通」→ 岗位移交自动沟通队列；前程无忧 = 投递按钮 + 成功弹层），外部网申 / 已投递 / 平台上限一律收口为跳过；**通道 B Camoufox** —— 仅 BOSS，且需设置页开启「优先走隐身通道」；**通道 C BOSS DOM** —— 内置浏览器详情页真实 DOM 沟通（默认路径）。
 
-* **多平台搜索采集**（引擎闸门 = `config.camoufox.enabled`，全平台统一语义）：开启隐身引擎 → Camoufox 通道（列表 + 详情 JD + 词级断点续采，profile 存 `~/.bossclaw/collection-progress.json`，TTL 24h）；未开启 → **内置浏览器可视化采集**（`visual-collect` / `collect-control` 全平台注册；BOSS 详情级、其余平台列表级，详情 JD 由 Camoufox 链路补齐）。各平台按设置页优先级**串行**采集；**故障范围**由 `platforms.ts::collectFaultScope()` 统一裁定 —— 平台级（31 未登录 / 4xx·5xx）只收口当前平台、后续平台继续，队列级（风控 32·35·36、环境异常 37·38、未知码 fail-safe）**立即中止整批**交人工。
+* **多平台搜索采集**（引擎闸门 = `config.camoufox.enabled`，全平台统一语义）：开启隐身引擎 → Camoufox 通道（列表 + 详情 JD + 词级断点续采，profile 存 `~/.bossclaw/collection-progress.json`，TTL 24h）；未开启 → **内置浏览器可视化采集**（`visual-collect` / `collect-control` 全平台注册；BOSS 详情级、其余平台列表级）。**列表级平台的详情 JD 由内置浏览器自己的详情补齐通道 `webview.cjs::enrichJobDetail()` 按能力表 `PLATFORM_DETAIL_API_FILL` 拉取**（智联 = 同源详情 JSON 接口；猎聘 = 同源 SSR 详情页 HTML，由 `platform-adapters.cjs::parseLiepinJobDetailHtml()` 纯函数解析；前程无忧暂无同源通道，只有列表字段）——**与是否安装 Camoufox 无关**；护栏：单次上限 300 条 / 连败 4 次熔断 / 失败保留卡片文本不丢岗位。各平台按设置页优先级**串行**采集；**故障范围**由 `platforms.ts::collectFaultScope()` 统一裁定 —— 平台级（31 未登录 / 4xx·5xx）只收口当前平台、后续平台继续，队列级（风控 32·35·36、环境异常 37·38、未知码 fail-safe）**立即中止整批**交人工。
 
 * **自动辅助**：启动后按匹配优先级依次投递 `approved_queue` 队列；webview 回传投递阶段（打开沟通 → 填写 → 发送 → 确认文字气泡 → 确认结果），失败自动暂停交人工核对；**首次成功投递后强制暂停验收**（安全不变量）。
 
 * **任务进度**：中栏任务级进度条 + 阶段标签（整理 / 匹配 / 排序 / 沟通 / 投递），日志流实时滚动；失败可重试 / 忽略 / 跳过。
 
-* **简历中心**：PDF / DOCX / DOC / TXT 本地解析（渲染进程内完成，无需桥接）：PDF 用自研解析器（Flate / ASCIIHex / ASCII85 / RunLength + ToUnicode / CMap），DOCX 用 mammoth 浏览器版 + 自研 ZIP/XML 双通道兜底，**旧版 `.doc` 用自研解析器**（OLE2/CFB 容器 + FIB/CLX 分片表，兼容「实为 RTF / HTML」的 `.doc`），失败再走桥接转档；「工作台定制」打招呼语提示词可编辑（留空用系统默认，统一驱动工作台岗位招呼语 / 定制简历求职信 / JD 预览）。
+### 简历 · AI 生成 · 技能
+
+* **简历中心**：PDF / DOCX / DOC / MD / TXT 本地解析（渲染进程内完成，无需桥接）：PDF 用自研解析器（Flate / ASCIIHex / ASCII85 / RunLength + ToUnicode / CMap），DOCX 用 mammoth 浏览器版 + 自研 ZIP/XML 双通道兜底，**旧版 `.doc` 用自研解析器**（OLE2/CFB 容器 + FIB/CLX 分片表，兼容「实为 RTF / HTML」的 `.doc`），**Markdown 走 `mdParser.ts`**，失败再走桥接转档；「工作台定制」打招呼语提示词可编辑（留空用系统默认，统一驱动工作台岗位招呼语 / 定制简历求职信 / JD 预览）。
 
 * **AI 能力**：职业画像（AI 完整画像 → 精简重试 → 本地规则三级降级）；岗位匹配（**AI 五维评估 + 档位制裁决，AI 分即最终分**，本地多维评分仅作展示与兜底；评分 / 决策 / 硬条件拦截 / 沟通草稿）；**打招呼语（求职信）提示词优先级**：① greetings 技能（含用户自定义技能）→ ② 简历中心「打招呼语提示词」输入框内容 → ③ 本地规则；投递方向支持 **AI 生成/校准关键词**，并新增 **薪资校准模块** 与 **工作时间偏好** 供 AI 判断匹配与约束沟通内容；AI 生成 + 求职者口吻校验，失败回退本地规则。
 
 * **定制简历**：侧栏「定制简历」页输入岗位 JD，AI 生成定制摘要 / 量化经历 / 求职信 / 技能缺口 / 优化建议，仅引用简历真实事实，AI 输出不达标回退本地规则兜底。
 
-* **AI 技能体系**：`skills/` 内置 7 项（resume-profile / job-analysis / greetings / tailor-cv / jd-reading / great-resume / job-match，SKILL.md），按作用域注入 system prompt；greetings 即「工作台定制的打招呼语提示词」统一口径，驱动工作台岗位招呼语 / 简历中心 JD 预览 / 定制简历求职信；jd-reading（读 JD 四层拆解，assistant 作用域，默认开启）、great-resume（经历酥化，assistant 作用域）、job-match（证据驱动岗位匹配，job-analysis 作用域）为增强技能，可在设置页手动启用；技能入口每次从磁盘重读（`reloadSkills()`）；支持自定义技能导入 / 新建 / 删除（`userData/skills`，白名单防路径穿越）；设置页「AI 技能」卡片管理。
+* **AI 技能体系**：`skills/` 内置 7 项（resume-profile / job-analysis / greetings / tailor-cv / jd-reading / great-resume / job-match，SKILL.md），按作用域注入 system prompt；greetings 即「工作台定制的打招呼语提示词」统一口径，驱动工作台岗位招呼语 / 简历中心 JD 预览 / 定制简历求职信；jd-reading（读 JD 四层拆解，assistant 作用域，默认开启）、great-resume（经历酥化，assistant 作用域）、job-match（证据驱动岗位匹配，job-analysis 作用域）为增强技能，可在设置页手动启用；技能入口每次从磁盘重读（`reloadSkills()`）；支持自定义技能导入 / 新建 / 删除（`userData/skills`，白名单防路径穿越）；设置页「AI 技能」卡片管理，自行导入 / 新建的技能、以及自行放进 `skills/` 目录的非出厂技能都显示「删除」入口（出厂内置技能按 `SHIPPED_SKILL_IDS` 只读，仅可停用；目录只读时删除自动降级为屏蔽名单 `userData/skills-removed.json`）。
 
 * **LLM 预设**：OpenAI / DeepSeek / 通义千问 / 智谱 GLM / 硅基流动 / 火山方舟 / 自定义（OpenAI 兼容端点）。
+
+### 可选桥接与隐身增强
 
 * **OpenClaw 桥接**：本地 Node 服务（127.0.0.1:18765）提供状态 / 日报 / 指令控制 / OCR / 简历解析 / **日志查看**。
 
@@ -46,7 +60,11 @@
 
   * **不绕过验证码 / 账户验证**：code 35/36/32 立即停止并交人工。
 
-* **自动沟通**（「自动沟通」页）：Camoufox 隐身引擎**多平台批量沟通**，按平台优先级串行消费（先完成高优先级平台的全部已确认岗位，再切下一平台）。投递语义按平台适配：BOSS 输入并发送打招呼语（**文字气泡确认**）；猎聘点「聊一聊」→ 平台用 **App 预设招呼语自动发送**（须先在猎聘 App 设置招呼语文案，脚本不注入文本），确认聊天窗打开 / 按钮变「继续聊」即计成功；智联 / 前程无忧点「投递」（前程无忧按「批量投递」+ 成功数量确认），确认「投递成功」/「已投递」即计成功。**AI 跟聊（needsReply）仅 BOSS 聊天链路支持**，其余平台回复请在平台 App 内人工跟进。平台卡片实时显示各平台引擎 / 登录状态，可逐平台「登录 / 退出」；未确认投递结果不计成功、code 35/36/32/37 立即停止交人工。
+### 自动沟通
+
+* **自动沟通**（「自动沟通」页）：Camoufox 隐身引擎**多平台批量沟通**，按平台优先级串行消费（先完成高优先级平台的全部已确认岗位，再切下一平台）。投递语义按平台适配：BOSS 输入并发送打招呼语（**文字气泡确认**）；猎聘点「聊一聊」→ 平台用 **App 预设招呼语自动发送**（须先在猎聘 App 设置招呼语文案，脚本不注入文本），确认聊天窗打开 / 按钮变「继续聊」即计成功；智联 / 前程无忧点「投递」（前程无忧按「批量投递」+ 成功数量确认），确认「投递成功」/「已投递」即计成功。**AI 跟聊仅 BOSS 支持**，其余平台回复请在平台 App 内人工跟进。**「AI 跟聊监听」**（自动沟通页开关，独立于批量投递）：开启后引擎用**单一常驻浏览器停在 BOSS 会话页**（Python `/chat-watch`：`start` / `scan` / `open` / `send` / `stop`，与批量投递**共用同一 pacer 与冷却不变量**，批量投递运行时本轮监听让路，避免两个隐身窗口争抢），每轮巡检间隔 2 分钟、每轮最多处理 6 个会话、两次回复最小间隔 20s；发现 HR 新消息即带**完整多轮聊天上下文**生成回复并发送，HR 明确拒绝则收口该会话（记指纹 + 拒绝时间）不再回复，系统提示 / 表情 / 无实质内容只记指纹、不重复调用 AI；回复类发送只记 `replySentAt`，**不计入单日投递上限**（不改 `sentAt`）。回复中可引用的薪资期望 / 面试时间 / 到岗时间等来自「沟通信息（AI 跟聊引用）」用户自填内容，留空则不作任何此类承诺；冷却期或 BOSS 未登录时不允许开启。平台卡片实时显示各平台引擎 / 登录状态，可逐平台「登录 / 退出」；未确认投递结果不计成功、code 35/36/32/37 立即停止交人工。
+
+### 界面 · 调度 · 备份
 
 * **主题**：浅色 / 深色 / 跟随系统（antd + CSS 变量，状态持久化）。
 
@@ -58,15 +76,23 @@
 
 * **首页「阅读使用文档」**：首页操作区提供「阅读使用文档」按钮，主进程读取用户文档 `resources/docs/使用前必读.md`（开发与打包同源，均指向应用 resources/docs/，`extraResources` 已配置）经 MarkdownView 抽屉渲染。
 
+### 岗位筛选（确定性，本地执行）
+
 * **公司规模筛选**：设置页新增「公司规模」单选，映射 BOSS web 端 scale 参数（0-20人=301 … 10000人以上=306，不限 = 不附加过滤），参与搜索采集与搜索 URL 构造。
 
 * **面试方式筛选**（`main` 新增）：设置页指定「线上 / 线下 / 不限」，由 `interviewMode.ts` 做**确定性**识别（优先本地关键词，宽松不误杀）：「加入任务」时按岗位标题 / 描述 / 卡片文本判定面试方式；**未明确披露一律判为合格**，不参与过滤、不误杀；出现「无需到场 / 线上即可」等否定表述不判为线下。目的是排除与设定冲突的岗位，避免浪费每日打招呼配额。
 
-* **外部 Agent 通道**（默认关闭）：应用内控制桥（`electron/control-bridge.cjs`，仅监听 `127.0.0.1:17650`，除 `/health` 外要求 `x-bossclaw-token`，令牌写入 `<userData>/control-bridge.json`）+ 零依赖 stdio MCP 服务器 `mcp/bossclaw-mcp`（**8 工具 / 3 组**：运行控制 3 · 应用控制 2 · agent 代答 3）。动作由渲染层白名单 `controlRuntime.ts` 强制，**不提供发消息 / 批量投递 / 绕过验证码 / 改安全参数的能力**。
+* **岗位过期判定**（`main` 新增，`jobExpiry.ts` 唯一权威）：JD 中**显式写出**投递截止日期（猎聘 JD 常见「截止日期：YYYY年MM月DD日」，也认 `2027-07-16` / `2027/7/16` / 缺年份的「07月16日」）的岗位做纯本地**确定性**判定 —— **截止日当天仍有效**，早于今天即判过期并硬性排除，不消耗 AI Token 与投递配额；**未写截止日期、写成「长期有效 / 招满即止」、或日期不可解析一律放行**（大多数岗位不写该字段 ⇒ 对其它平台零副作用）。判定输入为标题 + 描述 + 卡片文本，**不做全页扫描**；`ingestJob` 与「加入任务」两条入口同口径拦截。设置项 `excludeExpiredJobs` 默认按平台取值（`PLATFORM_EXPIRY_DEFAULT`：**仅猎聘默认开启**），用户在设置页的显式开关**优先于**平台默认值。回归：`scripts/liepin-jd-regression.mjs`。
+
+### 外部 Agent 通道
+
+* **外部 Agent 通道**（默认关闭）：应用内控制桥（`electron/control-bridge.cjs`，仅监听 `127.0.0.1:17650`，除 `/health` 外要求 `x-bossclaw-token`，令牌写入 `<userData>/control-bridge.json`）+ 零依赖 stdio MCP 服务器 `mcp/bossclaw-mcp`（**9 工具 / 3 组**：运行控制 3 · 应用控制 2 · agent 代答 4）。动作由渲染层白名单 `controlRuntime.ts` 强制，**不提供绕过验证码 / 绕过速率限制 / 改安全参数的能力**；**发送类动作默认关闭** —— 仅当用户已在应用内开启「全自动」（`executionMode === 'auto'`）时 `deliverySendNow`（及 MCP 代答组 `bossclaw_agent_send`）才可用，自动沟通引擎 `autochatStart` / `autochatStep` 另受冷却 / 每日上限 / 招呼语非空守卫，所有发送均复用应用自带安全引擎。
 
 * **Agent 代答**（`main` 新增）：用户**未配置 AI API Key** 时，应用内 AI 调用（岗位分析 / 职业画像 / 打招呼语 / 定制简历）由 `agentAnswer.ts` 挂入本地待答队列并等待，在线外部 Agent 经 `bossclaw_agent_tasks`（长轮询，**领取即心跳**）领取、用自有模型生成、`bossclaw_agent_submit` 回填；超时 / 取消 / 无心跳则回落应用内本地规则。心跳窗口 90s，单任务等待 30~240s，JSON 纠错最多 1 次。**只搬运「提示词 ↔ 生成文本」**，回填仍走应用既有校验链。
 
-* **数据统计与导出**：`Stats` 页由 `statsAggregate.ts` 聚合（趋势「已投递」按投递成功时间归桶），支持导出**岗位明细 CSV / 统计汇总 CSV / 统计报表 PDF（A4 横版）**，每次导出都由系统保存对话框选择位置。
+### 数据统计与本地数据
+
+* **数据统计与导出**：`Stats` 页由 `statsAggregate.ts` 聚合（趋势「已投递」按投递成功时间归桶），含**投递漏斗**转化看板（采集入队 → 已投递 → 已打开沟通 → 已回复 → 面试，并给出占采集比、打开率 / 回复率），支持导出**岗位明细 CSV / 统计汇总 CSV / 统计报表 PDF（A4 横版）**，每次导出都由系统保存对话框选择位置。
 
 * **数据**：设置页可导出 / 导入 / 清空本地数据（localStorage），并支持「立即备份 / 从本地备份恢复」。
 
@@ -74,7 +100,7 @@
 
 ## 技术栈
 
-* **Electron** `^31`（主进程 CommonJS：`electron/main.cjs` + `electron/preload/*`）
+* **Electron** `^42`（Chromium 148；主进程 CommonJS：`electron/main.cjs` + `electron/preload/*`）
 
 * **React 18 + TypeScript + Vite 5**（渲染进程：`src/`）
 
@@ -103,7 +129,7 @@ desktop-app/
 │       └── cloakPreload.cjs          # CloakBrowser 页面预加载
 ├── bridge/                           # Node 桥接服务（mammoth / 文件 / 任务恢复）
 ├── camoufox/
-│   ├── camoufox_server.py            # Python 隐身搜索/发送桥（多平台调度基座 + BOSS 既有链路）
+│   ├── camoufox_server.py            # Python 隐身搜索/发送桥（多平台调度基座 + BOSS 既有链路 + `/chat-watch` 常驻 AI 跟聊会话监听）
 │   ├── platforms/
 │   │   ├── models.py                 # JobCandidate 等统一数据模型
 │   │   ├── capabilities.py           # 平台能力矩阵（与 platforms.ts 双源同口径）
@@ -112,7 +138,8 @@ desktop-app/
 │   │   ├── progress.py               # 词级断点续采（TTL 24h）
 │   │   ├── filters.py                # 「基础求职条件」跨平台码值映射唯一权威
 │   │   ├── common.py                 # 公共基座（人类化行为 / Cookie 按平台持久化）
-│   │   └── liepin.py / zhaopin.py / job51.py   # 各平台差异声明
+│   │   └── liepin.py / zhaopin.py / job51.py   # 各平台差异声明（搜索 URL 附加 / 投递 / 登录）
+│   ├── tests/                        # Playwright DOM 回归（test_chat_context.py + fixtures，聊天上下文隔离）
 │   └── requirements.txt
 ├── resources/
 │   ├── icon.ico / icon.png
@@ -128,7 +155,7 @@ desktop-app/
 └── src/
     ├── main.tsx / App.tsx / theme.ts / index.css
     ├── store/                        # useAppStore / useDataStore / useSettingsStore / useScheduleStore
-    ├── lib/                          # storage / electronApi / bridgeClient / controlRuntime / localBackup / scheduler / bossclaw/*（platforms 平台注册与能力矩阵 / matching / fitLevel / profile / greetings / schoolTier / jobMatch / jobAssistant / jdCleaner / skills / agentAnswer / statsAggregate / interviewMode 等）
+    ├── lib/                          # storage / electronApi / bridgeClient / controlRuntime / localBackup / scheduler / bossclaw/*（platforms 平台注册与能力矩阵 / platformUrls 各平台搜索 URL 构造 / matching / fitLevel / profile / greetings / schoolTier / jobMatch / jobExpiry 岗位过期判定 / jobAssistant / jdCleaner / docParser 旧版 .doc 解析 / skills / agentAnswer / statsAggregate / interviewMode 等）
     ├── components/                   # TitleBar / Sidebar / StatusBar / BrowserView / CloakView / PlatformChip / MarkdownView / feedback
     └── pages/                        # Home / Workbench / Resume / Directions / Tasks / ScheduleTasks / Stats / Assistant（定制简历）/ OpenClaw / AutoChat / Settings
 ```
@@ -176,6 +203,10 @@ npm start                  # 仅启动 Electron（需先 build 或 dev 服务在
 npm run typecheck          # 仅类型检查（不打包）
 npm run build              # 类型检查 + Vite 构建到 dist/
 npm run verify             # typecheck + build 组合
+npm run verify:all         # typecheck + 全部纯逻辑回归 + build（提交前跑这个）
+
+npm run test:all           # 35 个纯逻辑回归套件（约 1 分钟）；-- --list 可看清单与跳过原因
+npm run test:ipc           # IPC 通道清单一致性（白名单 vs 主进程注册 vs 渲染层直写）
 
 npm run package            # 构建并打包 Windows NSIS 安装包 + 绿色便携版
 npm run package:portable   # 仅打包绿色便携版（无需安装）
@@ -208,11 +239,14 @@ npm run package:all        # 打包 Windows + Linux
 
 ```
 release/
-├── BossClaw-2.5.5-x64.exe           # Windows NSIS 安装包（推荐发行）
-├── BossClaw-2.5.5-portable.exe      # Windows 绿色便携版（无需安装、解压即用）
-├── BossClaw-2.5.5-x64.exe.blockmap  # NSIS 增量更新 blockmap（electron-builder 自动生成）
+├── BossClaw-<version>-x64.exe           # Windows NSIS 安装包（推荐发行）
+├── BossClaw-<version>-portable.exe      # Windows 绿色便携版（无需安装、解压即用）
+├── BossClaw-<version>-x64.exe.blockmap  # NSIS 增量更新 blockmap（electron-builder 自动生成）
 └── win-unpacked/                     # Windows 解压目录（可手工分发的文件夹）
 ```
+
+> `<version>` 取 `desktop-app/package.json` 的 `version`（单一来源；安装包名由 electron-builder 按同一字段生成）。
+> 示例：`version` = `2.6.2` → `BossClaw-2.6.2-x64.exe`。
 
 ### Linux（`npm run package:linux` 或 `package:all`）
 
@@ -252,13 +286,13 @@ release/
 
 * **主进程**（`electron/main.cjs`，CommonJS）：单窗口生命周期 + IPC 总线 + `persist:bossclaw` 会话 + CloakBrowser / Camoufox / Node 桥 子进程管理。
 
-* **预加载**（`electron/preload/*.cjs`，`contextIsolation: true`）：`app.cjs` 暴露 `window.electron` API；`webview.cjs` 注入 BOSS 页面，跑官方 API + DOM 兜底 + 真实键盘输入。
+* **预加载**（`electron/preload/*.cjs`，`contextIsolation: true`）：`app.cjs` 暴露 `window.electron` API；`webview.cjs` 注入各启用平台页面（采集 + 真实输入 + 投递状态机）；平台选择器集中在 `platform-adapters.cjs`；`liepin-im.cjs` 只读猎聘 IM 状态；`humanize.cjs` / `stealth.cjs` 负责人类化节奏与反检测补丁。
 
 * **渲染进程**（`src/`，ESM）：React SPA + antd。`window.electron` 是唯一与主进程交互的接口。
 
 ### IPC 总线（白名单 channel）
 
-详见 `electron/main.cjs` 与 `electron/preload/app.cjs`：
+详见 `electron/main.cjs` 与 `electron/preload/app.cjs`（**121 条** `ALLOWED_IPC_CHANNELS` 白名单，其中模拟面试 `jc:mock-interview-*` 占 48 条；新增 `jc:` 通道必须同步登记，否则运行时抛错。登记是否漏了由 `npm run test:ipc` 兜底校验）：
 
 | Channel                       | 用途                                                |
 | ----------------------------- | ------------------------------------------------- |
@@ -272,12 +306,21 @@ release/
 | `jc:camoufox-*`               | Camoufox Python 桥（status / search / send / login / logout / restart，按平台） |
 | `jc:cloak-*`                  | CloakBrowser 隐身浏览器（启动 / 标签 / 输入 / health 健康检查自动重启）                  |
 | `jc:bridge-control`           | OpenClaw Node 桥启停                                 |
+| `jc:bridge-token`             | 取 OpenClaw 桥运行时令牌（`~/.bossclaw/bridge-token`，渲染层不再持有硬编码值） |
 | `jc:autostart-*`              | 开机自启动（Windows 登录项，get / set）                       |
 | `jc:backup-*`                 | 本地备份（dir-get / dir-set / dir-pick / write / read / delete） |
 | `jc:clipboard-write`          | 剪贴板写入（查看网页源码复制）                              |
-| `jc:save-pdf`                 | 定制简历 A4 打印成 PDF 并保存                              |
+| `jc:save-pdf` / `jc:save-pdf-batch*` | 定制简历 A4 打印成 PDF（单条 / 批量，含进度事件 `jc:save-pdf-batch-progress`） |
+| `jc:save-report-pdf` / `jc:save-file` | 统计报表 PDF / CSV 导出（系统保存对话框）                |
+| `jc:save-qualified-jobs` / `jc:qualified-jobs-dir-*` | 达标岗位 JSON 落盘与导出目录管理                  |
+| `jc:material-pick` / `jc:material-read` | 经历补充材料：选文件、读正文（不缓存、不持久化正文）          |
+| `jc:skills-*`                 | AI 技能库列出 / 读取 / 导入 / 删除（防路径穿越）                  |
+| `jc:llm-proxy`                | 主进程代发用户配置模型的 HTTP 请求（统一出口）                      |
+| `jc:models-probe`             | 网关模型能力探测（/v1/models，GET）：上下文 / 思考等级 / 模态能力（回环放行、公网强制 https） |
+| `jc:webview-diag` / `jc:webview-source` | webview 诊断信息 / 页面源码（复制用）                    |
+| `jc:mock-interview-*`（48 条） | 模拟面试：会话 CRUD / 导出（JSON 全量 + 单场 Markdown）、题库与题目、语音包安装与状态 / 朗读模型切换、ASR / TTS |
 
-所有 IPC handler 统一经 `safeHandle` 包装，未捕获异常写日志后**保持原有 throw 语义**（渲染端 `invoke` reject 行为不变）。
+所有 IPC handler 统一经 `safeHandle` 包装，未捕获异常写日志后**保持原有 throw 语义**（渲染端 `invoke` reject 行为不变）。`jc:save-pdf-batch*` 由 preload 直接 `invoke`，尚未纳入 `assertIpcChannel` 白名单校验（待统一）。
 
 ### 本地控制桥（不走 IPC）
 
@@ -297,7 +340,11 @@ release/
 
 * **运行时状态**（`useAppStore`）：主题、活动路由、桥状态、BOSS 登录态、引擎状态——**不持久化**（每次启动重置）。
 
-* **业务数据**（`useDataStore`）：岗位 / 任务 / 日志 / 画像——**持久化到 localStorage**（带 `bossclaw-data-version` 重置）。
+* **业务数据**（`useDataStore`）：岗位 / 任务 / 画像 / 方向 / 招呼语——**持久化到 `bossclaw-data`**（带 `bossclaw-data-version` 重置）。
+
+* **运行日志**（`useRuntimeLogsStore`）：日志 / 聊天日志——独立持久化到 `bossclaw-runtime-logs`，避免日志膨胀拖慢业务数据序列化。
+
+* **定时任务**（`useScheduleStore`）：定时条目 + 采集请求——持久化到 `bossclaw-schedule`。
 
 * **用户配置**（`useSettingsStore`）：LLM 密钥、过滤规则、招呼语、引擎模式——**持久化**（设置页可导出/导入）。
 
@@ -313,13 +360,94 @@ release/
 
 * **没配 AI API Key，AI 相关功能还能用吗？**：能。三条路径按顺序生效 —— ① 外部 Agent 代答（需开启控制桥且有 agent 在线，见「本地控制桥」）；② 应用内**本地规则**兜底（职业画像 `buildLocalProfile`、匹配、招呼语等）；③ 纯本地确定性能力（简历解析、噪音清洗、排序）不受影响。用户配了 API Key 即直连自己的模型，不会走代答。
 
-* **非 BOSS 平台采集不到详情 JD？**：内置浏览器链路对非 BOSS 平台只做**列表级**采集（这些平台搜索页没有内联详情面板，点卡片会导航走），详情 JD 由 Camoufox 隐身引擎链路（`camoufox/platforms/`）补齐。BOSS 是唯一「列表内联详情」形态。
+* **非 BOSS 平台采集不到详情 JD？**：内置浏览器链路对非 BOSS 平台只做**列表级**采集（这些平台搜索页没有内联详情面板，点卡片会导航走），列表卡本身**不含 JD 正文**；拿到列表后由 `webview.cjs::enrichJobDetail()` 按能力表 `PLATFORM_DETAIL_API_FILL` 调**平台同源**通道补齐 —— 智联 = 详情 JSON 接口（按卡片 number 取 `jobDesc`，滚动加载出的卡由主进程旁路监听页面自身的 `POST /c/i/search/positions` 并入注解索引）、猎聘 = **同源 SSR 详情页 HTML**（`parseLiepinJobDetailHtml()`，JD 在 `<dd data-selector="job-intro-content">`，同页顺带取标题 / 薪资 / 地点 / 公司 / HR）；前程无忧暂无同源通道，只有列表字段。**该补齐不需要 Camoufox**（未装内核也能拿到 JD）；护栏：单次上限 300 条 / 连败 4 次熔断，失败保留卡片文本、绝不丢岗位。BOSS 是唯一「列表内联详情」形态。
 
 * **采集卡住很久才报超时？**：先确认 `visual-collect` / `collect-control` 是否已注册（全平台注册是硬约束，漏注册会静默等到最长 15 分钟兜底超时）；preload 改动后必须重启 Electron（`webview.cjs` 是 CommonJS，HMR 不覆盖）。
+
+* **模拟面试语音包下载慢 / 失败？**：应用内「设置 → 语音」走 `sherpa-onnx` 上游 / hf-mirror 下载，国内直连常常只有几十 KB/s。可改用根目录 `enable-speech-packs.cmd`（镜像重试 + 断点续传 + 体积与 sha256 双校验），或从 [v2.6.2 Release](https://github.com/YanQuan-dozzy/Boss-Claw/releases/tag/v2.6.2) 直接下载四套资源包（Kokoro 359MB / MeloTTS 167MB / SenseVoice 240MB / ZipVoice 158MB，外加 `speech-packs.json` 校验清单），再用 `powershell -ExecutionPolicy Bypass -File .\enable-speech-packs.ps1 -Packs all -SourceDir <下载目录>` 离线安装。落位目录为 `%APPDATA%\BossClaw\speech\models`，与应用内状态一致。
 
 ***
 
 ## 变更记录
+
+* **v2.6.4（2026-11-20 发布）** — 企业背调 + 本地存储重构 + HR 回复提醒：
+  * **企业工商信息（A 层）**：新增 `src/lib/companyProfile.ts`，按标签驱动解析公司主页 —— 同行 / 分行 / 全角冒号 / 同一行多组混排都能取到；注册资本统一按万元归一（外币不折算）、成立日期兼容三种写法、经营状态「吊销」优先于「注销」；「暂无」「查看详情」这类占位文案进黑名单，整页一个有效字段都没有时返回 `null`，不产空壳。`bizRiskHints` 只做**能直接从字段推出的**提示（注销 / 吊销、成立不足半年、注册资本偏小、参保人数为 0），**不评级、不自动跳过、不改 status**。`CompanyBizPanel` + 岗位卡摘要标签复用既有 page-read 读当前页，未新增 preload / 主进程代码；结果落 `JobMeta.companyProfile`。
+  * **企业背调（B/C 层）**：`src/lib/companyDueDiligence.ts` 生成搜索链接（默认 Bing，可切百度 / 搜狗，**不自动抓取**）；负面信号提取要求「裁员」「罚款」等中性词与强语境**同段共现**才算命中，避免误报。评级铁律：每条依据必须挂来源编号（A / S1…），挂不上来源的直接丢弃，一条都不剩就报错、不给评级；prompt 明确禁止替代用户判断「要不要投」。`page-read` 增返 `links`，让信号能挂到单条搜索结果而不是整页；结果落 `job.dueDiligence`。
+  * **队列按条落盘**：岗位队列从「整表重写」改为 `queue/items/<sha1(id)>.json` + `index.json`，日常保存只提交变化条目（`jc:queue-save-patch`），索引保留最近 24 份快照；`resumeText` / `resumeFileName` / `imageResumes` 迁到 `queue/resume.json`，不再吃 `localStorage` 配额。备份恢复兼容 v1 / v2 队列载荷与旧 `bossclaw-data` 简历字段（自动合并 / 剥离），存储页分别展示队列与简历的磁盘占用。
+  * **求职进展**：新增 `progressStage`（与投递 `status` 正交），AI 跟聊识别到约面 / 拒绝时自动写入，任务页可手动标记，统计页补漏斗面试数与分布。
+  * **HR 回复提醒**：`notifySystem` 支持 `clickAction`；HR 回复按 **10 分钟聚合**推送，HR 明确拒绝则立即提醒（绕过聚合）；点击通知回跳自动沟通页并聚焦、高亮该会话。设置页相应补「后台运行与通知」卡。
+  * **网关模型能力探测**：自定义 OpenAI 兼容端点不再一律按「未验证支持思考」处理，改为拉 `GET {baseUrl}/models` 动态发现上下文窗口（`context_length` / `context_window` / `max_input_tokens` 三种写法）、思考支持与等级、输入 / 输出模态、工具调用；`stripOrgPrefix` 剥掉路由分组，用户填 `model-a` 也能对上网关 id `auto/model-a`。失败或未命中一律 fail-safe 回落静态判定，成功结果持久化跨重启生效；设置页防抖 450ms 自动探测。
+  * **每日检查更新**：`checkForUpdatesDaily` 按本地自然日每天最多请求一次 GitHub Releases，读不到版本号不占当天额度、异常不抛出；启动延迟 2 秒触发，发现新版本给右上角通知与「前往下载」入口，**仍不自动下载或替换程序文件**。
+  * **模拟面试报告二期**：报告页补齐雷达图、场次对比与导出，追练入口接回公开侧实现（剥离私有覆盖层）。
+  * **修复**：完整聊天页「假成功」（发送确认改为只认真实己方气泡）、猎聘投递脚本按需加载（缺失只降级本平台，修隐身引擎启动即退出 #24）、asar 关闭时跳过 unpack 覆盖断言、模型候选列表与能力探测解耦（空模型名也能发现网关模型）。
+  * 回归：新增 `company-biz-regression`（75 项）、`company-due-diligence-regression`（58 项）、`model-capabilities-regression`（69 项）、`notify-reply-regression`、`progress-stage` 等套件，`test-all.mjs` 共 48 套。
+  * 门禁：`npm run verify`（typecheck + lint + build）+ `npm run test:all` 全绿。
+
+* **v2.6.2（2026-11-08 发布）** — 后台常驻 + 系统通知 + 更新检查 + 语音模型可切换：
+  * **关窗收进托盘**：原来的 `window-all-closed → app.quit()` 让「定时任务」只在窗口开着时生效，误关（或点标题栏 ×）会直接停掉在途投递。现在主进程增加 `Tray`，`close` 事件只有在「非退出中 + 用户开启常驻 + 托盘创建成功」**三条同时成立**时才 `preventDefault()` 并 `hide()`；真正退出只走托盘菜单 / 系统退出（`before-quit` 置 `isQuitting` 放行）。任一条不满足就照常关窗 —— 宁可退出，也不能出现「窗口藏了但唤不回」。偏好为 `AppConfig.closeToTray`（默认开），渲染层启动与变更时经 `jc:tray-prefs-set` 推镜像。
+  * **系统通知**：新增 `src/lib/notify.ts` 作为唯一入口（主进程 `jc:notify` → `Notification`，点击唤回窗口）。只在这三处发：首次投递验收暂停、风控命中暂停、定时任务触发 / 备份完成；`AppConfig.systemNotify` 可关，主进程侧按同一份镜像二次拦截。不做「每条投递成功都弹」。
+  * **检查更新**：设置页「版本与更新」经主进程 `jc:fetch-url` 读 GitHub Releases 最新 tag，有新版本给下载入口；**不自动下载或替换程序文件**（未签名 + `asar:false`，静默替换易被拦截且不利于回退）。版本比较走 `parseVersion` / `isNewerVersion` 的三段数字，避免 `"2.10.0" < "2.9.0"` 的字典序错误；结果缓存 6 小时。
+  * **CI 入库**：`.gitignore` 的 `.github/` 改为 `.github/*` + `!.github/workflows/` —— 之前 workflow 写了但被整体忽略，GitHub Actions 上从未跑过。
+  * **ESLint 接入**：新增 `eslint.config.mjs`（flat config）与 `npm run lint` / `lint:fix`，`verify` / `verify:all` 前置 lint（CI 因此自动带上）。基线取 `typescript-eslint` recommended **不带 type-checked**（数万行 + 多 tsconfig 引用会让单次 lint 到分钟级），定位是「补 tsc 看不见的问题」而非造第二套类型检查 —— 只保留 React Hooks 依赖数组、显式 `any`、主进程 CJS 未定义变量三类。为适配本仓库刻意关掉三条并写明理由：`no-control-regex`（JD 清洗必须写 `\x00`）、`no-useless-escape`（改正则纯风险）、`no-empty` 只留「非 catch 的空块」；`no-fallthrough` 开 `allowEmptyCase`（消息分发 switch 大量空 case 穿透）、`prefer-const` 开 `ignoreReadBeforeAssign`（`let timer` 被闭包先读后赋值）。`electron/preload/webview.cjs` 与 `electron/cloakbrowser/*.cjs` 补 browser globals（内含注入页面执行的函数体）。当前基线 **0 error / 267 warning**（全部是 `no-explicit-any`），warning 不阻断构建。17 处 hooks 依赖告警已逐条处理完毕：5 条真漏依赖补齐（`BrowserView` / `Workbench` / `Home`）、`MetricCard` 数字动画改用 ref 读起点（否则每帧重启动画）、`hooks.ts` 用 `void version` 显式声明「重算信号」、8 条刻意的细粒度依赖加 disable + 理由（`AutoChat` / `OpenClaw` / `Settings` / `MockInterview`）；另把 `flushLastSkipLog` 与 `pauseAssist` 包成 `useCallback`，消除「普通函数每渲染换引用 → 上层 useCallback 缓存全失效」的级联问题。
+  * 回归：新增 `update-check-regression.mjs`（27 条：版本解析 / 三段比较 / 网络失败与限流降级 / 缓存命中不重复请求）。IPC 白名单 121 → 123（新增 `jc:notify` / `jc:tray-prefs-set`）。
+  * 门禁：`tsc -b` + `vite build` + `test:all` 通过。
+
+* **v2.6.2（同上版次，2026-11-01 入库）** — 朗读模型可切换 + 克隆音色口径收敛：
+  * **第二套「听」包 MeloTTS**：内置朗读模型不再写死 Kokoro，新增 MeloTTS（`vits-melo-tts-zh_en`，44.1kHz 单女声，约 167MB，音色更接近真人录音）。两套包**可并存**、各自独立下载 / 删除，设置页「语音」卡片按模型行展示「当前使用 / 已下载 / 切换到这套 / 删除」；切换只写偏好 `settings.ttsPack` 并重启语音 worker（旧 `OfflineTts` 实例还占着内存），删掉当前生效的那套自动回落另一套，装完自动切到新装的那套。唯一判定点是 `speechInstall.activeTtsPack()`，UI / 合成 / 预热都从它取引擎。
+  * **引擎分派修正**：`modelConfig()` 改为返回 `{engine, config, pack, dir}`，`planVoice` / `warmup` / `status().engine` 不再写死 `kokoro`（否则切到 MeloTTS 仍拿 Kokoro 配置去加载）；MeloTTS 是单说话人，内置音色表里传的 `sid` 强制归 0，否则 sherpa 拒收。
+  * **导入包识别 MeloTTS 布局**：`mockInterviewVoicePack.isMeloLayout()` 按「`model.onnx` + `tokens.txt` + `lexicon*.txt`，无声码器 / 无 `voices.bin` / 无同名 `.onnx.json`」精确判定，不再被 Piper 规则误判成「原生包需转换」，也不与 Matcha 撞车。**MeloTTS 的 `dataDir` 必须留空** —— 包里那个 `dict/` 是 jieba 分词表，当音素目录传下去 sherpa 会报 `dict/phontab does not exist` 直接加载失败。
+  * **克隆音色**：功能名统一为「克隆音色」（原「克隆我的声音」），创建时**不再要求勾选授权声明**（`licenseAck` 从渲染层、IPC payload 与 manifest 中移除）；保留「参考音频只存本机、不上传、不建声纹库、只用于题干预生成」的数据边界说明。
+  * **开发期语音目录**：非打包运行且 `desktop-app/tmp/speech/models` 存在时直接认该目录（免在每台开发机重下三套模型）；「清空全部数据」只删落在 `userData` 下的语音目录，不连带删开发机模型，打包版行为不变。
+  * 回归：新增 `speech-pack-switch-regression.mjs`（11 条，两套并存 / 切换落盘 / 删生效包回落 / 非法包名拒绝）与 `mock-interview-voice-melo-smoke.mjs`（真模型冒烟，默认跳过）；`voice-pack-regression.mjs` 19 → 22 条（MeloTTS 判定 / `dict` 不当音素目录 / 带声码器的 `model.onnx` 不误判），`voice-repo-regression.mjs` 13 → 12 条（授权门槛用例退场）。IPC 白名单 120 → 121（新增 `jc:mock-interview-speech-set-pack`）。
+  * 门禁：`tsc -b` + `vite build` 通过；`test:ipc` / `repo-hygiene` 通过。
+
+* **v2.6.1（2026-10-31 发布）** — 稳定性版本：数据持久化 / 隐身登录 / 采集翻页 / 投递中断四条主线修复：
+  * **本地数据不再丢（issue #10 根治）**：岗位队列整体迁出 `localStorage`，改存主进程 `userData/queue/queue-store.json`（原子写 tmp+rename、`.bak` 回退、防抖合并 + 单飞串行）；首启自动迁移并验真后清理源数据；`clearAll` 一并删除队列目录，导入改 `await`；状态栏 / 设置页按「存储去向」展示队列文件占用。配套 `queue-store-regression.mjs`（38 断言）。
+  * **持久化健康可见**：`persistSafe` 新增失败状态（原因 / quota / 次数，成功即清）、失败订阅与内存态快照；失败当刻强制落备份（60s 限频），导出优先内存态；状态栏常驻「本地数据未保存」红标（≥80% 提前琥珀预警），设置页新增「本地存储用量」卡片；主进程 `userData` 心跳锁实现单实例守卫（存在 + mtime 120s + pid 存活三重判定）。
+  * **存储配额口径修正**：实测 Electron `localStorage` 上限 52,428,800 码元（50MB，非流传的 5MB），按「键名 + 值」码元计费；`--unlimited-storage` 实测无效。`LOCAL_STORAGE_QUOTA_BYTES` → `LOCAL_STORAGE_QUOTA_UNITS`，进度条与预警阈值同步。
+  * **隐身通道登录态**：Camoufox 指纹首次生成后落盘复用（`camoufox-identity-{platform}-{os}.json`）、profile 按平台持久化（`camoufox-profiles/{platform}`），修掉「刚扫码成功、一投递就要求重新验证」；登录态判定加入过期检查（毫秒 expires 归一秒）、`load_cookies` 跳过过期条目；退出登录连 profile 一起清；设置页为各平台补「隐身扫码登录 / 退出隐身」；自动沟通页对 BOSS 也做登录拦截。离线回归 23 例（`test_browser_identity` / `test_auth_cookie_expiry`）。
+  * **采集翻页（issue #7）**：设置页 Camoufox 面板改为常驻（不再被 `engineMode` 包裹），「隐身搜索页数」→「搜索结果页数」并补单位 / 上限 / 默认值说明；断点续采改按页数比对（`combo_entry()` 深拷贝 + `min_pages` 判据，页数不足只返 False 不删条目，`PROGRESS_VERSION` 1 → 2）；页数上限 `min(5,…)` → `clamp_pages()`（默认 10、`BOSCLAW_MAX_SEARCH_PAGES` 可覆盖、硬上限 20）；BOSS 隐身通道补回「基础求职条件」（`filters.py` 新增 `BOSS_*` 码表与 `_boss_params()`，与 `searchUrl.ts` 逐字一致并有源码级双源守卫；薪资刻意不参与 BOSS）。新增 `test_progress_resume.py`（11 例）/ `test_boss_filters.py`（12 例）。
+  * **投递可中断**：暂停 / 停止不再清 `activeId` 与 `applyStage`（避免在途回传因路由键丢失被丢弃），新增 `deliveryAbortRef` 中止信号，批次休息 / 岗位间隔 / 页面就绪等待均可在 1s 内中断；沟通动作未下发时岗位保持队列态，`runNext` 增加暂停守卫。
+  * **技能注入**：`skillInstructionsFor` 由同步改 `async` 并 `await ensureSkillsLoaded`，启动预热未完成或刚导入自定义技能时不再静默退化为内置兜底；所有调用点（画像 / 岗位分析 / 求职信 / 模拟面试）同步补 `await`。
+  * **HR 活跃度分档**：新增周 / 月数字解析（阿拉伯数字、中文数字与「半」），修掉「2周内活跃」漏判与「2月内活跃」误判为「本月活跃」；补 9 条回归断言。
+  * **简历中心预览**：新增 `skipHardBlockShortCircuit`，预览不再因学历 / 求职类型等本地硬条件早退恒回退本地规则；输入框内容按「技能 → 输入框 → 内置」优先级注入主分析 system prompt。
+  * **CloakBrowser 采集通道**：新增 `cloakCollector.cjs` 承载采集主循环（逐卡滚动 / 高亮 / 详情提取 / 列表级采集 / JD 补齐），选择器复用 `platform-adapters.cjs`；launcher 固定注入顺序（适配表 → 采集器 → preload），缺失文件带路径告警；`CloakView` 用 `probeId` + `page-status-result` 一次性事件补页面状态探测，采集器缺失立即回 `collect-error`，不再白等 15 分钟兜底超时。
+  * 门禁：`tsc -b` + `vite build` 通过；`scripts/test-all.mjs` 纯逻辑回归通过（含 `queue-store` / `persist-health` / `bank-recall` 等）。
+
+* **v2.6.0（2026-10-22 发布）** — 新增「模拟面试」+ 文档层更新：
+  * **模拟面试（Phase 1–4B 首次随包发布）**：新增 `pages/MockInterview.tsx` 与 `lib/bossclaw/mockInterview*.ts` 一整套本地链路 —— 两段式出题（通用题 → 按简历与上一轮回答深挖）、本地规则优先的动态追问、4+1 维四档评分与本地加权总分、雷达图 / 同岗位上一场对比 / 按缺口追练 / 长期弱项聚类、报告导出（单场 Markdown + 全量 JSON）、会话落盘主进程并支持断点续练与单题重答。
+  * **本地语音**：题干与追问本地朗读（Kokoro + sherpa-onnx，8 音色，题干预渲染 WAV 缓存；追问走流式合成边出边播），可选 Edge 神经语音（默认关闭，失败静默回落本地）；支持导入 Piper 转换版 / VITS 音色包；语音作答走 SenseVoice 16k 本机转写；「克隆音色」ZipVoice 零样本，参考音频不出本机。主进程新增 `electron/speechService.cjs` / `speechWorker.cjs` / `speechInstall.cjs` / `edgeTts.cjs` / `wav.cjs` 与 `mockInterview*Repo.cjs`，IPC 白名单 66 → 112（按模拟面试通道分组）。
+  * **本地面试题库**：`resources/bank/zh-interview-small.json`（13.6K 题，Apache-2.0，来源与清洗口径见 `resources/bank/NOTICE.md`）+ BM25 召回（召回 20 条候选，同一次 AI 调用内完成重排），支持 JSON / CSV / Markdown / docx 导入与增删改。
+  * **⚠️ 测试状态**：该功能**尚未经过完整测试**，本版按「可自行试用」发布，不保证稳定；在线语音引擎与打包冒烟尚未完成。遇到问题请提 Issue。
+  * **⚠️ 开源范围**：该功能的部分优化与更新代码**暂不开源**，公开仓库中的实现与安装包内的实现可能不完全一致。
+  * **文档**：根 README 信息架构重排（新增「为什么做 / 适合谁 / 与其他方案的区别 / 当前能力规模」四节，核心功能拆为 15 个编号小节），架构图补浅色 / 深色 SVG，技能数 7 → 9、侧栏入口 11 → 12、IPC 白名单 66 → 112 三处口径修正。
+  * 门禁：`tsc -b` + `vite build` 通过；`scripts/test-all.mjs` 纯逻辑回归通过。
+
+* **v2.5.7（2026-10-13 发布）** — 工作台岗位「定制简历」+ 猎聘投递链路升级 + 控制桥 / 本地桥安全护栏批次 + 社区贡献修复：
+  * **工作台岗位「定制简历」**（`tailorJob.ts` / `tailorBatch.ts` + `TailorResultView` / `JobAssistant`）：单岗位 / 批量 / 迭代三档生成，主进程 `resume-pdf-batch.cjs` 独占写盘防竞态（`wx` + 同名自动编号），配套 `test:tailor-job` / `test:tailor-batch` / `test:tailor-iteration` 三支回归。
+  * **猎聘投递链路升级（双通道同源）**：webview（preload）与 Camoufox（Python）均改为「点『聊一聊』→ 校验草稿 / 会话未变 → **真实输入本岗位招呼语** → 发送 → 读取 IM 状态确认**新增本人文字消息**才计成功」（仅会话打开不再计成功）；输入 / 发送前后命中风控即停交人工，草稿异常保留待人工核对。新增只读 IM 状态模块 `electron/preload/liepin-im.cjs`（纯 DOM 零 Electron 依赖，可离线回归）与 `test:webview-send` / `test:webview-native-send` / `test:liepin-im` / `test:liepin-delivery`（Python）回归。
+  * **控制桥 / 本地桥安全护栏批次**：本地桥令牌改**运行时随机生成**（`~/.bossclaw/bridge-token`，仅本机可读）+ Origin / Host 白名单 + 常量时间比较（C-2 / L-4），`config.json` 移除硬编码令牌；控制桥 `CONFIG_DENY` 补安全侧配置（活跃时段 / 批次休息 / 首条验收 / 日上限，防 agent 关掉安全节奏自证绕过，H-1）、`uiClick` / `uiType` / `uiSubmit` 强制显式 scope 且拦 app 作用域高危控件（H-2）、`autochatStart` / `autochatStep` 补 `executionMode` 护栏（C-1）、浏览器导航走招聘平台白名单（M-35）；素材「按路径读取」采用文件名 / 目录黑名单 + 扩展名白名单（H-6 / M-3）；`App.tsx` 页面常驻不再随进入工作台整体卸载（M-41）。
+  * **社区贡献修复（PR #5 / Fixes #4）**：**Camoufox 聊天上下文隔离，修复搜索框误识别** —— BOSS 沟通链路把搜索 / 筛选控件**硬排除**；聊天就绪判定、身份核验、输入、发送与附件全部限定在同一「**已验证聊天面板**」内，不再把搜索框误当聊天输入框；目标不明或冲突时 **fail-closed**（`sent=false`），发送前与附件前**重复核验**；修复 Playwright `evaluate` 单参数调用错位；新增真实 Playwright DOM 回归 `camoufox/tests/test_chat_context.py`。
+  * **界面**：自动沟通「安全节奏」卡片排版收敛 —— 三格等宽等高 / 作息改单列整行 / 字段级说明收进 Tooltip。
+  * **依赖锁修复**：`package-lock.json` 对齐 Electron 42 / electron-builder 26（此前 lock 仍锁 31.7.7 / 24，干净 `npm ci` 会装回 Electron 31 致升级丢失）。
+  * 门禁：`tsc -b` + `vite build` 通过；`scripts/` 全量静态回归通过。
+
+* **v2.5.6（2026-10-09 发布）** — 内核升级 Electron 31 → 42 + 内置浏览器反检测增强 + 猎聘 / 前程无忧全链路 + 岗位过期判定 + AI 跟聊监听 + 代码审查修复：
+  * **内置浏览器「主世界」反检测补丁**（新增 `electron/preload/stealth.cjs`）：`<webview>` 的 preload 与 `session.setPreloads` 均运行在**隔离世界**，改不了主世界 `navigator` —— 故补丁以源码字符串导出，由主进程 `executeJavaScript` 注入**主世界**（`did-start-loading` + `dom-ready` 双时机、内建幂等守卫）。补丁项 `uaCh` / `languages` / `notification` / `chromeObject` / `toStringGuard` 可用环境变量 `BOSSCLAW_STEALTH`（`off` / `only=a,b` / `skip=a,b`）单项开关；`webdriver` / `plugins` 经实测原生即正常，默认不改（盲改反会引入新破绽）。内置 11 类指纹自检探针 + 不变量断言（改补丁后必跑，防「修一个洞、开两个洞」）。
+  * **请求头层与真机画像对齐**：一份 `TARGET_PROFILE` 同时驱动 `setUserAgent` / `webRequest.onBeforeSendHeaders` / 主世界补丁三处（**禁止各写一份**，否则产生「JS 说一套、请求头说另一套」的新矛盾）。依据真机抓包样本对齐 `Sec-CH-UA` / `Sec-CH-UA-Mobile` / `Sec-CH-UA-Platform` / `Accept-Language` / UA —— 实测原生导航请求**完全不发送 `Sec-CH-UA` 系列头**，而 JS 层 `navigator.userAgentData` 却存在，属服务端直接可见的自相矛盾，现已补齐。
+  * **JD 学历解析修正**（`jobMatch.ts`）：「本科及以上」不再被升档成「要求硕士」，「X 优先」等语气词不计入要求，薪酬福利句不再被误采信；`score-regression.mjs` 扩至 44 项。
+  * **猎聘 / 前程无忧全链路补齐**：`platformUrls.ts` 新增猎聘筛选码表与 `appendLiepinCriteria`（经验 / 学历 / 规模 / 公司性质 / HR 活跃度 / 融资阶段）、前程无忧 `buildJob51SearchUrl`；`liepin.py` / `job51.py` / `filters.py` / `common.py` / `base.py` 收敛「搜索 · 投递 · 登录」三段差异声明；新增三支回归 `scripts/liepin-url-regression.mjs`（筛选码值 ↔ `filters.py` 双源同步守卫）· `liepin-jd-regression.mjs`（详情页 HTML → 字段补齐，JD 保真保留分段）· `liepin-apply-regression.mjs`（「聊一聊」`a.btn-main[data-selector="chat-chat"]` + IM 就绪信号 `#im-c-entry` 等，纠正旧错误的 `.__im_basic__*` 命名）。
+  * **岗位过期判定**：新增 `jobExpiry.ts`（纯函数、零依赖、可离线回归）—— 仅当 JD **显式写出**截止日期时判定，过期即硬性排除、无信号一律放行；设置项 `excludeExpiredJobs` 默认仅猎聘开启（`PLATFORM_EXPIRY_DEFAULT`），`ingestJob` 与「加入任务」两条入口同口径拦截。
+  * **AI 跟聊监听**：Camoufox 新增常驻 `/chat-watch`（单一常驻浏览器停在 BOSS 会话页；`start` / `scan` / `open` / `send` / `stop`），渲染层 `useAutoChatStore` 新增监听循环（2 分钟一轮、每轮 ≤6 会话、最小间隔 20s、批量投递让路、代际 token 防串台）；HR 明确拒绝则收口会话，回复类发送不计入单日投递上限；自动沟通页新增「AI 跟聊监听」开关与「沟通信息（AI 跟聊引用）」输入卡。
+  * **投递链路**：工作台非 BOSS DOM 投递（`platform-adapters.cjs::PLATFORM_APPLY_SPEC` + `webview.cjs::platformApply`）补齐猎聘「聊一聊」分支，四个平台全部可在工作台一键投递；`jobIdFromUrl()` 收口为唯一权威（`/job/xxx.shtml` 排除点号、`jobs.51job.com` 取末段）；猎聘卡片容器归一 + CSS Modules 驼峰类名口径校验（`[class*=]` 区分大小写，写错会静默把整页卡塌成 1 条候选）。
+  * **统计与首页**：`Stats` 页新增**投递漏斗**（采集入队 → 已投递 → 已打开沟通 → 已回复 → 面试 + 打开率 / 回复率）；首页补齐投递步骤归因（进度不再无声停在 80%）。
+  * **岗位发布时间透传**：`camoufox_server.py` / `webview.cjs` / `camoufox.ts` 贯通 `publishTime`，修复「新鲜度」维度恒失效。
+  * **界面**：新增 `index.polish.css` 组件级 polish 样式层与组件级主题 token；设置页「硬性过滤 / 求职偏好」栅格改零留白排布（开关类字段内联同行）；修复工作台事件回调被冻结导致 `apply-stage` 全量丢弃。
+  * **内核升级 Electron 31 → 42**（Chromium 126 → 148，`electron-builder` 24 → 26）：真机实测 `<webview>` 四项关键能力（`did-attach-webview` 触发 / preload 注入 / `sendToHost` 路由 / 主进程 `executeJavaScript` 往返）全部可用，`display:flex` 渲染未受影响（「改 block 会缩到约 150px」这个坑未被破坏）。两处 API 适配：`console-message` 首参在 42 起变为对象（统一 `parseConsoleMessage()` 收敛，旧位置参数取法虽仍可用但已 deprecated）、`session.setPreloads` / `getPreloads` 弃用（改 `registerPreloadScript`，双版本兼容）。升级后 UA / UA-CH 版本号由内核真实产生，反检测补丁从「伪造版本」退化为「只补真实缺口」。
+  * **输入通道收口（第一期）**：BOSS 聊天链路改**真实事件优先** + 人类化鼠标轨迹 —— 把 `isTrusted:false` 的 `el.click()` / `dispatchEvent` 迁往真事件通道（`isTrusted:true`）的第一步；新增**活跃时段与批次休息**，按真人作息分布安排投递节奏（**不改变**速率上限与安全不变量）。
+  * **代码审查修复（批次 1-14）**：AI 管线缓存污染与画像前置（`aiAnalyzeJob` 前必须 `dataSetProfile`）、安全不变量（投递守卫判定顺序纠偏 / 账号级额度与用量口径**同源收敛** / 风控冷却改**单调合并**写入，禁裸 `Date.now() + cooldownMs`）、并发限速（双引擎共享同一 `ActionPacer` 与计数）、主进程通道分桶与诊断日志门控、`chat-watch` 超时与 stdio 背压、设置页「节奏设置」三处修正（含**风控冷却实为死设置**）；新增静态守卫 `scripts/css-guard-regression.mjs`（12 项，拦截未定义 `className` 工具类等）与 `scripts/theme-vars-regression.mjs`（主题变量悬空）。
+  * **修复简历中心 PDF 解析卡死**：根因三层 —— ① 解析器无差别解码所有 `stream` 对象，**字体程序二进制**被当作文本候选；② 回退扫描仅凭「含 `BT`」判断像内容流（随机二进制常含该字节）；③ 数组文本算子正则在 `<` / `(` 上存在多条可覆盖同一字符的回溯路径 → **灾难性回溯**（实测 329KB 字体流单次分词 **81,281ms**，1MB 以上卡死渲染进程）。处置：正则消歧（单字符类排除 `<` `(`，退化为线性）、字体 / 图像 / 元数据 / 交叉引用流一律不解码、新增内容流**形状闸门**（尺寸上限 + 文本算子存在 + 可读字符占比）。1MB 字体流 4603ms → 48ms，2MB 从置死 → 86ms；并修正「扫描件 PDF 把字体垃圾当简历正文」的内容质量缺陷。新增 `scripts/pdf-parse-regression.mjs`（31 项，含反向自证）。
+  * 门禁：`tsc -b` + `vite build` 通过；`scripts/` 全量静态回归通过。
 
 * **v2.5.5（2026-09-22 发布）** — 智联招聘全链路接入 + 多平台基础求职条件扩展 + MCP 全自动投递：
   * **智联招聘全链路接入（筛选 / 搜索 / 投递）**：`camoufox/platforms/zhaopin.py` 按差异声明补齐筛选参数拼接与投递链路；递送 `filters.py` ↔ `platformUrls.ts` 双源同步，六大筛选维度（职位类型 et / 学历 el / 经验 we / 公司性质 ct / 融资阶段 fs / 规模 cs）码值**按实测链接逐档校准**（公司性质：中外合资=4 / 港澳台=16 / 机关事业单位=6;10 / 其他=7;14;15；多值拼接规则 = 同类型 `;` 分隔、跨类型 `,` 分隔）；新增 `companyType` / `financing` 求职条件配置项并接入智联；新增 `scripts/zhaopin-url-regression.mjs`（32 项断言）守护拼接口径。

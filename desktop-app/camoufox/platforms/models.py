@@ -103,6 +103,8 @@ class JobCandidate:
     bossTitle: str = ''
     companySize: str = ''
     companyType: str = ''
+    # 公司所属行业（猎聘接口的 compIndustry 落这里；**不得**与 companyType 混用）
+    industry: str = ''
     url: str = ''
     # 溯源：该岗位由哪个关键词/页面采到（BossHunter 的 source_keyword 口径）
     sourceKeyword: str = ''
@@ -143,8 +145,12 @@ class JobCandidate:
             'bossTitle': self.bossTitle,
             'companySize': self.companySize,
             'companyType': self.companyType,
+            'industry': self.industry,
             'url': self.url,
             'sourceKeyword': self.sourceKeyword,
+            # 页级溯源（审查 #56）：JobCandidate.sourcePage 原本在出口被丢弃，
+            # 渲染层/AI 看不到「这条 JD 来自第几页」，无法据此做采集完整性核对与分页去重排查。
+            'sourcePage': int(self.sourcePage or 0),
             'recruitmentType': self.recruitmentType,
         }
 

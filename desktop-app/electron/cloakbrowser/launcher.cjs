@@ -13,6 +13,13 @@
 
 const path = require('node:path');
 const fs = require('node:fs');
+const crypto = require('node:crypto');
+
+// M-7：事件上报 nonce（每次进程启动随机生成，注入 preload 闭包，页面脚本无法直接读取）。
+// 用于给 console 事件通道加一道「盲伪造」防护：页面必须拿到 nonce 才能伪造 __bossclaw_emit 事件。
+// 残余风险：addInitScript 注入在主世界，页面若主动劫持 console.log 仍可能观察到 nonce ——
+// 彻底隔离需改用 Playwright context.exposeBinding（属后续增强项）。
+const EMIT_NONCE = crypto.randomBytes(12).toString('hex');
 
 let mod = null; // dynamic import cache: { launchPersistentContext, launch, binaryInfo, ensureBinary, ... }
 
@@ -34,6 +41,8 @@ const state = {
   /** binary info from binaryInfo() */
   binary: null,
   lastError: null,
+  /** M-8：启动代际号（stop() 自增以作废进行中的启动） */
+  generation: 0,
 };
 
 /** 由 main.cjs 注入外部回调 */
@@ -106,6 +115,8 @@ async function start(opts = {}) {
   state.starting = true;
   state.lastError = null;
   _emitStatusDebounced();
+  // M-8：代际号 —— stop() 会自增它作废进行中的启动，避免「stop 后 start 完成回调仍置 ready=true」的竞态
+  const gen = state.generation;
 
   state.startingPromise = (async () => {
     try {
@@ -148,6 +159,11 @@ async function start(opts = {}) {
       } catch (e) {
         // 注册失败不影响启动
       }
+      // M-8：若期间已被 stop()（代际变化），丢弃本次启动结果并关闭刚建好的 context
+      if (state.generation !== gen) {
+        try { await ctx.close(); } catch { /* 忽略 */ }
+        return { ok: false, error: '启动已被 stop 作废' };
+      }
       state.context = ctx;
       state.ready = true;
       state.starting = false;
@@ -166,7 +182,13 @@ async function start(opts = {}) {
 }
 
 async function stop() {
-  if (!state.context) return { ok: true };
+  // M-8：作废进行中的启动（代际自增）+ 复位 starting/lastError；
+  // 原实现不复位，导致 stop 后仍显示「启动中」、且 start 完成回调会把 ready 置回 true。
+  state.generation += 1;
+  state.starting = false;
+  state.lastError = null;
+  state.startingPromise = null;
+  if (!state.context) { _emitStatusDebounced(); return { ok: true }; }
   try {
     await state.context.close();
   } catch (e) {
@@ -185,6 +207,13 @@ async function stop() {
 
 // ===== Page 管理 =====
 // tabId 是渲染层分配的稳定 ID，BrowserView 的 tabId 即 pageId；Playwright Page 由 launcher 内部映射，保证 tabId == pageId 一一对应
+/** 同 tabId 并发创建去重（见审查 #78）：`state.pages.has()` 与 `state.pages.set()` 之间隔着
+ *  `await state.context.newPage()`，并发调用会各自建出一个真实窗口 —— 后到者覆盖映射，
+ *  先建者成孤儿；且孤儿的 `close` 监听会 `state.pages.delete(tabId)` 误删存活页的映射
+ *  （表现为后续操作 "tab not found"）。 */
+const inflightNewPage = new Map();
+
+/** 创建标签页（对外入口，负责同 tabId 并发去重）。 */
 async function newPage(tabId, url) {
   if (!state.context) return { ok: false, error: 'engine not started' };
   if (!tabId) return { ok: false, error: 'tabId required' };
@@ -192,15 +221,58 @@ async function newPage(tabId, url) {
     const existing = state.pages.get(tabId);
     return { ok: true, tabId, url: existing.url, title: existing.title, reused: true };
   }
+  const inflight = inflightNewPage.get(tabId);
+  if (inflight) return inflight;
+  const task = createPage(tabId, url);
+  inflightNewPage.set(tabId, task);
+  try {
+    return await task;
+  } finally {
+    inflightNewPage.delete(tabId);
+  }
+}
+
+/** 读取并注入一份页面脚本（page.addInitScript）。
+ *  文件缺失 / 读取失败 / 注入失败一律带**文件路径**告警（禁止静默，否则表现为「页面无反应」无法定位）。
+ *  wrap(src) 可选：给 CommonJS 源套垫片后再注入。 */
+async function injectPageScript(page, filePath, label, wrap) {
+  let src;
+  try {
+    if (!fs.existsSync(filePath)) {
+      console.warn(`[cloakbrowser] 注入脚本缺失：${label} (${filePath})`);
+      return false;
+    }
+    src = fs.readFileSync(filePath, 'utf8');
+  } catch (e) {
+    console.warn(`[cloakbrowser] 读取注入脚本失败：${label} (${filePath})：${String((e && e.message) || e)}`);
+    return false;
+  }
+  // M-7：注入本次启动的 emit nonce（preload / collector 均以 __BOSSCLAW_EMIT_NONCE__ 占位）
+  src = src.replace(/__BOSSCLAW_EMIT_NONCE__/g, EMIT_NONCE);
+  const content = wrap ? wrap(src) : src;
+  try {
+    await page.addInitScript({ content });
+    return true;
+  } catch (e) {
+    console.warn(`[cloakbrowser] 注入脚本失败：${label} (${filePath})：${String((e && e.message) || e)}`);
+    return false;
+  }
+}
+
+/** 实际创建（不做并发去重，只由 newPage 调用）。 */
+async function createPage(tabId, url) {
   try {
     const page = await state.context.newPage();
-    // 通过 preInitScript / cloakPreload.cjs 以 page.addInitScript 方式注入
-    const preloadPath = path.join(__dirname, 'cloakPreload.cjs');
-    if (fs.existsSync(preloadPath)) {
-      // addInitScript 支持 file / function 形式的注入
-      const code = fs.readFileSync(preloadPath, 'utf8');
-      await page.addInitScript({ content: code });
-    }
+    // 注入顺序固定：平台适配表（window.__bossclawAdapters）→ 采集器（window.__bossclawCollector）
+    // → cloakPreload（事件桥 window.__bossclawEmitEvent / 调度 window.__bossclaw_listen）。
+    // 采集器在选择器 / 平台判定上依赖适配表，且通过 preload 暴露的 emit 回传事件，故顺序不可换。
+    await injectPageScript(page, path.join(__dirname, '..', 'preload', 'platform-adapters.cjs'), 'platform-adapters.cjs', (src) =>
+      // platform-adapters.cjs 是 CommonJS（module.exports）：用最小垫片包成页面脚本，
+      // 挂到 window.__bossclawAdapters（纯数据 + 纯函数、零 DOM、零 require）
+      `(function(){ const module={exports:{}}; (function(module, exports){\n${src}\n})(module, module.exports); window.__bossclawAdapters = module.exports; })();`
+    );
+    await injectPageScript(page, path.join(__dirname, 'cloakCollector.cjs'), 'cloakCollector.cjs');
+    await injectPageScript(page, path.join(__dirname, 'cloakPreload.cjs'), 'cloakPreload.cjs');
     const targetUrl = (url && /^https?:\/\//.test(url)) ? url : 'https://www.zhipin.com';
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
 
@@ -233,7 +305,8 @@ async function newPage(tabId, url) {
     const onConsole = async (msg) => {
       try {
         const text = msg.text();
-        const marker = '__bossclaw_emit__';
+        // M-7：marker 带本次启动 nonce，未携带正确 nonce 的伪造事件一律丢弃
+        const marker = '__bossclaw_emit__' + EMIT_NONCE;
         const idx = text.indexOf(marker);
         if (idx < 0) return;
         const json = text.slice(idx + marker.length).trim();

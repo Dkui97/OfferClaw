@@ -11,10 +11,10 @@ import { useEffect, useRef, useState } from 'react';
 import { Button, Card, Space, Tag, Typography, message, Spin, Tooltip } from 'antd';
 import { ApiOutlined, PlayCircleOutlined, PauseCircleOutlined, StopOutlined, FileTextOutlined, UploadOutlined, CloseCircleFilled } from '@ant-design/icons';
 import { useAppStore } from '@/store/useAppStore';
+import { electronApi } from '@/lib/electronApi';
 
 const { Paragraph, Text } = Typography;
 const BRIDGE_PORT = 18765;
-const BRIDGE_TOKEN = 'bossclaw-desktop-bridge';
 const base = `http://127.0.0.1:${BRIDGE_PORT}`;
 
 export default function OpenClaw() {
@@ -28,11 +28,14 @@ export default function OpenClaw() {
   const setBridgeStatus = useAppStore((s) => s.setBridgeStatus);
 
   const call = async (route: string, method = 'GET', body?: any) => {
-    const url = `${base}${route}?token=${BRIDGE_TOKEN}`;
+    // C-2：令牌经主进程 IPC 读取运行时随机令牌，改为请求头传递（不再硬编码 / 不走 URL query）
+    const url = `${base}${route}`;
     // P30：桥接 HTTP 超时兜底——本地桥半开（端口占用但无响应）时避免请求永久挂起
+    const headers: Record<string, string> = { 'X-Bossclaw-Token': await electronApi.bridge.token() };
+    if (body) headers['Content-Type'] = 'application/json';
     const res = await fetch(url, {
       method,
-      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      headers,
       body: body ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(15000),
     });
@@ -54,6 +57,9 @@ export default function OpenClaw() {
     }
   };
 
+  // 挂载时探测一次桥接状态。refresh 是组件内普通函数（每次渲染新引用），写进依赖会形成
+  // 「拉状态 → setState → 重渲染 → 再拉」的无限请求；这里的语义就是「只在挂载时跑一次」。
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { refresh(); }, []);
 
   const control = async (type: string) => {
@@ -125,7 +131,9 @@ export default function OpenClaw() {
         </div>
       </div>
 
-      <Card size="small" className="mb-12">
+      {/* 审查 #112：原 `className="mb-12"` 是死类（index.css 从未定义 → 静默无间距效果）。
+          本页其余间距/字号一律走内联 style，此处保持一致显式写出。 */}
+      <Card size="small" style={{ marginBottom: 12 }}>
         <Space wrap>
           <Button icon={<ApiOutlined />} onClick={refresh} loading={loading}>刷新状态</Button>
           <Button type="primary" icon={<PlayCircleOutlined />} onClick={() => control('start')}>启动</Button>
@@ -209,12 +217,13 @@ export default function OpenClaw() {
             ) : (
               <>
                 {(logs.events || []).slice(0, 30).map((e: any, i: number) => (
-                  <div key={`e${i}`} style={{ padding: '2px 0' }}>
+                  // L-30：用「时间戳 + 内容前缀」作 key（原 `e${i}` 是索引 key，刷新后节点复用错位）
+                  <div key={`e-${e.ts}-${String(e.message || '').slice(0, 16)}-${i}`} style={{ padding: '2px 0' }}>
                     <Text type="secondary">[{new Date(e.ts).toLocaleTimeString()}]</Text> {e.message}
                   </div>
                 ))}
                 {(logs.commands || []).slice(0, 30).map((c: any, i: number) => (
-                  <div key={`c${i}`} style={{ padding: '2px 0' }}>
+                  <div key={`c-${c.ts}-${String(c.type || '')}-${i}`} style={{ padding: '2px 0' }}>
                     <Text type="secondary">[{new Date(c.ts).toLocaleTimeString()}]</Text> 指令：{c.type}
                   </div>
                 ))}

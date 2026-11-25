@@ -4,7 +4,8 @@
 // 这些 set() 会让 zustand persist 对「整个 bossclaw-data」做一次同步 JSON.stringify +
 // localStorage.setItem（含 base64 图片简历 imageResumes、resumeText 16 万字符、双 500 条日志、
 // pending 大数组，单次可达数百 KB~数 MB）。高频触发时渲染进程主线程被大对象序列化反复阻塞，
-// 表现为界面点击无反应、甚至被系统判定无响应；localStorage 写满（5MB 配额）后 setItem 抛
+// 表现为界面点击无反应、甚至被系统判定无响应；localStorage 写满（实测单源上限
+// 52,428,800 个 UTF-16 码元，见 storage.ts 的口径注释）后 setItem 抛
 // QuotaExceededError 还会沿调用链冒泡，拖垮正在运行的引擎/UI。
 //
 // 对策：
@@ -70,6 +71,150 @@ export function persistDirtyEpoch(name: string): number {
   return persistWriteEpoch.get(name) ?? 0;
 }
 
+/** 非 zustand 的业务键成功直写后调用，使下一次本地备份能发现变更。 */
+export function markPersistDirty(name: string): void {
+  persistWriteEpoch.set(name, (persistWriteEpoch.get(name) ?? 0) + 1);
+}
+
+// ---- 持久化健康（issue #10：写失败不得静默）----
+// 背景：配额写满后 writeWithFallback 按设计「丢弃本次持久化」并只做限频 console.warn——
+// 界面毫无反馈，引擎照常跑、队列照常推进，落盘却停在配额耗尽的那一刻。用户重启后整个会话的
+// 进度（队列、投递结果，连同一份 bossclaw-data 里的基础求职条件）回到旧快照，看起来像
+// 「数据凭空回退了一天」。此处把失败登记成可订阅的健康状态（状态栏告警 + 设置页用量），
+// 并保留「最后一次尝试写入」的完整值：localBackup 在失败期间改用内存态落备份，保证即便主存储
+// 写不进，数据也能从备份文件回签。
+export interface PersistFailureInfo {
+  name: string;
+  /** 最近一次失败原因（QuotaExceededError 等原始 message） */
+  message: string;
+  /** true = 配额类错误（存储写满 / 隐私模式无配额） */
+  quota: boolean;
+  /** 首次失败时间戳 */
+  since: number;
+  /** 最近一次失败时间戳 */
+  at: number;
+  /** 累计失败次数 */
+  count: number;
+}
+
+const lastFailure = new Map<string, PersistFailureInfo>();
+/** 各 persist 键「最后一次交给 setItem 的值」：写失败时它是唯一比 localStorage 更新的事实来源 */
+const latestValue = new Map<string, StorageValue<unknown>>();
+/** 失败通知（localBackup 用于失败即落盘） */
+const failureListeners = new Set<(info: PersistFailureInfo) => void>();
+/** 健康状态订阅（React useSyncExternalStore 用） */
+const healthListeners = new Set<() => void>();
+let healthVersion = 0;
+
+function bumpHealth(): void {
+  healthVersion += 1;
+  for (const fn of healthListeners) {
+    try {
+      fn();
+    } catch {
+      /* 订阅方异常不影响写入路径 */
+    }
+  }
+}
+
+/** 订阅持久化健康变化（返回取消订阅函数） */
+export function subscribePersistHealth(fn: () => void): () => void {
+  healthListeners.add(fn);
+  return () => healthListeners.delete(fn);
+}
+
+/** 健康状态版本号（useSyncExternalStore 的 getSnapshot，变化即代表健康状态有更新） */
+export function getPersistHealthVersion(): number {
+  return healthVersion;
+}
+
+/** 当前处于「写失败」状态的键（成功写入后自动清除） */
+export function listPersistFailures(): PersistFailureInfo[] {
+  return Array.from(lastFailure.values()).sort((a, b) => b.at - a.at);
+}
+
+/** 是否存在尚未恢复的写失败 */
+export function hasPersistFailure(): boolean {
+  return lastFailure.size > 0;
+}
+
+/** 查询单个键的写失败信息（未失败返回 null）——localBackup 据此决定是否改用内存态快照 */
+export function persistFailureOf(name: string): PersistFailureInfo | null {
+  return lastFailure.get(name) ?? null;
+}
+
+/**
+ * 订阅「写失败」事件（每次失败都会通知；调用方需自行限频）。
+ * 用于 persistSafe 自身无法承担的动作，例如立刻把内存态写进本地备份文件。
+ */
+export function onPersistFailure(cb: (info: PersistFailureInfo) => void): () => void {
+  failureListeners.add(cb);
+  return () => failureListeners.delete(cb);
+}
+
+/**
+ * 取某 persist 键「最后一次交给 setItem 的完整值」的序列化串（无记录返回 null）。
+ * 只在主存储写失败时被 localBackup 调用——正常情况下它恒等于 localStorage 的内容。
+ */
+export function getLatestPersistSnapshot(name: string): string | null {
+  const v = latestValue.get(name);
+  if (!v) return null;
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return null;
+  }
+}
+
+/** 判断错误是否为配额类（Chromium: QuotaExceededError / code 22 / Firefox: NS_ERROR_DOM_QUOTA_REACHED） */
+function isQuotaError(err: unknown): boolean {
+  const e = err as { name?: string; code?: number; message?: string } | null;
+  if (!e) return false;
+  if (e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED') return true;
+  if (e.code === 22 || e.code === 1014) return true;
+  return /quota/i.test(String(e.message || ''));
+}
+
+function recordFailure(name: string, err: unknown): void {
+  const now = Date.now();
+  const prev = lastFailure.get(name);
+  const info: PersistFailureInfo = {
+    name,
+    message: String((err as { message?: string })?.message || err),
+    quota: isQuotaError(err),
+    since: prev?.since ?? now,
+    at: now,
+    count: (prev?.count ?? 0) + 1,
+  };
+  lastFailure.set(name, info);
+  bumpHealth();
+  for (const fn of failureListeners) {
+    try {
+      fn(info);
+    } catch {
+      /* 忽略：备份失败不应反过来影响持久化路径 */
+    }
+  }
+}
+
+function clearFailure(name: string): void {
+  if (!lastFailure.delete(name)) return;
+  bumpHealth();
+}
+
+/**
+ * 上报一次「外部存储」失败（issue #10：队列已迁到主进程文件，失败不再经过 localStorage 包装）。
+ * 复用同一份失败状态机，是为了让状态栏红标 / 一键备份 / 去重提示的行为保持一致。
+ */
+export function reportExternalFailure(name: string, err: unknown): void {
+  recordFailure(name, err);
+}
+
+/** 外部存储恢复成功后清除失败标记（与 reportExternalFailure 配对） */
+export function clearExternalFailure(name: string): void {
+  clearFailure(name);
+}
+
 /** 真实写盘（尽力而为，绝不抛出）。写失败时按「键的类型」处置：运行时日志键直接丢弃（重启即重新累积），业务键丢弃该次持久化。 */
 function writeWithFallback(store: Storage, name: string, value: StorageValue<unknown>): boolean {
   const payload = () => {
@@ -79,10 +224,16 @@ function writeWithFallback(store: Storage, name: string, value: StorageValue<unk
       return null;
     }
   };
-  let json = payload();
-  if (json == null) return false;
+  const json = payload();
+  if (json == null) {
+    // 序列化失败同样是「落盘没跟上内存」，必须计入健康状态，否则用户永远看不到告警
+    recordFailure(name, new Error('序列化失败（值中含不可序列化内容）'));
+    return false;
+  }
   try {
     store.setItem(name, json);
+    // 成功即解除该键的失败标记（界面告警随之消失）
+    clearFailure(name);
     return true;
   } catch (err) {
     // 第一次失败：按键的种类降级。P2-05 后日志已拆成独立小键（bossclaw-runtime-logs），
@@ -96,9 +247,11 @@ function writeWithFallback(store: Storage, name: string, value: StorageValue<unk
         warnOnceThrottled(`localStorage 配额告警：${name} 过大，已放弃持久化运行时日志（重启后重新累积）`);
         return true;
       }
+      recordFailure(name, err);
       warnOnceThrottled(`localStorage 写入失败（${name}：${String((err as Error)?.message || err)}），本次持久化已丢弃`);
       return false;
     } catch {
+      recordFailure(name, err);
       warnOnceThrottled(`localStorage 写入失败（${String((err as Error)?.message || err)}），本次持久化已丢弃`);
       return false;
     }
@@ -123,6 +276,9 @@ export function createSafePersistStorage<S = unknown>(options: SafeStorageOption
   // 待写缓冲：name -> 序列化后的完整 StorageValue 对象。写盘前合并同一 key 的最新值。
   const pending = new Map<string, StorageValue<unknown>>();
   let timer: ReturnType<typeof setTimeout> | null = null;
+  /** 存储暂不可用时的重试定时器（见 flushNow 的 !store 分支） */
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  const STORAGE_RETRY_MS = 5000;
 
   const flushNow = (): void => {
     if (timer) {
@@ -131,9 +287,23 @@ export function createSafePersistStorage<S = unknown>(options: SafeStorageOption
     }
     if (pending.size === 0) return;
     const store = read();
+    // 审查 #28：**先判存储可用、再清 pending** —— 原顺序（先 clear 再判 store）在 localStorage
+    // 不可用（隐私模式 / 存储被禁用 / 测试注入返回 null）时会把待写值直接从缓冲里抹掉：
+    // 之后即便存储恢复可用，这些变更也再无机会落盘（静默丢写）。保留 pending 则可由下一次
+    // set/flush 一并写出；缓冲体积受「每键保留最新值」约束，不会无限增长。
+    // 审查 #9：保留 pending 还不够 —— 若此后没有新的 set，这批变更会一直滞留到页面隐藏/关闭。
+    // 这里补一次延迟重试（幂等：pending 为空时立即返回，不会空转）。
+    if (!store) {
+      if (!retryTimer) {
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          flushNow();
+        }, STORAGE_RETRY_MS);
+      }
+      return;
+    }
     const batch = Array.from(pending.entries());
     pending.clear();
-    if (!store) return; // 无可用存储：静默丢弃（内存态不受影响）
     for (const [name, value] of batch) {
       if (writeWithFallback(store, name, value)) {
         // 防抖合批后在此刻才真正写盘 → 内容确实变化 → 递增写哨兵，
@@ -168,6 +338,10 @@ export function createSafePersistStorage<S = unknown>(options: SafeStorageOption
       clearTimeout(timer);
       timer = null;
     }
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
     pending.clear();
   };
   discardCallbacks.add(discard);
@@ -188,16 +362,20 @@ export function createSafePersistStorage<S = unknown>(options: SafeStorageOption
     setItem: (name: string, value: StorageValue<S>): void => {
       persistWriteEpoch.set(name, (persistWriteEpoch.get(name) ?? 0) + 1); // 写哨兵递增（备份快路径）
       // 仅登记 + 防抖合批，真正的序列化与写盘延后到 flushNow（主线程不再被大 stringify 卡住）
+      // 同时保留最新值引用：写盘失败时 localBackup 用它落「内存态」备份（见 getLatestPersistSnapshot）
+      latestValue.set(name, value as StorageValue<unknown>);
       pending.set(name, value as StorageValue<unknown>);
       scheduleFlush();
     },
     removeItem: (name: string): void => {
       persistWriteEpoch.set(name, (persistWriteEpoch.get(name) ?? 0) + 1); // 删除同样是「内容变化」
       pending.delete(name);
+      latestValue.delete(name);
       const store = read();
       if (store) {
         try {
           store.removeItem(name);
+          clearFailure(name); // 键已删除，此前的写失败不再成立
         } catch {
           /* 忽略 */
         }

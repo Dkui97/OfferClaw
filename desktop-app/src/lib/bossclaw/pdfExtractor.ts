@@ -15,16 +15,51 @@ function normalizeLineBreaks(text: string): string {
     .trim();
 }
 
+/** 解压输出的硬上限（审查 H-5）：防 Flate 解压炸弹把渲染进程打爆 / OOM。
+ *  64MB 对正常简历内容流绰绰有余（原始正文远小于此）。 */
+const INFLATE_MAX_BYTES = 64 * 1024 * 1024;
+
+/** 边读边累计字节数，超阈值即 reader.cancel() 中止（不把解压结果整体读进内存）。 */
+async function readStreamCapped(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || !value.byteLength) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch { /* 忽略 */ }
+        throw new Error(`解压输出超过 ${maxBytes} 字节上限（疑似解压炸弹），已中止`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* 忽略 */ }
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return out;
+}
+
 async function inflateBytes(bytes: Uint8Array): Promise<Uint8Array> {
   const attempts = ['deflate', 'deflate-raw'];
+  let lastError: unknown = null;
   for (const format of attempts) {
     try {
       const stream = new Blob([bytes as unknown as BlobPart]).stream().pipeThrough(new DecompressionStream(format as CompressionFormat));
-      return new Uint8Array(await new Response(stream).arrayBuffer());
-    } catch {
+      return await readStreamCapped(stream, INFLATE_MAX_BYTES);
+    } catch (error) {
+      lastError = error;
+      // 超限（解压炸弹）属确定性失败：立即中止，不再尝试其它压缩格式
+      if (error instanceof Error && error.message.includes('解压炸弹')) throw error;
       // PDF 生产者对是否带 zlib 头存在差异，尝试下一种格式
     }
   }
+  void lastError;
   throw new Error('无法解压 PDF 数据流');
 }
 
@@ -159,6 +194,43 @@ function expandObjectStreams(objects: Map<number, any>) {
   }
 }
 
+// ---- 正文 vs 二进制资源的边界（唯一的「什么能当正文解析」判据）----
+// 背景：字体程序（FontFile/FontFile2/FontFile3）、图像、元数据、内嵌文件都是二进制资源数据，
+// **不是页面正文**；交叉引用流也被列入（同样不含正文）。若它们被当成正文送入 tokenizeTextBlock，
+// 随机二进制里的 '[' '<' '(' 会触发正则灾难性回溯 —— 实测 329KB 字体流单次分词 81s、
+// 1MB 以上直接卡死渲染进程（用户侧表现「解析 PDF 卡死」）。
+// 因此：① 这类流直接不解码（省内存/省时；对象流 ObjStm 例外，它装的是别的对象，必须解码）；
+//       ② 任何流在进入分词前都要过 looksLikeTextContent 形状闸门。
+const NON_TEXT_STREAM_HINTS: RegExp[] = [
+  /\/FontFile[23]?\b/, // 嵌入字体程序（FontFile / FontFile2 / FontFile3）
+  /\/Subtype\s*\/Image\b/, // 图像 XObject
+  /\/Subtype\s*\/(?:Type1C|CIDFontType0C|OpenType)\b/, // CFF / OpenType 字体
+  /\/Type\s*\/(?:XRef|Metadata|EmbeddedFile)\b/, // 交叉引用 / 元数据 / 内嵌文件
+  /\/Length1\b/, // 字体程序专有键（Type1/TrueType 原始字节长度）
+];
+
+function isNonTextStream(dictionary: string): boolean {
+  const head = String(dictionary || '').slice(0, 4096); // 只需看字典头部，避免对超大字典做无谓扫描
+  return NON_TEXT_STREAM_HINTS.some((pattern) => pattern.test(head));
+}
+
+// 单条内容流字符数硬上限：页面正文流通常 < 100KB，超过此规模必然是二进制/资源数据
+const MAX_CONTENT_STREAM_CHARS = 2 * 1024 * 1024;
+// 只有超过该规模的流才做「可信度」校验：小流不可能拖慢解析，直接放行以杜绝误杀
+const LARGE_CONTENT_STREAM_CHARS = 64 * 1024;
+// 阈值远低于真实内容流（实测 0.80~0.97）且远高于随机二进制（实测 0.02），留有充足余量
+const MIN_CONTENT_QUALITY = 0.3;
+
+// 内容流形状闸门：必须是「像内容流」的数据，否则一律不解析。
+// 这是与正则消歧并列的第二道防线 —— 即便判据 /BT/ 被二进制偶然命中，也拦得住。
+function looksLikeTextContent(text: string): boolean {
+  if (!text) return false;
+  if (text.length > MAX_CONTENT_STREAM_CHARS) return false;
+  if (text.length < LARGE_CONTENT_STREAM_CHARS) return true;
+  if (!/\bT[jJ]\b|\bTf\b|\bTd\b|\bTD\b|\bTm\b|\bT\*\b/.test(text)) return false;
+  return candidateQuality(text) >= MIN_CONTENT_QUALITY;
+}
+
 async function parseObjects(arrayBuffer: ArrayBuffer) {
   const bytes = new Uint8Array(arrayBuffer);
   const source = latin1Decoder.decode(bytes);
@@ -169,23 +241,29 @@ async function parseObjects(arrayBuffer: ArrayBuffer) {
     let dictionary = body;
     let decodedBytes: Uint8Array | null = null;
     let decodedText = '';
+    let nonText = false;
     if (streamMatch) {
       dictionary = body.slice(0, streamMatch.index);
-      const absoluteStart = range.bodyStart + streamMatch.index + streamMatch[0].length;
-      let absoluteEnd = source.indexOf('endstream', absoluteStart);
-      if (absoluteEnd > absoluteStart) {
-        while (absoluteEnd > absoluteStart && (bytes[absoluteEnd - 1] === 10 || bytes[absoluteEnd - 1] === 13)) absoluteEnd -= 1;
-        const raw = bytes.slice(absoluteStart, absoluteEnd);
-        try {
-          decodedBytes = await decodeStream(raw, dictionary);
-          decodedText = latin1Decoder.decode(decodedBytes);
-        } catch {
-          decodedBytes = raw;
-          decodedText = latin1Decoder.decode(raw);
+      nonText = isNonTextStream(dictionary);
+      // 对象流（ObjStm）虽是压缩容器，但里面装的是别的对象，必须解码；字体/图像等资源流一律不解码
+      const neededForObjects = /\/Type\s*\/ObjStm\b/.test(dictionary);
+      if (!nonText || neededForObjects) {
+        const absoluteStart = range.bodyStart + streamMatch.index + streamMatch[0].length;
+        let absoluteEnd = source.indexOf('endstream', absoluteStart);
+        if (absoluteEnd > absoluteStart) {
+          while (absoluteEnd > absoluteStart && (bytes[absoluteEnd - 1] === 10 || bytes[absoluteEnd - 1] === 13)) absoluteEnd -= 1;
+          const raw = bytes.slice(absoluteStart, absoluteEnd);
+          try {
+            decodedBytes = await decodeStream(raw, dictionary);
+            decodedText = latin1Decoder.decode(decodedBytes);
+          } catch {
+            decodedBytes = raw;
+            decodedText = latin1Decoder.decode(raw);
+          }
         }
       }
     }
-    objects.set(range.id, { id: range.id, generation: range.generation, body, dictionary, decodedBytes, decodedText });
+    objects.set(range.id, { id: range.id, generation: range.generation, body, dictionary, decodedBytes, decodedText, nonText });
   }
   expandObjectStreams(objects);
   return { bytes, source, objects };
@@ -230,7 +308,9 @@ function parseToUnicodeCMap(text: string) {
       const start = Number.parseInt(range[1], 16);
       const end = Number.parseInt(range[2], 16);
       const width = range[1].length;
-      if (!Number.isFinite(start) || !Number.isFinite(end) || end - start > 8192) continue;
+      // L-15：原上限 8192 会把常见大范围 CJK 映射（如 U+4E00–U+9FFF ≈ 21k）整体丢弃 → 丢字。
+      // 放宽到 65536（覆盖 BMP 内常见映射），同时保留上限作为超大跨度的 DoS 守卫。
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end < start || end - start > 65536) continue;
       if (range[3]) {
         const destination = range[3].toUpperCase();
         for (let code = start; code <= end; code += 1) {
@@ -392,8 +472,12 @@ function decodePdfString(token: string, cmap: { map: Map<string, string>; length
 }
 
 function tokenizeTextBlock(body: string): string[] {
+  // 注意：数组算子分支里的单字符类必须排除 '<' 与 '('（[^\]\\<(]）。
+  // 否则 '<' 既能被单字符分支吃、又能被 <...> 分支吃，'(' 同理，多个分支可覆盖同一字符
+  // → 回溯路径指数级膨胀；随机二进制（字体程序）里 '[' '<' '(' 密集，实测 329KB 跑 81s、1MB 卡死。
+  // 消歧后每个字符只有唯一匹配路径，退化为线性（实测 4MB 仅 45ms）。
   const pattern =
-    /\/([^\s/<>\[\]()]+)\s+[-+]?\d*\.?\d+\s+Tf|\[(?:[^\]\\]|\\.|\((?:\\.|[^\\)])*\)|<[^>]*>)*\]\s*TJ|\((?:\\.|[^\\)])*\)\s*(?:Tj|'|")|<[0-9A-Fa-f\s]+>\s*(?:Tj|'|")|(?:T\*|[-+]?\d*\.?\d+\s+[-+]?\d*\.?\d+\s+(?:Td|TD)|(?:[-+]?\d*\.?\d+\s+){6}Tm)/g;
+    /\/([^\s/<>\[\]()]+)\s+[-+]?\d*\.?\d+\s+Tf|\[(?:[^\]\\<(]|\\.|\((?:\\.|[^\\)])*\)|<[^>]*>)*\]\s*TJ|\((?:\\.|[^\\)])*\)\s*(?:Tj|'|")|<[0-9A-Fa-f\s]+>\s*(?:Tj|'|")|(?:T\*|[-+]?\d*\.?\d+\s+[-+]?\d*\.?\d+\s+(?:Td|TD)|(?:[-+]?\d*\.?\d+\s+){6}Tm)/g;
   return [...body.matchAll(pattern)].map((m) => m[0]);
 }
 
@@ -553,6 +637,7 @@ export async function extractPdfText(arrayBuffer: ArrayBuffer): Promise<PdfExtra
 
   const cmapByObject = new Map<number, any>();
   for (const object of objects.values()) {
+    if (object.nonText) continue; // 字体/图像等二进制流不含 CMap，跳过（其 decodedText 已为空）
     const cmap = parseToUnicodeCMap(object.decodedText || '');
     if (cmap) cmapByObject.set(object.id, cmap);
   }
@@ -574,7 +659,8 @@ export async function extractPdfText(arrayBuffer: ArrayBuffer): Promise<PdfExtra
     const resourceFonts = resolveResources(page, objects);
     for (const reference of pageContentReferences(page)) {
       const stream = objects.get(reference);
-      if (!stream?.decodedText) continue;
+      // 关键闸门：/Contents 也可能（错误地）指向字体/图像等二进制流 —— 必须形状校验后才解析
+      if (!stream?.decodedText || stream.nonText || !looksLikeTextContent(stream.decodedText)) continue;
       processedStreams.add(reference);
       const text = extractTextFromContent(stream.decodedText, fontMaps, resourceFonts);
       if (text) results.push(text);
@@ -584,10 +670,13 @@ export async function extractPdfText(arrayBuffer: ArrayBuffer): Promise<PdfExtra
   if (!results.length) {
     const globalFonts = new Map<string, number>();
     for (const object of objects.values()) {
+      if (object.nonText) continue; // 二进制流不声明字体资源表，且扫它纯属浪费
       for (const [name, reference] of collectFontResources(object, objects)) globalFonts.set(name, reference);
     }
     for (const object of objects.values()) {
-      if (processedStreams.has(object.id) || !/\bBT\b/.test(object.decodedText || '')) continue;
+      // 回退扫描是「把疑似正文的对象都试一遍」：字体二进制里常含 "BT" 字节，只判 /BT/ 会误抓 → 必须过形状闸门
+      if (object.nonText || processedStreams.has(object.id)) continue;
+      if (!/\bBT\b/.test(object.decodedText || '') || !looksLikeTextContent(object.decodedText)) continue;
       const text = extractTextFromContent(object.decodedText, fontMaps, globalFonts);
       if (text) results.push(text);
     }

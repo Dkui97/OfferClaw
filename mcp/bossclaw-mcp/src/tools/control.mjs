@@ -4,7 +4,7 @@
 // 执行白名单动作。所有动作都必须经 electron/control-bridge.cjs + src/lib/controlRuntime.ts，
 // 且**不绕过验证码 / 不改安全上限**；自动发送（deliverySendNow）仅在用户开启「全自动」
 // （executionMode==='auto'）时对 agent 开放，且复用应用自带安全投递引擎——安全不变量仍在渲染层强制。
-import { controlCall, getPath, ok, fail, truncate, PATHS } from '../context.mjs';
+import { controlCall, getPath, ok, fail, truncate, PATHS, bridgeHint } from '../context.mjs';
 import { obj, str, bool, enumStr, WRITE_LOCAL, READ_ONLY } from '../schema.mjs';
 
 /** 渲染层白名单动作（src/lib/controlRuntime.ts 为唯一权威实现） */
@@ -92,17 +92,6 @@ const RENDERER_ACTIONS = [
 const MAIN_ACTIONS = ['focusWindow', 'minimize', 'maximize', 'windowState', 'reloadRenderer', 'openDevTools', 'screenshot'];
 
 const ACTIONS = [...RENDERER_ACTIONS, ...MAIN_ACTIONS];
-
-async function bridgeHint() {
-  return [
-    `应用内控制桥当前不可用。启用方式（三选一）：`,
-    `  1) 用 bossclaw_app_start 启动（默认带 BOSSCLAW_CONTROL=1），或`,
-    `  2) 让用户运行仓库根的 start-bossclaw.cmd（本地启动器默认已开启 agent 桥），或`,
-    `  3) 手动以 BOSSCLAW_CONTROL=1 启动 Electron。`,
-    `关闭方式：start-bossclaw.cmd --no-agent，或 BOSSCLAW_CONTROL=0 / --no-control-bridge。`,
-    `桥信息文件：${PATHS.controlBridgeFile}`,
-  ].join('\n');
-}
 
 export const controlTools = [
   {
@@ -206,7 +195,7 @@ export const controlTools = [
       'agentTasks{waitMs?,includeMessages?,limit?}｜agentSubmit{id,content}｜agentCancel{id,reason?}\n' +
       '  - 浏览器只读探索（webview 引擎可用）：browserSearch{query,city?,page?,pageSize?}｜browserOpenJob{url,tabId?}｜' +
       'browserReadPage{tabId?}｜browserReadJob{encryptJobId}｜browserDomDump{tabId?}\n' +
-      '  - 投递：deliverySetMode{mode:"auto"|"review"}｜deliveryDraft{greeting}（半自动，预填不发送）｜' +
+      '  - 投递：deliverySetMode（**已禁用**：执行模式受保护，只能由用户在应用设置页切换）｜deliveryDraft{greeting}（半自动，预填不发送）｜' +
       'deliverySendNow{greeting?}（仅 executionMode==\'auto\' 且复用安全引擎）\n' +
       '  - 通用 UI 接管（scope:"app" 操作应用界面 / "webview" 操作右栏 BOSS 页；禁止任意脚本与跳转）：uiSnapshot{scope?,selector?,limit?}｜' +
       'uiClick{scope?,selector?,label?,index?}｜uiType{scope?,selector?/into?,value,clear?}（contenteditable 聊天框请用 deliveryDraft）｜' +

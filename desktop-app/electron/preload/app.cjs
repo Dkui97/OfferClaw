@@ -5,13 +5,59 @@ const { contextBridge, ipcRenderer } = require('electron');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
-// P4-09：IPC 通道命名断言（桥接层逃生口 invoke/send/on 用）。
-// 本项目对外通道统一 `jc:` 前缀，与 main.cjs 的 safeHandle / ipcMain 注册面对应；
-// 逃生口保留是为了兼容历史桥接调用，但通道名不合规（拼写错 / 漏前缀）会在控制台给出警告，
-// 避免「通道是否受支持」只能靠全仓库 grep 推断。仅工程可维护性断言，不做访问控制。
+// P4-09 → 审查 H-6：IPC 通道白名单（硬约束）。
+// 原实现只 `console.warn` 不拦截 → 渲染层一旦 XSS 就能用通用逃生口 invoke/send/on
+// 调用主进程**所有**已注册 handler、并订阅任意通道。现改为白名单：不在表内的通道直接抛错。
+// 表 = main.cjs / electron/*.cjs 中出现的全部 `jc:` 通道（含主进程主动 push 的事件通道）。
+const ALLOWED_IPC_CHANNELS = new Set([
+  'jc:app-info', 'jc:autostart-get', 'jc:autostart-set',
+  'jc:backup-delete', 'jc:backup-dir-get', 'jc:backup-dir-pick', 'jc:backup-dir-set', 'jc:backup-read', 'jc:backup-write',
+  'jc:boss-login', 'jc:boss-logout', 'jc:bridge-control', 'jc:bridge-token',
+  'jc:camoufox-call', 'jc:camoufox-restart', 'jc:camoufox-status', 'jc:camoufox-stop', 'jc:clipboard-write',
+  'jc:cloak-binary', 'jc:cloak-event', 'jc:cloak-health', 'jc:cloak-page-back', 'jc:cloak-page-close',
+  'jc:cloak-page-forward', 'jc:cloak-page-input', 'jc:cloak-page-list', 'jc:cloak-page-navigate',
+  'jc:cloak-page-new', 'jc:cloak-page-reload', 'jc:cloak-page-send', 'jc:cloak-start', 'jc:cloak-status',
+  'jc:cloak-status-changed', 'jc:cloak-stop',
+  'jc:fetch-url', 'jc:llm-proxy', 'jc:material-pick', 'jc:material-read', 'jc:open-external',
+  'jc:models-probe',
+  'jc:mock-interview-clear', 'jc:mock-interview-clear-sessions', 'jc:mock-interview-delete',
+  'jc:mock-interview-export', 'jc:mock-interview-export-md', 'jc:mock-interview-list', 'jc:mock-interview-read',
+  'jc:mock-interview-usage', 'jc:mock-interview-write',
+  'jc:mock-interview-bank-add-question', 'jc:mock-interview-bank-cache-clear',
+  'jc:mock-interview-bank-cache-read', 'jc:mock-interview-bank-cache-write',
+  'jc:mock-interview-bank-create', 'jc:mock-interview-bank-delete',
+  'jc:mock-interview-bank-delete-question', 'jc:mock-interview-bank-import',
+  'jc:mock-interview-bank-list', 'jc:mock-interview-bank-read',
+  'jc:mock-interview-bank-rename', 'jc:mock-interview-bank-restore-builtin',
+  'jc:mock-interview-bank-toggle', 'jc:mock-interview-bank-update-question',
+  'jc:mock-interview-bank-usage',
+  'jc:mock-interview-speech-cancel', 'jc:mock-interview-speech-install', 'jc:mock-interview-speech-progress',
+  'jc:mock-interview-speech-remove', 'jc:mock-interview-speech-set-online', 'jc:mock-interview-speech-set-pack',
+  'jc:mock-interview-speech-status',
+  'jc:mock-interview-tts', 'jc:mock-interview-tts-clear-cache', 'jc:mock-interview-tts-preview',
+  'jc:mock-interview-tts-stream', 'jc:mock-interview-tts-cancel', 'jc:mock-interview-tts-chunk',
+  'jc:mock-interview-asr', 'jc:mock-interview-asr-warmup',
+  'jc:mock-interview-voice-clear', 'jc:mock-interview-voice-create', 'jc:mock-interview-voice-list',
+  'jc:mock-interview-voice-import', 'jc:mock-interview-voice-pack-pick',
+  'jc:mock-interview-voice-pack-preview', 'jc:mock-interview-voice-remove',
+  'jc:mock-interview-voice-rename', 'jc:mock-interview-voice-usage',
+  'jc:qualified-jobs-dir-get', 'jc:qualified-jobs-dir-pick', 'jc:qualified-jobs-dir-set', 'jc:read-doc',
+  'jc:queue-clear', 'jc:queue-load', 'jc:queue-save', 'jc:queue-save-patch', 'jc:queue-usage',
+  'jc:save-file', 'jc:save-pdf', 'jc:save-pdf-batch', 'jc:save-pdf-batch-cancel',
+  'jc:save-pdf-batch-progress', 'jc:save-qualified-jobs', 'jc:save-report-pdf', 'jc:show-item',
+  'jc:skills-delete', 'jc:skills-import', 'jc:skills-list', 'jc:skills-read',
+  'jc:webview-diag', 'jc:webview-input', 'jc:webview-input-done', 'jc:webview-open-link', 'jc:webview-source',
+  'jc:window-always-on-top', 'jc:window-always-on-top-changed', 'jc:window-always-on-top-set',
+  'jc:window-close', 'jc:window-focus-changed', 'jc:window-is-maximized', 'jc:window-maximize',
+  'jc:window-maximized-changed', 'jc:window-minimize',
+  'jc:notify', 'jc:notify-action', 'jc:tray-prefs-set',
+]);
+
 const assertIpcChannel = (method, channel) => {
-  if (typeof channel !== 'string' || !/^jc:/.test(channel)) {
-    console.warn(`[preload/app] 非约定前缀 IPC 通道 ${method}('${String(channel)}') —— 通道须以 jc: 开头并在 main.cjs 注册`);
+  if (typeof channel !== 'string' || !ALLOWED_IPC_CHANNELS.has(channel)) {
+    const msg = `[preload/app] 拒绝非白名单 IPC 通道 ${method}('${String(channel)}') —— 通道须在 ALLOWED_IPC_CHANNELS 表内`;
+    console.error(msg);
+    throw new Error(msg);
   }
   return channel;
 };
@@ -27,11 +73,28 @@ const api = {
   // 应用信息（名称、版本号）— 标题栏使用
   getAppInfo: () => ipcRenderer.invoke('jc:app-info'),
 
+  // 岗位队列存储模式（issue #10 / docs/存储迁移方案.md §5 回滚开关）：
+  // 默认 'file'（<userData>/queue/queue-store.json）；设 BOSSCLAW_QUEUE_STORE=localstorage
+  // 启动时退回旧路径（队列仍写在 bossclaw-data 里），用于发布后观察期出问题时的现场回滚。
+  // 渲染层在模块初始化时同步读取，因此不能走 IPC（异步拿不到首帧前的值）。
+  queueStoreMode: process.env.BOSSCLAW_QUEUE_STORE === 'localstorage' ? 'localstorage' : 'file',
+
   // 窗口控制（frame:false 自绘标题栏按钮）
   winMinimize: () => ipcRenderer.send('jc:window-minimize'),
   winMaximize: () => ipcRenderer.send('jc:window-maximize'),
   winClose: () => ipcRenderer.send('jc:window-close'),
   winIsMaximized: () => ipcRenderer.invoke('jc:window-is-maximized'),
+  // 系统通知 / 托盘常驻（设置页开关；主进程按同一份偏好再拦截一次）
+  notify: (payload) => ipcRenderer.invoke('jc:notify', payload || {}),
+  setTrayPrefs: (prefs) => ipcRenderer.send('jc:tray-prefs-set', prefs || {}),
+  // 订阅「通知被点击后回传的动作」（如跳转跟聊页并高亮会话），返回取消订阅函数。
+  // 动作由主进程原样转发渲染层传入的 clickAction，解释权在渲染层（见 App.tsx）。
+  onNotifyAction: (callback) => {
+    const listener = (_event, action) => callback(action || {});
+    ipcRenderer.on('jc:notify-action', listener);
+    return () => ipcRenderer.removeListener('jc:notify-action', listener);
+  },
+
   // 窗口置顶（标题栏图钉按钮）：查询状态 / 设置 / 订阅变化
   winAlwaysOnTop: () => ipcRenderer.invoke('jc:window-always-on-top'),
   winAlwaysOnTopSet: (value) => ipcRenderer.send('jc:window-always-on-top-set', Boolean(value)),
@@ -59,6 +122,9 @@ const api = {
   // 清除指定平台在 persist:bossclaw 会话中的登录 cookie（设置页「退出登录」用）
   bossLogout: (platform) => ipcRenderer.invoke('jc:boss-logout', platform),
 
+  // 本地桥（OpenClaw）访问令牌：随机生成、存于 ~/.bossclaw/bridge-token（C-2，不再随 bundle 分发）
+  bridgeToken: () => ipcRenderer.invoke('jc:bridge-token'),
+
   // 内置浏览器 webview 预加载脚本绝对路径（由 BrowserView 组件读取后设置到 <webview>）
   // 注意：webview 标签的 preload 属性协议必须是 file:（Electron 文档硬性要求，反斜杠绝对路径会被拒绝加载）
   webviewPreload: pathToFileURL(path.join(__dirname, 'webview.cjs')).href,
@@ -68,6 +134,81 @@ const api = {
 
   // LLM 主进程代理（P05）：渲染层经此转发 OpenAI 兼容请求，规避渲染层 CORS，超时/错误到主进程统一处理
   llmProxy: (url, payload, apiKey, timeoutMs) => ipcRenderer.invoke('jc:llm-proxy', url, payload, apiKey, timeoutMs),
+
+  // 网关模型能力探测（/v1/models）：设置页「大模型接入」动态判定上下文/思考等级/模态能力
+  modelsProbe: (url, apiKey, timeoutMs) => ipcRenderer.invoke('jc:models-probe', url, apiKey, timeoutMs),
+
+  // ===== 模拟面试（会话文件存于 <userData>/mock-interview/，不进 localStorage）=====
+  // 列表 / 读取 / 写入 / 删除 / 清空 / 导出 / 目录占用。写入带 seq，主进程拒绝更旧的迟到包。
+  mockInterviewList: () => ipcRenderer.invoke('jc:mock-interview-list'),
+  mockInterviewRead: (id) => ipcRenderer.invoke('jc:mock-interview-read', id),
+  mockInterviewWrite: (session, opts) => ipcRenderer.invoke('jc:mock-interview-write', session, opts),
+  mockInterviewDelete: (id) => ipcRenderer.invoke('jc:mock-interview-delete', id),
+  mockInterviewClear: () => ipcRenderer.invoke('jc:mock-interview-clear'),
+  mockInterviewClearSessions: () => ipcRenderer.invoke('jc:mock-interview-clear-sessions'),
+  mockInterviewExport: () => ipcRenderer.invoke('jc:mock-interview-export'),
+  mockInterviewExportMd: (payload) => ipcRenderer.invoke('jc:mock-interview-export-md', payload),
+  mockInterviewUsage: () => ipcRenderer.invoke('jc:mock-interview-usage'),
+
+  // ===== 模拟面试 · 题库（内置库随包只读，用户库写 <userData>/mock-interview/bank/）=====
+  mockInterviewBankList: () => ipcRenderer.invoke('jc:mock-interview-bank-list'),
+  mockInterviewBankRead: (bankId) => ipcRenderer.invoke('jc:mock-interview-bank-read', bankId),
+  mockInterviewBankCreate: (name, type) => ipcRenderer.invoke('jc:mock-interview-bank-create', name, type),
+  mockInterviewBankRename: (bankId, name) => ipcRenderer.invoke('jc:mock-interview-bank-rename', bankId, name),
+  mockInterviewBankDelete: (bankId) => ipcRenderer.invoke('jc:mock-interview-bank-delete', bankId),
+  mockInterviewBankToggle: (bankId, enabled) => ipcRenderer.invoke('jc:mock-interview-bank-toggle', bankId, enabled),
+  mockInterviewBankRestoreBuiltin: () => ipcRenderer.invoke('jc:mock-interview-bank-restore-builtin'),
+  mockInterviewBankAddQuestion: (bankId, question) =>
+    ipcRenderer.invoke('jc:mock-interview-bank-add-question', bankId, question),
+  mockInterviewBankUpdateQuestion: (bankId, questionId, patch) =>
+    ipcRenderer.invoke('jc:mock-interview-bank-update-question', bankId, questionId, patch),
+  mockInterviewBankDeleteQuestion: (bankId, questionId) =>
+    ipcRenderer.invoke('jc:mock-interview-bank-delete-question', bankId, questionId),
+  mockInterviewBankImport: (bankId, questions, opts) =>
+    ipcRenderer.invoke('jc:mock-interview-bank-import', bankId, questions, opts),
+  mockInterviewBankUsage: () => ipcRenderer.invoke('jc:mock-interview-bank-usage'),
+  mockInterviewBankCacheRead: () => ipcRenderer.invoke('jc:mock-interview-bank-cache-read'),
+  mockInterviewBankCacheWrite: (payload) => ipcRenderer.invoke('jc:mock-interview-bank-cache-write', payload),
+  mockInterviewBankCacheClear: () => ipcRenderer.invoke('jc:mock-interview-bank-cache-clear'),
+
+  // ===== 模拟面试 · 语音（本地 sherpa-onnx；模型与缓存存 <userData>/speech/）=====
+  mockInterviewSpeechStatus: () => ipcRenderer.invoke('jc:mock-interview-speech-status'),
+  mockInterviewSpeechInstall: (pack) => ipcRenderer.invoke('jc:mock-interview-speech-install', pack),
+  mockInterviewSpeechCancel: () => ipcRenderer.invoke('jc:mock-interview-speech-cancel'),
+  mockInterviewSpeechRemove: (pack) => ipcRenderer.invoke('jc:mock-interview-speech-remove', pack),
+  mockInterviewSpeechSetOnline: (on) => ipcRenderer.invoke('jc:mock-interview-speech-set-online', on),
+  mockInterviewSpeechSetPack: (pack) => ipcRenderer.invoke('jc:mock-interview-speech-set-pack', pack),
+  mockInterviewTts: (opts) => ipcRenderer.invoke('jc:mock-interview-tts', opts),
+  mockInterviewTtsStream: (opts) => ipcRenderer.invoke('jc:mock-interview-tts-stream', opts),
+  mockInterviewTtsCancel: (streamId) => ipcRenderer.invoke('jc:mock-interview-tts-cancel', streamId),
+  // 流式朗读的分块（主进程 → 渲染层），返回取消订阅函数
+  onMockInterviewTtsChunk: (callback) => {
+    const listener = (_event, chunk) => callback(chunk);
+    ipcRenderer.on('jc:mock-interview-tts-chunk', listener);
+    return () => ipcRenderer.removeListener('jc:mock-interview-tts-chunk', listener);
+  },
+  mockInterviewTtsPreview: (opts) => ipcRenderer.invoke('jc:mock-interview-tts-preview', opts),
+  mockInterviewTtsClearCache: () => ipcRenderer.invoke('jc:mock-interview-tts-clear-cache'),
+  // 语音识别（P4）：渲染层传 16k Float32 PCM + 能量 VAD 分段
+  mockInterviewAsr: (opts) => ipcRenderer.invoke('jc:mock-interview-asr', opts),
+  mockInterviewAsrWarmup: () => ipcRenderer.invoke('jc:mock-interview-asr-warmup'),
+
+  // ===== 模拟面试 · 克隆音色（P4-B）=====
+  mockInterviewVoiceList: () => ipcRenderer.invoke('jc:mock-interview-voice-list'),
+  mockInterviewVoiceCreate: (payload) => ipcRenderer.invoke('jc:mock-interview-voice-create', payload),
+  mockInterviewVoicePackPick: () => ipcRenderer.invoke('jc:mock-interview-voice-pack-pick'),
+  mockInterviewVoicePackPreview: (dir, sid) => ipcRenderer.invoke('jc:mock-interview-voice-pack-preview', dir, sid),
+  mockInterviewVoiceImport: (dir, opts) => ipcRenderer.invoke('jc:mock-interview-voice-import', dir, opts),
+  mockInterviewVoiceRename: (id, name) => ipcRenderer.invoke('jc:mock-interview-voice-rename', id, name),
+  mockInterviewVoiceRemove: (id) => ipcRenderer.invoke('jc:mock-interview-voice-remove', id),
+  mockInterviewVoiceUsage: () => ipcRenderer.invoke('jc:mock-interview-voice-usage'),
+  mockInterviewVoiceClear: () => ipcRenderer.invoke('jc:mock-interview-voice-clear'),
+  // 安装进度（下载/解压/校验），返回取消订阅函数
+  onMockInterviewSpeechProgress: (callback) => {
+    const listener = (_event, p) => callback(p);
+    ipcRenderer.on('jc:mock-interview-speech-progress', listener);
+    return () => ipcRenderer.removeListener('jc:mock-interview-speech-progress', listener);
+  },
 
   // ===== 开机自启动（Windows 登录项）=====
   autostartGet: () => ipcRenderer.invoke('jc:autostart-get'),
@@ -81,8 +222,24 @@ const api = {
   backupRead: () => ipcRenderer.invoke('jc:backup-read'),
   backupDelete: () => ipcRenderer.invoke('jc:backup-delete'),
 
+  // ===== 岗位队列文件仓储（issue #10 / 存储迁移 P3）=====
+  // load/save 走主进程 <userData>/queue/；save 交「已序列化字符串 + 单调 seq」，
+  // savePatch 只交通常变化条目（P3 per-item 写入）。
+  queueLoad: () => ipcRenderer.invoke('jc:queue-load'),
+  queueSave: (text, seq, opts) => ipcRenderer.invoke('jc:queue-save', text, seq, opts),
+  queueSavePatch: (text, seq) => ipcRenderer.invoke('jc:queue-save-patch', text, seq),
+  queueClear: () => ipcRenderer.invoke('jc:queue-clear'),
+  queueUsage: () => ipcRenderer.invoke('jc:queue-usage'),
+
   // 保存定制简历 PDF：渲染进程传 A4 打印 HTML，主进程 printToPDF 后弹出保存对话框写盘
   savePdf: (defaultName, html) => ipcRenderer.invoke('jc:save-pdf', defaultName, html),
+  savePdfBatch: (items, requestId) => ipcRenderer.invoke('jc:save-pdf-batch', items, requestId),
+  cancelPdfBatch: (requestId) => ipcRenderer.invoke('jc:save-pdf-batch-cancel', requestId),
+  onPdfBatchProgress: (callback) => {
+    const handler = (_event, progress) => callback(progress);
+    ipcRenderer.on('jc:save-pdf-batch-progress', handler);
+    return () => ipcRenderer.removeListener('jc:save-pdf-batch-progress', handler);
+  },
   // 通用文本导出（CSV）：主进程弹系统保存对话框由用户选位置后写盘（extWhitelist 默认 ['csv']）
   saveFile: (defaultName, content, extWhitelist) =>
     ipcRenderer.invoke('jc:save-file', defaultName, content, extWhitelist),
@@ -101,6 +258,9 @@ const api = {
   // 系统文件选择对话框（多选）→ 返回 [{ path, name }]
   materialPick: () => ipcRenderer.invoke('jc:material-pick'),
   // 按绝对路径现读文件 → { ok, name, dataUrl, bytes }
+  // 防护由主进程统一实施（扩展名白名单 + 敏感文件名/目录黑名单 + 20MB 上限）——
+  // 刻意**不**在渲染层做「仅允许本次选过的路径」限制：历史素材只存在渲染层 localStorage，
+  // 那样做会让升级后所有历史素材都需重新选择（UX 回归），且防护面并未真正收紧。
   materialRead: (filePath) => ipcRenderer.invoke('jc:material-read', filePath),
 
   // ===== AI Skills 层（skills/<id>/SKILL.md，调用 AI 时按作用域启用）=====

@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { createSafePersistStorage } from '@/lib/persistSafe';
+import { isQueueFileMode } from '@/lib/bossclaw/queueMode';
 import type {
   DirectionPlan,
   PendingItem,
@@ -16,8 +17,10 @@ import type {
 import { DEFAULT_STATS, DEFAULT_PROFILE, DEFAULT_PROFILE_DRAFT, DEFAULT_DIRECTION_PLAN, today } from '@/lib/bossclaw/defaults';
 import { cleanCompanyName } from '@/lib/bossclaw/jobDisplay';
 
-/** 达标岗位本地缓存上限：最多保留最近 N 天（按日期分组）的达标岗位数据，超出自动清理更早几天的数据，防止 localStorage 撑爆。
- *  实测按每天约 460 个达标岗位、叠加图片简历+导入文件后，保留 7 天（≈3200 条）仍能把整 store 稳定在 5MB 配额约 60% 以内；90 天会随累计溢出。 */
+/** 达标岗位本地缓存上限：最多保留最近 N 天（按日期分组）的达标岗位数据，超出自动清理更早几天的数据，
+ *  防止 localStorage 体积无限膨胀（写盘体积直接决定每次 persist 的主线程序列化开销）。
+ *  口径修正（2026-10-27）：localStorage 的真实上限是 52,428,800 码元（≈50 Mi，见 lib/storage.ts 实测），
+ *  不是历史文档里的 5 MB；按每天约 460 条估算，7 天（≈3200 条）只占约 0.6%，7 天并非配额压力点。 */
 const MAX_QUALIFIED_CACHE_DAYS = 7;
 
 /** 裁剪达标岗位缓存：日期键多于上限时，删除最早（更久之前）的日期分组 */
@@ -93,6 +96,10 @@ interface DataState {
   addPendingItem: (item: PendingItem) => void;
   updatePending: (id: string, patch: Partial<PendingItem>) => void;
   setPending: (items: PendingItem[]) => void;
+  /** 删除单条岗位记录（含已投递终态）：仅从队列移除，不改动其它岗位 */
+  removePending: (id: string) => void;
+  /** 批量删除岗位记录（如清理「已投递」堆积）：按 id 移除，未命中的 id 自动忽略 */
+  removePendingMany: (ids: string[]) => void;
 
   upsertTaskRun: (run: TaskRun) => void;
   updateTaskRun: (id: string, patch: Partial<TaskRun>) => void;
@@ -104,6 +111,16 @@ interface DataState {
 
   recomputeStats: () => void;
   resetDailyStats: () => void;
+  /**
+   * 启动水合：把主进程数据文件里读回的 pending / qualifiedExports / 简历灌入 store（issue #10 / P3）。
+   * 仅在启动阶段调用一次；调用后立刻重算 stats，保证持久化的统计与文件队列一致。
+   * resume 缺省时保持 store 当前值（迁移失败的老数据仍从 localStorage 水合而来）。
+   */
+  hydrateFromFile: (
+    pending: PendingItem[],
+    qualifiedExports: Record<string, QualifiedJobExport[]>,
+    resume?: { resumeText?: string; resumeFileName?: string; imageResumes?: ImageResume[] },
+  ) => void;
 }
 
 export const useDataStore = create<DataState>()(
@@ -128,7 +145,7 @@ export const useDataStore = create<DataState>()(
       setResumeText: (text, fileName) =>
         set((s) => {
           // 本地存储容量保护（借鉴 AI-BossJob 的自动截断降级方案）：
-          // 简历原文过长时截断保存，避免撑爆 localStorage（约 5MB 配额）
+          // 简历原文过长时截断保存，避免单次写盘体积过大（配额口径见 lib/storage.ts 实测值）
           const MAX_RESUME_CHARS = 160_000;
           const raw = String(text || '');
           const stored = raw.length > MAX_RESUME_CHARS ? raw.slice(0, MAX_RESUME_CHARS) : raw;
@@ -188,6 +205,20 @@ export const useDataStore = create<DataState>()(
       updatePending: (id, patch) =>
         set((s) => ({ pending: s.pending.map((p) => (p.id === id ? { ...p, ...patch } : p)) })),
       setPending: (items) => set({ pending: items }),
+      removePending: (id) =>
+        set((s) => {
+          // 无变化时返回原 state，避免无意义地触发一次整包持久化
+          if (!s.pending.some((p) => p.id === id)) return s;
+          return { pending: s.pending.filter((p) => p.id !== id) };
+        }),
+      removePendingMany: (ids) =>
+        set((s) => {
+          const targets = new Set((Array.isArray(ids) ? ids : []).map(String));
+          if (!targets.size) return s;
+          const next = s.pending.filter((p) => !targets.has(p.id));
+          if (next.length === s.pending.length) return s;
+          return { pending: next };
+        }),
 
       upsertTaskRun: (run) =>
         set((s) => {
@@ -242,6 +273,21 @@ export const useDataStore = create<DataState>()(
         set({ stats: next });
       },
       resetDailyStats: () => set({ stats: { ...DEFAULT_STATS, date: today() } }),
+      hydrateFromFile: (pending, qualifiedExports, resume) => {
+        const patch: Partial<DataState> = {
+          pending: Array.isArray(pending) ? pending : [],
+          qualifiedExports: qualifiedExports && typeof qualifiedExports === 'object' ? qualifiedExports : {},
+        };
+        // P3：简历已迁到 <userData>/queue/resume.json；缺省字段不覆盖（兼容迁移失败 / 旧文件）
+        if (resume) {
+          if (typeof resume.resumeText === 'string') patch.resumeText = resume.resumeText;
+          if (typeof resume.resumeFileName === 'string') patch.resumeFileName = resume.resumeFileName;
+          if (Array.isArray(resume.imageResumes)) patch.imageResumes = resume.imageResumes;
+        }
+        set(patch);
+        // 文件队列是唯一事实来源，统计需立即对齐（否则持久化的 stats 会停留在 localStorage 旧值）
+        get().recomputeStats();
+      },
     }),
     {
       name: 'bossclaw-data',
@@ -262,7 +308,13 @@ export const useDataStore = create<DataState>()(
             pending: s.pending.map((p) => {
               if (p?.job && typeof p.job.company === 'string') {
                 const cleaned = cleanCompanyName(p.job.company);
-                if (cleaned === undefined) return { ...p, job: { ...p.job, company: '' } };
+                // cleanCompanyName 有两个出口：undefined（判脏：地名/保留字/长度不合理 → 置空）
+                // 与规范化后的字符串（压缩空白）。原实现只处理了前者，后者的返回值被直接丢弃，
+                // 「清洗」对合法但含多余空白的公司名完全不生效（审查 #4）。
+                return {
+                  ...p,
+                  job: { ...p.job, company: cleaned === undefined ? '' : cleaned },
+                };
               }
               return p;
             }),
@@ -276,6 +328,23 @@ export const useDataStore = create<DataState>()(
         // experienceMaterials 是「经历补充文件」的会话态引用：不持久化（正文每次调用现读磁盘），
         // 重启后需用户重新选择，避免应用内长期留存素材内容副本。
         const { resumeImage, experienceMaterials: _materials, ...rest } = s;
+        if (isQueueFileMode()) {
+          // issue #10 / P3：队列与简历已由主进程文件承载（lib/bossclaw/queueRepo.ts）。
+          // 这里必须把 pending / qualifiedExports / resumeText / resumeFileName / imageResumes
+          // 从 localStorage 载荷里剔除：
+          //   · 它们是 bossclaw-data 体积与写入频率的绝对大头（旧数据 5MB+）；
+          //   · 继续留在 localStorage 会和文件形成双源，一旦两边不一致就会出现「重启后回退」。
+          // 迁移失败/环境变量回滚时 isQueueFileMode() 为 false，行为自动退回旧路径。
+          const {
+            pending: _pending,
+            qualifiedExports: _qualified,
+            resumeText: _resumeText,
+            resumeFileName: _resumeFileName,
+            imageResumes: _imageResumes,
+            ...queueFree
+          } = rest;
+          return queueFree as DataState;
+        }
         return rest as DataState;
       },
     }
@@ -340,21 +409,44 @@ function jobCompleteness(job?: Pick<JobMeta, 'url' | 'company' | 'location' | 's
   return n;
 }
 
-/** pending 折叠重复（v2 迁移）：精确键（归一化 URL / jobId）或软匹配命中即视为同一岗位，保留更完整的一条 */
+/** pending 折叠重复（v2 迁移）：精确键（归一化 URL / jobId）或软匹配命中即视为同一岗位，保留更完整的一条。
+ *  性能（审查 #13）：精确键改走 Map 索引，避免对每条记录都在 `kept.some` 里重算 `jobUrlKey`（O(n²)，
+ *  每次比较都要 split/trim 字符串）；软匹配只对「至少一方是弱身份」的少量记录生效，保留原语义。
+ */
 function dedupePendingItems(pending: PendingItem[]): PendingItem[] {
   const kept: PendingItem[] = [];
-  for (const item of pending) {
+  const byUrl = new Map<string, number>();
+  const byJid = new Map<string, number>();
+  const jidOf = (p: PendingItem) => String(p.job?.jobId || '').trim().toLowerCase();
+  const dropIndex = (idx: number, prev: PendingItem) => {
+    const prevUrl = jobUrlKey(prev.job);
+    if (prevUrl && byUrl.get(prevUrl) === idx) byUrl.delete(prevUrl);
+    const prevJid = jidOf(prev);
+    if (prevJid && byJid.get(prevJid) === idx) byJid.delete(prevJid);
+  };
+  const addIndex = (idx: number, item: PendingItem) => {
     const key = jobUrlKey(item.job);
-    const jid = String(item.job?.jobId || '').trim().toLowerCase();
-    const exactHit = kept.some(
-      (p) => (key && jobUrlKey(p.job) === key) || (jid && String(p.job?.jobId || '').trim().toLowerCase() === jid)
-    );
-    if (exactHit) continue;
+    if (key) byUrl.set(key, idx);
+    const jid = jidOf(item);
+    if (jid) byJid.set(jid, idx);
+  };
+  for (const item of pending) {
+    // L-27：迁移/损坏数据可能含 null 元素，先跳过，避免 `item.job` 抛 TypeError 使整次迁移失败
+    if (!item || typeof item !== 'object') continue;
+    const key = jobUrlKey(item.job);
+    const jid = jidOf(item);
+    const exactIdx = (key ? byUrl.get(key) : undefined) ?? (jid ? byJid.get(jid) : undefined);
+    if (exactIdx !== undefined) continue;
     const softIdx = kept.findIndex((p) => sameJobSoft(item.job, p.job));
     if (softIdx >= 0) {
-      if (jobCompleteness(item.job) > jobCompleteness(kept[softIdx].job)) kept[softIdx] = item;
+      if (jobCompleteness(item.job) > jobCompleteness(kept[softIdx].job)) {
+        dropIndex(softIdx, kept[softIdx]);
+        kept[softIdx] = item;
+        addIndex(softIdx, item);
+      }
       continue;
     }
+    addIndex(kept.length, item);
     kept.push(item);
   }
   return kept;

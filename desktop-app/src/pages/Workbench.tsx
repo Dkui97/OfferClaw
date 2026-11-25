@@ -8,20 +8,24 @@
  * 右栏子模块：内置浏览器（BrowserView 多平台标签 webview，含 BOSS 等平台登录态与岗位详情页）
  */
 import { useEffect, useRef, useState, useMemo, useCallback, memo } from 'react';
-import { Button, Card, Empty, Progress, Tag, Typography, message, Segmented, Tooltip, Space, Select, Alert } from 'antd';
+import { Button, Card, Empty, Progress, Tag, Typography, message, Segmented, Tooltip, Space, Select, Alert, Modal, Popconfirm } from 'antd';
 import {
   CheckOutlined, ReloadOutlined, EyeOutlined, SearchOutlined,
   StopOutlined, UndoOutlined, ThunderboltOutlined,
-  PauseOutlined, CaretRightOutlined, InfoCircleOutlined,
+  PauseOutlined, CaretRightOutlined, InfoCircleOutlined, DeleteOutlined,
 } from '@ant-design/icons';
 import { useDataStore } from '@/store/useDataStore';
 import { useRuntimeLogsStore, type LogLevel } from '@/store/useRuntimeLogsStore';
 import { useSettingsStore } from '@/store/useSettingsStore';
 import { useAppStore } from '@/store/useAppStore';
 import { useScheduleStore } from '@/store/useScheduleStore';
+import { notifyRiskPaused, notifyValidationPaused } from '@/lib/notify';
 import BrowserView, { WebviewApi } from '@/components/BrowserView';
 import GreetingEditor from '@/components/GreetingEditor';
 import PlatformChip from '@/components/PlatformChip';
+import CompanyBizPanel from '@/components/CompanyBizPanel';
+import CompanyDueDiligencePanel from '@/components/CompanyDueDiligencePanel';
+import ProgressStageSelect from '@/components/ProgressStageSelect';
 import { ChevronDown } from '@/components/ChevronDown';
 import { LogConsole } from '@/components/LogConsole';
 import { rerankPending, promoteApprovedToQueue } from '@/lib/bossclaw/priority';
@@ -29,22 +33,32 @@ import { analyzeJob, resolveQueueMinScore } from '@/lib/bossclaw/matching';
 import { fitLevelLabel } from '@/lib/bossclaw/fitLevel';
 import { isLocationExcluded } from '@/lib/bossclaw/locationFilter';
 import { isCompanyExcluded } from '@/lib/bossclaw/companyFilter';
+import { MATCH_SCORE_COLOR } from '@/lib/bossclaw/statsAggregate';
 import { isJdKeywordExcluded } from '@/lib/bossclaw/jdKeywordFilter';
+import { checkJobExpiry, isExpiryFilterEnabled, PLATFORM_EXPIRY_DEFAULT } from '@/lib/bossclaw/jobExpiry';
 import { makePendingItem, jobUrlKey, sameJobSoft } from '@/store/useDataStore';
 import { checkBossLogin } from '@/lib/bossLogin';
 import { stageToPhase, taskStageMetaFor } from '@/lib/bossclaw/taskState';
-import { jobCardStatus, scoreChip } from '@/lib/bossclaw/statusMeta';
+import { jobCardStatus, scoreChip, JOB_ACTION_TIPS } from '@/lib/bossclaw/statusMeta';
 import { formatMetaLine, cleanTitle, decodeSalaryDigits } from '@/lib/bossclaw/jobDisplay';
+// 企业工商摘要（P1-5 A 层）：卡片上只显示一行状态/注册资本，详细字段在展开区的 CompanyBizPanel
+import { bizProfileTag } from '@/lib/bossclaw/companyProfile';
+// 企业背调摘要（B/C 层）：只有中/高风险才在卡片上出提示标签，且明示「非权威、不拦截」
+import { dueDiligenceTag } from '@/lib/bossclaw/companyDueDiligence';
 import { meetsHrActivityFilter, HR_ACTIVITY_FILTER_LABEL } from '@/lib/bossclaw/hrActivity';
 import { detectInterviewMode } from '@/lib/bossclaw/interviewMode';
 import { detectWorkSchedule } from '@/lib/bossclaw/workSchedule';
-import { buildSearchQueue } from '@/lib/bossclaw/searchUrl';
-import { buildPlatformSearchQueue, describePlatformCriteria, type PlatformSearchQueueItem } from '@/lib/bossclaw/platformUrls';
+import { buildSearchQueue, type SearchQueueItem } from '@/lib/bossclaw/searchUrl';
+import { buildPlatformSearchQueue, bossCriteriaFromQueueItem, describePlatformCriteria, type PlatformSearchQueueItem } from '@/lib/bossclaw/platformUrls';
 import { collectFaultScope, platformEnabled, platformLabel, sortedEnabledPlatforms, PLATFORM_IDS, type JobPlatform } from '@/lib/bossclaw/platforms';
 import {
-  ActionPacer, effectiveDailyCapFor, dailySentCountFor, isLockedOut,
-  cooldownRemaining, classifyRiskCode, humanDelayMs, SAFETY_LIMITS,
+  effectiveDailyCapFor, dailySentCountFor, isLockedOut,
+  cooldownRemaining, classifyRiskCode, humanDelayMs, SAFETY_LIMITS, resolveCooldownMs, nextCooldownUntil,
 } from '@/lib/bossclaw/safety';
+import { sharedPacer, markDelivered, resetDeliveredSinceRest } from '@/lib/bossclaw/deliveryThrottle';
+// 活跃时段 / 批次休息（**唯一权威**，详见模块头注释）：
+// 操作时间戳是**服务端可见的账号级长期统计**，指纹补丁掩盖不了「24 小时无睡眠」「连续上百次不中断」
+import { isWithinActiveWindow, nextActiveStartMs, formatActiveWindow, batchRestDelayMs } from '@/lib/bossclaw/activityWindow';
 import { resolveCityCode, loadBossCityCodes } from '@/lib/bossclaw/searchUrl';
 import { camoufoxSearch, camoufoxSend, camoufoxStatus, isCamoufoxStopCode, isCamoufoxEnvCode, type CamoufoxJob } from '@/lib/bossclaw/camoufox';
 import { claimDelivery, isDeliveryClaimed, releaseDelivery } from '@/lib/bossclaw/deliveryLock';
@@ -143,8 +157,12 @@ const BOSS_RESUME_URL = 'https://www.zhipin.com/web/geek/resume';
 const LogStream = memo(function LogStream() {
   const logs = useRuntimeLogsStore((s) => s.logs);
   const formattedLogs = useMemo(() => {
+    // 审查 #96：key 必须用**稳定 id**（store 在写入时生成）。原实现用 `${l.time}-${i}`，
+    // 而 i 是 slice(-80) 窗口内的下标 —— 每来一条新日志整个窗口位移、所有 key 变化，
+    // 使已 memo 的 LogItem 全量重挂载（大列表下可见的滚动卡顿 + 丢失 DOM 复用）。
+    // 历史持久化数据可能缺 id（旧版本写入），此时才回落 `时间-窗口下标`。
     return logs.slice(-80).map((l, i) => ({
-      id: `${l.time}-${i}`,
+      id: l.id || `${l.time}-${i}`,
       time: typeof l.time === 'number' ? new Date(l.time).toLocaleTimeString() : String(l.time),
       level: l.level || 'info',
       msg: l.msg,
@@ -239,6 +257,8 @@ export default function Workbench() {
   const addPendingItem = useDataStore((s) => s.addPendingItem);
   const updatePending = useDataStore((s) => s.updatePending);
   const setPending = useDataStore((s) => s.setPending);
+  const removePending = useDataStore((s) => s.removePending);
+  const removePendingMany = useDataStore((s) => s.removePendingMany);
   const addLog = useRuntimeLogsStore((s) => s.addLog);
   const recomputeStats = useDataStore((s) => s.recomputeStats);
   // 采集任务联动：与「任务进度」页共用 taskRuns（采集时写入，任务进度页实时出现卡片）
@@ -273,7 +293,14 @@ export default function Workbench() {
   const commStuckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // BOSS DOM 投递结果等待槽：runNext 打开岗位下发 start-apply 后挂起，等 handleApplyStage 回写终态
   // （verify_result→success / risk / failed / external→skip），避免 fire-and-forget 造成 runNext 反复重入与日志重复。
-  const domWaitRef = useRef<((mode: 'success' | 'risk' | 'failed' | 'skip' | 'timeout' | 'continue_chat', payload: any, tabId?: string) => void) | null>(null);
+  const domWaitRef = useRef<((mode: 'success' | 'risk' | 'failed' | 'skip' | 'timeout' | 'continue_chat' | 'aborted', payload: any, tabId?: string) => void) | null>(null);
+  /** 手动暂停信号：置真后，仍在等「岗位间隔 / 页面就绪」的通道必须在沟通动作下发前退出。
+   *  每次 runNext 选中新岗位时复位（见 runNext）；不复位会让暂停后的下一次启动也被拦下。 */
+  const deliveryAbortRef = useRef(false);
+  /** 是否有投递通道正在执行（页面已打开、等终态回传）。
+   *  暂停时**不能**清 activeId：handleApplyStage 以 activeId 为事件路由键，清空会丢弃页内回传，
+   *  该岗位只能等兜底超时 → 被误判「投递失败」（用户实测现象）。收口由通道自身负责。 */
+  const deliveryInFlightRef = useRef(false);
   // 最近一次记录的投递阶段（用于进度日志去重：同一阶段反复回传时只记一条，避免刷屏）
   const lastApplyStageRef = useRef<TaskStage | ''>('');
   // P01：runNext 互斥守卫。只允许一个投递循环在途；执行中再有触发则排队，结束后续跑。
@@ -323,19 +350,21 @@ export default function Workbench() {
   }, []);
   // 跳过日志合并：连续同因跳过只打一条，切换原因时再补「同类跳过 ×N」，避免刷屏
   const lastSkipLogRef = useRef<{ msg: string; count: number } | null>(null);
-  const flushLastSkipLog = () => {
+  // 包 useCallback：它被 addSkipLogOnce 与 ingestJob 两个 useCallback 引用，
+  // 普通函数每渲染换引用会让这两者的依赖恒变（等于没缓存）。
+  const flushLastSkipLog = useCallback(() => {
     const cur = lastSkipLogRef.current;
     if (!cur) return;
     if (cur.count > 1) addLog('info', `${cur.msg}（同因跳过 ×${cur.count}）`);
     lastSkipLogRef.current = null;
-  };
+  }, [addLog]);
   const addSkipLogOnce = useCallback((level: LogLevel, msg: string) => {
     const cur = lastSkipLogRef.current;
     if (cur && cur.msg === msg) { cur.count += 1; return; }
     flushLastSkipLog();
     lastSkipLogRef.current = { msg, count: 1 };
     addLog(level, msg);
-  }, [addLog]);
+  }, [addLog, flushLastSkipLog]);
 
   // ===== Camoufox 隐身采集（可选增强）=====
   const [cfxCollecting, setCfxCollecting] = useState(false);
@@ -375,7 +404,8 @@ export default function Workbench() {
   }, [config, searchPlatforms]);
 
   // ===== 防封号：限速器 + 投递节奏 =====
-  const pacerRef = useRef<ActionPacer>(new ActionPacer(SAFETY_LIMITS.MAX_ACTIONS_PER_MINUTE));
+  // 限速器（pacer）与「连续投递计数」**不在本组件持有一份**：二者都是账号级保护，必须与
+  // 「自动沟通」引擎共享同一实例，否则并行运行时速率上限翻倍、批次休息间隔翻倍（见审查 #73）。
   const lastDeliveryAt = useRef(0);
   const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -387,6 +417,10 @@ export default function Workbench() {
   }, []);
 
   const ensureBossLogin = async (): Promise<boolean> => {
+    // CloakBrowser 使用独立浏览器 profile，persist:bossclaw 里的 cookie 探测对它无效；
+    // 是否登录以页面自身 page-status.loginWall 为准（waitTabReady 命中 reason='login' 即收口）。
+    // 否则会出现「Cloak 页面已登录、却因 Electron 会话没 cookie 被拦下」的假未登录。
+    if (useSettingsStore.getState().config.engineMode === 'cloak') return true;
     let v = useAppStore.getState().bossLoggedIn;
     if (v !== true) {
       // 权威复核：缓存态可能因「DOM 误报 / 启动时序」停留在 false，现场重读 wt2 cookie 再定
@@ -446,8 +480,13 @@ export default function Workbench() {
         cfxActiveRef.current = false;
         setCfxCollecting(false);
         setRunning(false);
-        setActiveId(null);
-        setApplyStage(null);
+        // 暂停一律置位中止信号：正在等节流/页面就绪的通道会在沟通动作下发前退出
+        deliveryAbortRef.current = true;
+        // 在途投递不清 activeId：页面可能仍在回传终态（清空会让回传被丢弃、误判失败）
+        if (!deliveryInFlightRef.current) {
+          setActiveId(null);
+          setApplyStage(null);
+        }
         addLog('warn', '已停止投递');
       }
     }
@@ -557,6 +596,17 @@ export default function Workbench() {
       addLog('info', `已跳过：${job.title || job.url}（${bl.reason}）`);
       recomputeStats();
       return;
+    }
+    // JD 截止日期已过（确定性过滤）：与 ingestJob 同口径（jobExpiry.ts 唯一权威），
+    // 让「加入任务」这条不经 ingestJob 的入口也被拦截，避免过期岗位绕过设置进队列。
+    if (isExpiryFilterEnabled(cfg, job.platform, PLATFORM_EXPIRY_DEFAULT[String(job.platform || '')] ?? false)) {
+      const exp = checkJobExpiry(job);
+      if (exp.expired) {
+        addPendingItem({ id: runId, runId, job, status: 'skipped', createdAt: Date.now(), retryCount: 0, deliveryGreeting: '', error: exp.reason });
+        addLog('info', `已跳过：${job.title || job.url}（${exp.reason}）`);
+        recomputeStats();
+        return;
+      }
     }
     const imFilterM = cfg.interviewModeFilter || 'any';
     if (imFilterM !== 'any') {
@@ -692,6 +742,17 @@ export default function Workbench() {
   const onApproveAll = () => {
     const waiting = pending.filter((p) => p.status === 'pending');
     if (!waiting.length) { message.info('没有待确认的岗位'); return; }
+    // M-39：高危批量动作前置二次确认（展示将处理的数量），避免误点一次性入队
+    Modal.confirm({
+      title: '批量确认全部「待确认」岗位？',
+      content: `将把 ${waiting.length} 个岗位一次性加入「投递中」队列；其中缺少求职招呼语的岗位不会入队（仍留在「待确认」）。`,
+      okText: '确认入队',
+      cancelText: '取消',
+      onOk: () => approveAllNow(waiting),
+    });
+  };
+
+  const approveAllNow = (waiting: PendingItem[]) => {
     // 批量确认走同一口径：直接入队。逐个校验招呼语——无招呼语者**不入队**（保持待确认），
     // 与单个「批准」的「无招呼语则拒绝批准」一致，不做静默兜底。
     const noGreeting: string[] = [];
@@ -725,15 +786,25 @@ export default function Workbench() {
   const onRejectAll = () => {
     const waiting = pending.filter((p) => p.status === 'pending');
     if (!waiting.length) { message.info('没有待确认的岗位'); return; }
-    setPending(pending.map((p) => (p.status === 'pending' ? { ...p, status: 'ignored' as const } : p)));
-    addLog('info', `已忽略 ${waiting.length} 个岗位`);
-    recomputeStats();
+    // M-39：批量忽略不可逆（岗位离开待确认），前置二次确认并展示数量
+    Modal.confirm({
+      title: '忽略全部「待确认」岗位？',
+      content: `将把 ${waiting.length} 个岗位标记为「已忽略」。`,
+      okText: '确认忽略',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: () => {
+        setPending(pending.map((p) => (p.status === 'pending' ? { ...p, status: 'ignored' as const } : p)));
+        addLog('info', `已忽略 ${waiting.length} 个岗位`);
+        recomputeStats();
+      },
+    });
   };
 
   const onRetry = (id: string) => {
     const item = pending.find((p) => p.id === id);
     if (item?.riskBlocked) { message.warning('该岗位曾触发平台风控拦截（验证/封禁），禁止重试，请人工核对'); return; }
-    updatePending(id, { status: 'pending', retryCount: (item?.retryCount || 0) + 1, error: '', riskBlocked: false });
+    updatePending(id, { status: 'pending', retryCount: (item?.retryCount || 0) + 1, error: '', riskBlocked: false, needsReview: false });
     addLog('info', '已重置该岗位，可重新分析/投递');
   };
 
@@ -767,6 +838,50 @@ export default function Workbench() {
     if (useAppStore.getState().autoAssist) requestRunNext();
   };
 
+  // ===== 终态岗位删除（终态清理）=====
+  // sent / failed / skipped / ignored 都是终态：重试/忽略/跳过对它们无意义，此前只有 sent 有出口，
+  // 其余状态只能靠「显示已忽略/跳过」查看、无法清理，长期累积。
+  // 删除仅移除本地岗位记录：不影响已发出的消息，也不影响平台上的真实投递；
+  // 相关计数随 pending 一起重算（数据源只有 pending 一处）。
+  const DELETABLE_STATUSES = ['sent', 'failed', 'skipped', 'ignored'];
+  const onDeleteTerminal = (id: string) => {
+    const item = useDataStore.getState().pending.find((p) => p.id === id);
+    if (!item) return;
+    if (!DELETABLE_STATUSES.includes(item.status)) { message.warning('仅终态岗位（已投递 / 失败 / 已忽略 / 已跳过）支持删除'); return; }
+    removePending(id);
+    // 防御：极端情况下引擎仍指向该卡（如刚投递完成即被删除），一并释放，避免残留 activeId 指向已删数据
+    if (id === activeId) {
+      setActiveId(null);
+      setApplyStage(null);
+    }
+    addLog('warn', `已删除岗位记录（${STATUS_TAG[item.status]?.label || item.status}）：${cleanTitle(item.job?.title, item.job?.salary)}`);
+    message.success('已删除该岗位记录');
+    recomputeStats();
+  };
+
+  const onClearDelivered = () => {
+    const sentItems = useDataStore.getState().pending.filter((p) => p.status === 'sent');
+    if (!sentItems.length) { message.info('暂无已投递岗位'); return; }
+    // 批量删除不可恢复，前置二次确认（与「批量忽略」同一口径）
+    Modal.confirm({
+      title: `清理全部「已投递」岗位（${sentItems.length} 个）？`,
+      content: '仅删除本地岗位记录，不影响已发出的招呼语与平台上的实际投递；删除后「已投递」计数同步减少，且不可恢复。',
+      okText: '确认清理',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: () => {
+        removePendingMany(sentItems.map((p) => p.id));
+        if (activeId && sentItems.some((p) => p.id === activeId)) {
+          setActiveId(null);
+          setApplyStage(null);
+        }
+        addLog('warn', `已清理 ${sentItems.length} 个已投递岗位记录`);
+        message.success(`已清理 ${sentItems.length} 个已投递岗位`);
+        recomputeStats();
+      },
+    });
+  };
+
   // 兼容入口：现在「批准」已直接入队，正常情况下不会有 approved 残留。
   // 保留它用于两种情况：1) 老版本数据里遗留的 approved 岗位（升级后一次性清掉）；
   // 2) 未来若重新引入「先攒一批再统一投放」的两步用法。
@@ -779,11 +894,22 @@ export default function Workbench() {
     const { next, count } = promoteApprovedToQueue(pending, useSettingsStore.getState().config);
     const queued = pending.filter((p) => p.status === 'approved_queue').length;
     if (!count && !queued) { message.info('队列里没有待投递的岗位'); return; }
-    if (count) setPending(next);
-    if (!running) setAutoAssist(true);
-    addLog('success', count
-      ? `已将 ${count} 个「待投递」岗位并入「投递中」队列，开始投递`
-      : `队列中已有 ${queued} 个岗位，开始投递`);
+    // M-39：一键投递会真实开启投递引擎（不可逆的外部副作用），前置二次确认并展示将处理的数量
+    Modal.confirm({
+      title: '开始「一键投递」？',
+      content: count
+        ? `将把 ${count} 个「待投递」岗位并入「投递中」队列，并开启投递引擎开始投递${queued ? `（队列中另有 ${queued} 个已入队岗位）` : ''}。`
+        : `队列中已有 ${queued} 个「投递中」岗位，将开启投递引擎开始投递。`,
+      okText: '开始投递',
+      cancelText: '取消',
+      onOk: () => {
+        if (count) setPending(next);
+        if (!running) setAutoAssist(true);
+        addLog('success', count
+          ? `已将 ${count} 个「待投递」岗位并入「投递中」队列，开始投递`
+          : `队列中已有 ${queued} 个岗位，开始投递`);
+      },
+    });
   };
 
   const toggleExpanded = (id: string) => {
@@ -796,23 +922,32 @@ export default function Workbench() {
   };
 
   const onRetryAllFailed = () => {
-    const retryable = pending.filter((p) => p.status === 'failed' && !p.riskBlocked);
-    if (!retryable.length) { message.info('没有可重试的失败任务'); return; }
-    setPending(pending.map((p) => (p.status === 'failed' && !p.riskBlocked ? { ...p, status: 'approved_queue' as const, retryCount: (p.retryCount || 0) + 1, error: '', riskBlocked: false, approvedAt: Date.now() } : p)));
+    // needsReview（发送结果证据不足）不参与批量重试：可能其实已经发出，重试会造成重复消息。
+    const retryable = pending.filter((p) => p.status === 'failed' && !p.riskBlocked && !p.needsReview);
+    if (!retryable.length) { message.info('没有可重试的失败任务（需人工核对的岗位请单独确认后再重试）'); return; }
+    setPending(pending.map((p) => (p.status === 'failed' && !p.riskBlocked && !p.needsReview ? { ...p, status: 'approved_queue' as const, retryCount: (p.retryCount || 0) + 1, error: '', riskBlocked: false, needsReview: false, approvedAt: Date.now() } : p)));
     addLog('info', `已重新投递 ${retryable.length} 个失败任务`);
     recomputeStats();
     startDelivery();
   };
 
-  const pauseAssist = (reason: string) => {
+  // 包 useCallback：pauseAssist 被 handleRisk / handleDelivered 等多个 useCallback 引用，
+  // 普通函数每渲染换引用会让那些回调的依赖恒变（React 每次都重建，缓存失效）。
+  // 内部只用到 setState / store action / ref，没有随渲染变化的值，[] + addLog 即可。
+  const pauseAssist = useCallback((reason: string) => {
     visualActiveRef.current = false;
     setVisualCollecting(false);
     setVisualPaused(false);
     setAutoAssist(false);
-    setActiveId(null);
-    setApplyStage(null);
+    // 在途投递（页面已打开、等 apply-stage 终态）绝不能在这里清 activeId/applyStage：
+    // 清空后 handleApplyStage 会丢弃页内回传 → 只能等兜底超时 → 岗位被误判失败。
+    // 这种情形由通道函数自己收口（见 deliveryInFlightRef / domResult.mode==='aborted'）。
+    if (!deliveryInFlightRef.current) {
+      setActiveId(null);
+      setApplyStage(null);
+    }
     addLog('warn', reason);
-  };
+  }, [addLog, setAutoAssist]);
 
   // ===== 投递节流：拆成「预检」+「间隔等待」两段 =====
   // 拆分动机（09-17 实测）：岗位间隔节流（betweenJobsSeconds，默认 20s）原本发生在**打开标签页之前**，
@@ -829,6 +964,18 @@ export default function Workbench() {
       pauseAssist(`账号处于冷却期（剩余约 ${Math.ceil(cooldownRemaining(cfg) / 60000)} 分钟），已暂停投递，请勿重复启动以免升级封禁`);
       return false;
     }
+    // 活跃时段检查（模拟真人作息）。放在统一预检里 → 三条投递通道（BOSS DOM / 非 BOSS DOM / Camoufox）
+    // 全部受它约束，无需各写一遍。
+    // 为什么不「等」：非活跃时段可能要等数小时，阻塞界面不可接受 —— 只能中止本轮并明确告知何时恢复。
+    if (!isWithinActiveWindow(cfg.activeHours)) {
+      const nextAt = nextActiveStartMs(cfg.activeHours);
+      pauseAssist(
+        `当前不在活跃时段（今日投递窗口 ${formatActiveWindow(cfg.activeHours)}）。` +
+        `按真人作息在非活跃时段停止投递，可显著降低「账号活动时间异常」的风控风险；` +
+        `预计 ${new Date(nextAt).toLocaleString('zh-CN')} 自动恢复（可在设置中调整或关闭该限制）`,
+      );
+      return false;
+    }
     // 工作台「一键投递」只处理 BOSS 岗位 → 上限按 BOSS 平台独立适配
     // （effectiveDailyCapFor：min(该平台每日目标, 平台侧上限, MAX_SAFE_DAILY=150)）
     const cap = effectiveDailyCapFor(cfg, 'boss');
@@ -837,8 +984,8 @@ export default function Workbench() {
       pauseAssist(`今日 BOSS 已投递 ${sentToday} 条，达到该平台上限 ${cap} 条，投递已暂停（避免账号受限）`);
       return false;
     }
-    const pacerMax = Math.max(1, Number(cfg.maxActionsPerMinute) || SAFETY_LIMITS.MAX_ACTIONS_PER_MINUTE);
-    if (pacerRef.current.budget !== pacerMax) pacerRef.current = new ActionPacer(pacerMax);
+    // 预算同步到共享 pacer（其内部夹到 SAFETY_LIMITS.MAX_ACTIONS_PER_MINUTE 硬上限；见审查 #22/#73）
+    sharedPacer(cfg.maxActionsPerMinute);
     return true;
   };
 
@@ -852,7 +999,29 @@ export default function Workbench() {
    */
   const awaitDeliveryGap = async (): Promise<void> => {
     const cfg = useSettingsStore.getState().config;
-    await pacerRef.current.waitForSlot();
+    // 可中断等待：暂停后 1s 内返回，避免「已暂停却仍白等批次休息/岗位间隔」
+    const sleepAbortable = async (ms: number): Promise<void> => {
+      const end = Date.now() + ms;
+      while (Date.now() < end) {
+        if (deliveryAbortRef.current) return;
+        await sleep(Math.min(1000, Math.max(1, end - Date.now())));
+      }
+    };
+    // ===== 批次休息（真人不会连续上百次投递而不中断）=====
+    // 与「岗位间隔」是两个量级：岗位间隔是秒级抖动，批次休息是分钟级中断，后者才是打断
+    // 「连续高强度作业」曲线的关键 —— 只做秒级抖动的账号，其 24h 活动曲线上仍是一条直线。
+    const sinceRest = markDelivered();
+    const restMs = batchRestDelayMs(cfg.batchRest, sinceRest);
+    if (restMs > 0) {
+      const restMin = Math.round(restMs / 60000);
+      addLog('info', `已连续投递 ${sinceRest} 个岗位，按防封号策略休息约 ${restMin} 分钟（模拟真人作业中断，降低风控风险）`);
+      await sleepAbortable(restMs);
+      if (deliveryAbortRef.current) return; // 暂停：不刷新 lastDeliveryAt（本岗位动作并未下发）
+      resetDeliveredSinceRest();
+      addLog('info', '批次休息结束，继续投递');
+    }
+    await sharedPacer(cfg.maxActionsPerMinute).waitForSlot();
+    if (deliveryAbortRef.current) return;
     const baseSec = Math.max(Number(cfg.betweenJobsSeconds) || SAFETY_LIMITS.MIN_BETWEEN_JOBS_MS / 1000, SAFETY_LIMITS.MIN_BETWEEN_JOBS_MS / 1000);
     const gapMs = humanDelayMs(baseSec * 1000, 0.35);
     const elapsed = Date.now() - lastDeliveryAt.current;
@@ -862,7 +1031,11 @@ export default function Workbench() {
       // 用户容易以为卡死而手动重复点投递 —— 那才是真正会触发风控的高频操作。
       const waitSec = Math.ceil(wait / 1000);
       addLog('info', `为降低风控风险，本岗位将等待 ${waitSec} 秒后投递（岗位间隔约 ${Math.round(gapMs / 1000)}s，距上次投递已过 ${Math.round(elapsed / 1000)}s）。页面已在后台加载完成，期间请勿手动重复投递`);
-      await sleep(wait);
+      await sleepAbortable(wait);
+      if (deliveryAbortRef.current) {
+        addLog('warn', '已暂停投递：本次等待中断，本岗位动作未下发');
+        return;
+      }
       addLog('info', `等待结束（${waitSec}s），继续投递本岗位`);
     }
     lastDeliveryAt.current = Date.now();
@@ -914,6 +1087,16 @@ export default function Workbench() {
       addSkipLogOnce('info', `跳过「${job?.title || '岗位'}」（${jd.reason}）`);
       return false;
     }
+    // JD 截止日期已过（确定性过滤）：猎聘 JD 末尾常带「截止日期：YYYY年MM月DD日」，
+    // 过期岗位无投递价值。此处前置拦截，省掉后续 AI 分析（jobMatch 里还有同一条硬约束兜底，
+    // 保证「加入任务」等不经 ingestJob 的入口同样被拦）。判定口径唯一权威见 jobExpiry.ts。
+    if (isExpiryFilterEnabled(cfg, job?.platform, PLATFORM_EXPIRY_DEFAULT[String(job?.platform || '')] ?? false)) {
+      const exp = checkJobExpiry(job);
+      if (exp.expired) {
+        addSkipLogOnce('info', `跳过「${job?.title || '岗位'}」（${exp.reason}）`);
+        return false;
+      }
+    }
     const imFilterC = cfg.interviewModeFilter || 'any';
     if (imFilterC !== 'any') {
       const modeC = detectInterviewMode(job);
@@ -958,7 +1141,7 @@ export default function Workbench() {
       addLog('error', `分析失败「${meta.title}」：${err?.message || err}`);
       return false;
     }
-  }, [addPendingItem, addLog, addSkipLogOnce]);
+  }, [addPendingItem, addLog, addSkipLogOnce, flushLastSkipLog]);
 
   // 提取纯 encryptJobId（对齐旧 webview.cjs 口径）
   const extractEncryptJobId = useCallback((job: JobMeta): string => {
@@ -1007,7 +1190,9 @@ export default function Workbench() {
     const signal = classifyRiskCode(code);
     const msg = String(rawMessage || signal?.message || '检测到平台风控信号');
     const severity = signal?.severity || 'challenge';
-    const cooldownMs = signal?.cooldownMs ?? SAFETY_LIMITS.DEFAULT_COOLDOWN_MS;
+    // 唯一权威解析：按「设置页的风控冷却（autoCooldownMinutes）」× 风险级别比例，
+    // 并受该级别绝对下限约束（详见 safety.ts::resolveCooldownMs）。
+    const cooldownMs = resolveCooldownMs(useSettingsStore.getState().config, signal);
     if (activeId) {
       updatePending(activeId, { status: 'failed', error: msg, retryable: signal?.retryable === true, riskBlocked: severity === 'banned' });
     }
@@ -1015,14 +1200,16 @@ export default function Workbench() {
     setApplyStage(null);
     recomputeStats();
     if (severity === 'banned') {
-      useSettingsStore.getState().setConfig({ pausedUntil: Date.now() + cooldownMs });
+      useSettingsStore.getState().setConfig({ pausedUntil: nextCooldownUntil(useSettingsStore.getState().config, signal) });
       pauseAssist(`${msg}。已强制暂停并进入冷却 ${Math.ceil(cooldownMs / 60000)} 分钟，请人工处理，切勿重复重试以免升级封禁。`);
     } else if (severity === 'rate_limited') {
-      useSettingsStore.getState().setConfig({ pausedUntil: Date.now() + cooldownMs });
+      useSettingsStore.getState().setConfig({ pausedUntil: nextCooldownUntil(useSettingsStore.getState().config, signal) });
       pauseAssist(`${msg}。已暂停并进入退避冷却 ${Math.ceil(cooldownMs / 60000)} 分钟，之后可重新投递。`);
     } else {
       pauseAssist(`${msg}。已暂停投递：若右侧浏览器出现安全验证，请人工完成后再点"重新投递"。`);
     }
+    // 窗口可能在托盘里：风控暂停必须让人看见（不是程序坏了，是被平台拦了，需要人工处理）
+    notifyRiskPaused(code ?? '-', msg);
   }, [activeId, updatePending, addLog, recomputeStats, pauseAssist]);
 
   // ===== 投递成功处理（API / DOM 兜底共用）=====
@@ -1050,9 +1237,14 @@ export default function Workbench() {
       // 历史 bug：此处曾直接 return，跳过上面的标签收尾，导致 activeId/activeTabRef 悬挂、
       // 引擎停在已 sent 的岗位上无法推进（表现为「投递一个就要重新确认」）。
       pauseAssist('首次投递成功，已暂停投递：请核对右侧沟通对象、文字气泡与附件，确认无误后再启动');
+      // 首次验收是唯一「必须人来拍板」的节点：窗口可能已收进托盘，用系统通知把人叫回来
+      notifyValidationPaused(c?.job?.title);
       return;
     }
     if (useAppStore.getState().autoAssist) requestRunNext();
+    // requestRunNext 是函数声明（`function requestRunNext()`），只读写 ref 与 getState，语义上等价稳定引用；
+    // 写成依赖会让本回调每次渲染都重建（函数声明每渲染都是新引用），等于没缓存。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [updatePending, addLog, recomputeStats, pauseAssist]);
 
   // ===== 可视化采集（对齐 job-claw-main：逐卡片滚动 + 高亮 + 点击展开详情）=====
@@ -1210,7 +1402,9 @@ export default function Workbench() {
     ingestedSeenRef.current = new Set(); // 新一采集批重置去重，允许重新扫描
     collectListReadyLoggedRef.current = false; // 新一批重新记录首个「列表就绪」
     visualLoginBlockedRef.current = '';
-    // BOSS 登录态由 wt2 cookie 判定（webview 与隐身引擎共用同一会话）；
+    // BOSS 登录态：内置 WebView 用 persist:bossclaw 的 wt2 cookie；CloakBrowser 使用独立 profile，
+    // 其登录态由页内 page-status / loginWallDetected() 判定（见 ensureBossLogin 的 cloak 短路）；
+    // Camoufox 走 runCamoufoxCollect 的引擎自检，不进入本函数。
     // 其余平台的登录态在各自标签页内，由页内 loginWallDetected() 判定后回传 login-required
     // —— 不能拿 BOSS cookie 口径去判断猎聘/智联/前程无忧（会误判成未登录而拒绝采集）。
     if (platform === 'boss' && !(await ensureBossLogin())) return 'skip';
@@ -1225,7 +1419,8 @@ export default function Workbench() {
     if (cfg0.collectWithoutKeyword) addLog('warn', NO_KEYWORD_SETUP_REMINDER);
     // 搜索队列按平台分源，两条通道口径统一：
     //   BOSS   → searchUrl.ts（官方筛选码 + 城市码表）
-    //   其余平台 → platformUrls.ts（城市/薪资/关键词进 URL，基础求职条件同步拼接）—— 与隐身采集同一构建器
+    //   其余平台 → platformUrls.ts（城市/薪资/关键词进 URL；猎聘与智联把「基础求职条件」+ HR 活跃度
+    //              一并拼进 URL，前程无忧仍只带城市/薪资/关键词）—— 与隐身采集同一构建器
     if (platform === 'boss') await loadBossCityCodes();
     const queue = platform === 'boss'
       ? filterQueueByRunIds('boss', buildSearchQueue(directionPlan, config), runIds)
@@ -1590,11 +1785,16 @@ export default function Workbench() {
       const item = queue[qi];
       if (!cfxActiveRef.current) break;
       const cityCode = platform === 'boss' ? (resolveCityCode(item.location) || '100010000') : String(item.location || '全国');
-      // 非 BOSS 平台：城市/薪资/关键词在 URL 里，其余「基础求职条件」（学历/经验/公司规模/求职类型）
-      // 随 criteria 下发，由 Python 侧 platform filters 翻译成本平台筛选参数。
-      // （BOSS 队列项来自 searchUrl.ts，不含 criteria —— 故按 platform 收窄类型）
-      const itemCriteria = platform === 'boss' ? undefined : (item as PlatformSearchQueueItem).criteria;
-      const criteriaNote = platform === 'boss' ? '' : describePlatformCriteria(itemCriteria);
+      // 基础求职条件：
+      //  - 非 BOSS：队列项自带 criteria（platformUrls.ts 构造，城市/薪资/关键词已在 URL 里，
+      //    其余筛选随 criteria 下发，由 Python 侧 platform filters 翻译成本平台参数）。
+      //  - BOSS：内置浏览器通道把这些筛选拼进 URL（searchUrl.ts），隐身通道此前**完全丢弃**
+      //    （issue #7 第五节）→ 这里用队列项里同一批字段拼出 criteria，让两通道筛出同一批岗位。
+      //    薪资不参与：内置浏览器通道的 BOSS 队列也不带 salary（薪资是期望值，硬筛会误杀），保持一致。
+      const itemCriteria = platform === 'boss'
+        ? bossCriteriaFromQueueItem(item as SearchQueueItem)
+        : (item as PlatformSearchQueueItem).criteria;
+      const criteriaNote = describePlatformCriteria(itemCriteria);
       addLog('info', `隐身搜索（${pfLabel}）「${item.keyword}」· ${item.location || '全国'} · ${item.employmentType || '不限'}（${qi + 1}/${queue.length}）${criteriaNote ? ` · 基础求职条件：${criteriaNote}` : ''}`);
       // 采集任务卡片（与「任务进度」页共用 taskRuns）
       const runId = collectRunId(platform, item);
@@ -1617,7 +1817,8 @@ export default function Workbench() {
       });
       lastCode = null; // 每组重置：故障范围判定与 catch 兜底只看本组结果，避免沿用上一组残留码
       try {
-        const result = await camoufoxSearch(item.keyword, cityCode, cfx0.pages || 1, cfx0.os, platform, itemCriteria, forceRecheck);
+        // M-11：透传断点续采 TTL 配置（仅 platforms 非敏感子集；严禁整份 config，含 API Key）
+        const result = await camoufoxSearch(item.keyword, cityCode, cfx0.pages || 1, cfx0.os, platform, itemCriteria, forceRecheck, { platforms: config.platforms });
         if (result.skipped) {
           // 断点续采命中：既非失败、也非「无岗位」，单独记账便于用户理解「为什么没采」
           addLog('info', `「${keywordLabel(item.keyword)}」跳过本次采集：${result.message || '近期已采过（断点续采）'}`);
@@ -1653,7 +1854,7 @@ export default function Workbench() {
           if (collectFaultScope(lastCode) === 'queue') queueAborted = true;
           if (isCamoufoxStopCode(lastCode)) {
             addLog('error', `隐身采集命中风控码 ${lastCode}：${result.message || ''}。立即停止并进入冷却，请人工处理。`);
-            useSettingsStore.getState().setConfig({ pausedUntil: Date.now() + SAFETY_LIMITS.DEFAULT_COOLDOWN_MS });
+            useSettingsStore.getState().setConfig({ pausedUntil: nextCooldownUntil(useSettingsStore.getState().config, classifyRiskCode(lastCode)) });
             markCollectRun(runId, baseRun, {
               status: 'failed', stage: 'failed', stageLabel: `风控码 ${lastCode}`, error: errMsg,
               progress: Math.round(((qi + 1) / queue.length) * 100),
@@ -1826,6 +2027,11 @@ export default function Workbench() {
         await runNextRef.current();
       } finally {
         runNextLock.current = false;
+        // 暂停态收口：本轮通道（含在途暂停）结束后统一清掉活动岗位，避免界面停留在「投递中」卡片
+        if (!useAppStore.getState().autoAssist) {
+          setActiveId(null);
+          setApplyStage(null);
+        }
         if (runNextQueued.current) {
           runNextQueued.current = false;
           requestRunNext();
@@ -1841,6 +2047,15 @@ export default function Workbench() {
   /** 通道 A：非 BOSS 平台 DOM 投递（猎聘/智联/51Job；新建对应平台标签页） */
   const deliverNonBoss = async (candidate: PendingItem, url: string): Promise<void> => {
     const pf = String(candidate.job?.platform || 'boss') as JobPlatform;
+    // 猎聘 chat 口径：必须把该岗位**最新**招呼语传入聊天发送流程（发送成功以「新增本人文字气泡」为准）。
+    // 队列中同一岗位的招呼语可能已被后续编辑覆盖，故一律从 store 读 live 值，不用闭包里的旧 candidate。
+    // 招呼语过短时先暂停自动沟通，避免用空文案走完「打开会话 → 点发送」却什么都发不出去。
+    const liveCandidate = useDataStore.getState().pending.find((p) => p.id === candidate.id);
+    const greeting = String(liveCandidate?.deliveryGreeting || liveCandidate?.analysis?.greeting || candidate.deliveryGreeting || candidate.analysis?.greeting || '').trim();
+    if (pf === 'liepin' && greeting.length < 8) {
+      pauseAssist('猎聘招呼语为空或过短，请先补充招呼语再投递');
+      return;
+    }
     if (!claimDelivery(candidate.id, pf)) {
       addLog('warn', `岗位正由后台「自动沟通」投递，工作台已跳过：${candidate.job?.title || '岗位'}`);
       // 不降级状态：该岗位是 approved_queue（「投递中」），只是本轮投递权被后台占用。
@@ -1855,17 +2070,24 @@ export default function Workbench() {
     }
     setApplyStage('open_job');
     addLog('info', `通过「${platformLabel(pf)}」新标签页投递：${candidate.job?.title || '岗位'}`);
-    // 注意：智联「继续沟通」的招呼语发送已移交「自动沟通」引擎，工作台 platformApply 不再携带
-    // greeting（避免在 platform-apply 内做整套填发确认导致 25s 超时）——见 webview.cjs continue_chat 收口。
+    // 猎聘必须把本岗位实际招呼语传入聊天发送流程（发送+确认在 platform-apply 内完成）；
+    // 智联「继续沟通」的招呼语发送仍移交「自动沟通」引擎处理，不在工作台路径携带 greeting。
     let r: any;
+    deliveryInFlightRef.current = true;
     try {
       // 非 BOSS 路径的 platformApply 内部自行「打开标签页 + 下发投递」，无法把加载与节流拆开并行，
       // 因此与串行版本保持一致：先等满岗位间隔再执行（安全语义优先于观感）。
       await awaitDeliveryGap();
-      r = await webviewApi.current?.platformApply(url, pf, candidate.job);
+      // 暂停发生在投递动作下发之前：直接收口，岗位保持「投递中」队列态（不算失败，也不开标签页）
+      if (deliveryAbortRef.current) {
+        addLog('warn', `已暂停：${candidate.job?.title || '岗位'}（投递动作未下发，岗位仍在投递队列中）`);
+        return;
+      }
+      r = await webviewApi.current?.platformApply(url, pf, candidate.job, greeting);
     } catch (e) {
       r = { ok: false, stage: 'failed', error: String((e as Error)?.message || e) };
     } finally {
+      deliveryInFlightRef.current = false;
       releaseDelivery(candidate.id, pf); // 锁绝不泄漏
     }
     const res = r || {};
@@ -1924,6 +2146,13 @@ export default function Workbench() {
     const errMsg = res.error || res.message || '投递失败';
     updatePending(candidate.id, { status: 'failed', error: errMsg });
     addLog('error', `投递失败：${nTitle}（${errMsg}）`);
+    if (res.needsReview) {
+      // 猎聘 chat 口径：没能确认到「新增本人文字气泡」时证据不足 —— 保留会话标签供人工核对，
+      // 既不自动重试也不继续下一条（避免重复给同一 HR 发消息）。
+      setApplyStage(null); recomputeStats();
+      pauseAssist(errMsg);
+      return;
+    }
     if (res.tabId) webviewApi.current?.closeTab(res.tabId);
     setApplyStage(null); recomputeStats();
     if (useAppStore.getState().autoAssist) {
@@ -1945,6 +2174,7 @@ export default function Workbench() {
     const jobId = extractEncryptJobId(candidate.job);
     if (!jobId) { pauseAssist('岗位缺少 jobId，无法通过 Camoufox 投递'); return; }
     try {
+      deliveryInFlightRef.current = true;
       setApplyStage('open_job');
       addLog('info', `通过 Camoufox 隐身通道投递：${candidate.job?.title || '岗位'}`);
       const st = await camoufoxStatus();
@@ -1963,6 +2193,10 @@ export default function Workbench() {
         // Camoufox 路径没有可并行的页面加载（发送在独立进程内完成），
         // 因此与串行版本一致：先等满岗位间隔再发送。
         await awaitDeliveryGap();
+        if (deliveryAbortRef.current) {
+          addLog('warn', `已暂停：${candidate.job?.title || '岗位'}（Camoufox 发送未下发，岗位仍在投递队列中）`);
+          return;
+        }
         cfxResult = await camoufoxSend(jobId, greeting, cfx0.os);
       } finally {
         releaseDelivery(candidate.id, pf);
@@ -1987,7 +2221,7 @@ export default function Workbench() {
       if (isCamoufoxStopCode(code)) {
         updatePending(candidate.id, { status: 'failed', error: msg, retryable: false, riskBlocked: true });
         addLog('error', `Camoufox 投递命中风控码 ${code}：${msg}。立即暂停并进入冷却，请人工处理，切勿重复重试。`);
-        useSettingsStore.getState().setConfig({ pausedUntil: Date.now() + SAFETY_LIMITS.DEFAULT_COOLDOWN_MS });
+        useSettingsStore.getState().setConfig({ pausedUntil: nextCooldownUntil(useSettingsStore.getState().config, classifyRiskCode(code)) });
         setApplyStage(null);
         recomputeStats();
         pauseAssist(`${msg}。已强制暂停并进入冷却，请人工核对处理。`);
@@ -2006,6 +2240,8 @@ export default function Workbench() {
       recomputeStats();
       pauseAssist('投递已暂停：Camoufox 投递异常，请人工核对后重试');
       return;
+    } finally {
+      deliveryInFlightRef.current = false;
     }
   };
 
@@ -2052,7 +2288,8 @@ export default function Workbench() {
     // 单线性等待 DOM 投递终态：runNext 在此挂起，终态由 handleApplyStage 回写 domWaitRef，
     // 避免 fire-and-forget 造成 runNext 反复重入、打开多个标签页并重复刷日志。
     const domTitle = candidate.job?.title || '岗位';
-    let domResult: { mode: 'success' | 'risk' | 'failed' | 'skip' | 'timeout' | 'continue_chat'; payload: any; tabId?: string } = { mode: 'failed', payload: { error: 'DOM 沟通投递未返回终态' } };
+    let domResult: { mode: 'success' | 'risk' | 'failed' | 'skip' | 'timeout' | 'continue_chat' | 'aborted'; payload: any; tabId?: string } = { mode: 'failed', payload: { error: 'DOM 沟通投递未返回终态' } };
+    deliveryInFlightRef.current = true;
     try {
       domResult = await new Promise<typeof domResult>((resolve) => {
         let timerRef: ReturnType<typeof setTimeout> | null = null;
@@ -2080,6 +2317,8 @@ export default function Workbench() {
             const domDeadline = Date.now() + 25000;
             let lastProbeAt = 0;
             while (Date.now() < domDeadline) {
+              // 暂停即退出探测：否则 Promise.all 还要白等满 25s 才轮到中止判定
+              if (deliveryAbortRef.current) return;
               // 快速路径（原逻辑）：preload 就绪且不再 loading 直接视为可用
               if (webviewApi.current?.isPreloadReady?.(domTab) && !webviewApi.current?.isLoading?.(domTab)) return;
               // 兜底路径：preload 就绪标记 / loading 标志被卡住时，用 pageStatus 探针实测页面可用性。
@@ -2099,6 +2338,11 @@ export default function Workbench() {
           // 串行版本是「先等节流 → 再开页面」，用户要盯着空转的十几秒；并行后页面几乎立刻打开，
           // 而 start-apply（点击立即沟通）仍要等节流结束才下发 —— 投递动作的时序完全不变。
           await Promise.all([awaitDeliveryGap(), waitDomReady()]);
+          // 暂停发生在沟通动作下发之前：直接以 aborted 终态收口（岗位保持队列态，不判失败）
+          if (deliveryAbortRef.current) {
+            settle('aborted', { error: '用户已暂停投递，本岗位沟通动作未下发' });
+            return;
+          }
           if (!webviewApi.current) return;
           sendOnce();
           // 「继续沟通/立即沟通」的沟通入口常整页跳转到聊天页（app.zhipin.com / /web/geek/chat），导航会使 preload 重注入、
@@ -2126,6 +2370,7 @@ export default function Workbench() {
       });
     } finally {
       domWaitRef.current = null;
+      deliveryInFlightRef.current = false;
       releaseDelivery(candidate.id, pf);
     }
 
@@ -2136,6 +2381,17 @@ export default function Workbench() {
     if (domResult.mode === 'risk') {
       // 保留标签供人工完成安全验证
       handleRisk(domResult.payload?.code, domResult.payload?.message || '');
+      return;
+    }
+    if (domResult.mode === 'aborted') {
+      // 手动暂停发生在沟通动作下发之前：岗位保持「投递中」队列态（不判失败、不占用今日投递名额）
+      addLog('warn', `已暂停：${domTitle}（沟通动作未下发，岗位仍在投递队列中）`);
+      if (activeTabRef.current) { webviewApi.current?.closeTab(activeTabRef.current); activeTabRef.current = null; }
+      setApplyStage(null);
+      setActiveId(null);
+      recomputeStats();
+      // 暂停期间用户可能已重新启动：此时按队列继续；否则就此收口
+      if (useAppStore.getState().autoAssist) requestRunNext();
       return;
     }
     if (domResult.mode === 'skip') {
@@ -2162,8 +2418,20 @@ export default function Workbench() {
     }
     // failed / timeout
     const errMsg = String(domResult.payload?.error || 'DOM 沟通投递失败');
-    updatePending(candidate.id, { status: 'failed', error: errMsg, retryable: true });
+    // needsReview：已点击但没确认到「本次新增的己方气泡」——证据不足，既不能算成功，
+    // 也不能当作可安全重试的失败（可能其实已发出）。保留标签与页面交人工核对，暂停引擎。
+    const needsReview = domResult.payload?.needsReview === true;
+    updatePending(candidate.id, {
+      status: 'failed', error: errMsg, retryable: !needsReview,
+      ...(needsReview ? { needsReview: true } : {}),
+    });
     addLog('error', `投递失败：${domTitle}（${errMsg}）`);
+    if (needsReview) {
+      setApplyStage(null);
+      recomputeStats();
+      pauseAssist(errMsg);
+      return;
+    }
     if (activeTabRef.current) { webviewApi.current?.closeTab(activeTabRef.current); activeTabRef.current = null; }
     setApplyStage(null);
     recomputeStats();
@@ -2176,6 +2444,9 @@ export default function Workbench() {
   };
 
   const runNext = async () => {
+    // 暂停守卫：暂停态下不允许再开新岗位（暂停瞬间 running 仍为 true 的路径仍可能触发本轮，
+    // 若不加守卫会再开一个岗位页并真的投递出去）
+    if (!useAppStore.getState().autoAssist) return;
     // 多平台适配：投递覆盖全部平台——BOSS 走 webview 官方接口；猎聘/智联/51Job
     // 分别新建对应平台标签页做 DOM 投递（见下方平台分派分支）。
     // 投递顺序完全由 rerankPending 决定（状态组 → 平台优先级 → priorityScore → AI 分 → 入队时间），
@@ -2197,6 +2468,8 @@ export default function Workbench() {
       return;
     }
     setActiveId(candidate.id);
+    // 复位暂停信号：上一轮暂停/停止留下的中止标记不能拦住本次重新启动
+    deliveryAbortRef.current = false;
     lastApplyStageRef.current = '';
     setApplyStage('queued');
     addLog('info', `按匹配优先级投递：${candidate.job?.title || '岗位'}（AI ${candidate.analysis?.score || 0} 分）`);
@@ -2270,16 +2543,19 @@ export default function Workbench() {
     // 诊断日志（stage:'log'）不驱动状态机，放行且不受跨标签守卫影响，便于排查外来标签的串台。
     if (stage === 'log') { addLog('info', String(data?.message || '')); return; }
     const current = useDataStore.getState();
-    const active = current.pending.find((p) => p.id === activeId);
-    if (!activeId || !active) return;
+    const active = activeId ? current.pending.find((p) => p.id === activeId) : undefined;
     // 跨标签防串台：只有「本次投递所用标签页」回传的阶段才驱动当前岗位的状态机。
     // 历史现象：上一个岗位超时/失败后其标签页虽有 closeTab，但关闭是异步的，在途回传仍会到达；
     // 这些外来事件会被当成当前岗位的进度（日志里冒出上一个岗位的标题，甚至把阶段写错）。
     // 同一次投递内整页跳转（job_detail → 聊天页）tabId 不变，故正常流程不受影响。
     if (tabId && activeTabRef.current && tabId !== activeTabRef.current) return;
+    // 暂停时会保留在途投递的 activeId；但若 activeId 已被清空而 DOM 等待槽仍在途，
+    // 终态仍必须回写 —— 否则页面照常把招呼语发出去，工作台只能等兜底超时 → 误判「投递失败」。
+    if (!active && !domWaitRef.current) return;
 
     if (stage === 'risk') {
       if (domWaitRef.current) { domWaitRef.current('risk', { code: data?.code, message: data?.message || '' }, tabId); return; }
+      if (!activeId) return;
       handleRisk(data?.code, data?.message || '');
       return;
     }
@@ -2288,6 +2564,7 @@ export default function Workbench() {
       // 不再按新投递发招呼语并计成功——移入「自动沟通」队列（status=opened，AutoChat 接管），
       // 并从工作台投递队列移除（防重复投递同一 HR、不占用今日投递名额）。
       if (domWaitRef.current) { domWaitRef.current('continue_chat', {}, tabId); return; }
+      if (!activeId) return;
       updatePending(activeId, { status: 'opened', error: '' });
       addLog('warn', `${active?.job?.title || '岗位'}：检测到「继续沟通」（已建立会话），已移入自动沟通队列`);
       setApplyStage(null);
@@ -2308,6 +2585,7 @@ export default function Workbench() {
       const error = String(data.error || '投递失败');
       if (data.external === true) {
         if (domWaitRef.current) { domWaitRef.current('skip', { error }, tabId); return; }
+        if (!activeId) return;
         updatePending(activeId, { status: 'skipped', error });
         addLog('warn', `已跳过：${active?.job?.title || ''}（${error}）`);
         setApplyStage(null);
@@ -2316,7 +2594,8 @@ export default function Workbench() {
         return;
       }
       // 有 DOM 等待槽在途（工作台 BOSS 直投）→ 只回写终态，状态/日志由 runNext 统一处理（去重）
-      if (domWaitRef.current) { domWaitRef.current('failed', { error }, tabId); return; }
+      if (domWaitRef.current) { domWaitRef.current('failed', { error, needsReview: data.needsReview === true }, tabId); return; }
+      if (!activeId) return;
       updatePending(activeId, { status: 'failed', error });
       addLog('error', `投递失败：${active?.job?.title || ''}（${error}）`);
       setApplyStage(null);
@@ -2335,6 +2614,7 @@ export default function Workbench() {
     }
     if (stage === 'verify_result') {
       if (domWaitRef.current) { domWaitRef.current('success', {}, tabId); return; }
+      if (!activeId) return;
       handleDelivered(activeId, tabId);
       return;
     }
@@ -2440,12 +2720,14 @@ export default function Workbench() {
 
   // 标签数字与各自列表同源：全部 = 未投递总数；其余 = 对应状态总数（含已投递）
   const visibleAllCount = showIgnored ? activeAll.length : activeAll.filter((p) => !isHiddenStatus(p.status)).length;
+  // 「已投递」总数：标签计数与「清理已投递」入口共用同一口径
+  const sentTotal = pending.filter((p) => p.status === 'sent').length;
   const WB_FILTERS = [
     { key: 'all', label: `全部 ${visibleAllCount}` },
     { key: 'pending', label: `待确认 ${pending.filter((p) => p.status === 'pending').length}` },
     { key: 'approved', label: `待投递 ${pending.filter((p) => p.status === 'approved').length}` },
     { key: 'approved_queue', label: `投递中 ${pending.filter((p) => p.status === 'approved_queue').length}` },
-    { key: 'sent', label: `已投递 ${pending.filter((p) => p.status === 'sent').length}` },
+    { key: 'sent', label: `已投递 ${sentTotal}` },
     { key: 'failed', label: `失败 ${pending.filter((p) => p.status === 'failed').length}` },
   ];
 
@@ -2720,7 +3002,7 @@ export default function Workbench() {
                   size="small"
                   percent={visualItem.total ? Math.round((visualItem.index / visualItem.total) * 100) : 0}
                   style={{ flex: '1 1 0', minWidth: 0, margin: 0 }}
-                  strokeColor={{ from: '#13b5ac', to: '#078A83' }}
+                  strokeColor={{ from: MATCH_SCORE_COLOR, to: '#078A83' }}
                 />
                 {visualCollecting && (
                   <Button
@@ -2755,7 +3037,7 @@ export default function Workbench() {
                   </div>
                   <Tag color="processing" style={{ margin: 0, flex: '0 0 auto' }}>{currentPhase ? currentPhase.label : '投递中'}</Tag>
                 </div>
-                <Progress percent={currentPhase ? currentPhase.progress : 0} size="small" strokeColor={{ from: '#13b5ac', to: '#078A83' }} status="active" />
+                <Progress percent={currentPhase ? currentPhase.progress : 0} size="small" strokeColor={{ from: MATCH_SCORE_COLOR, to: '#078A83' }} status="active" />
                 <div className="delivery-task-meta">
                   <Text type="secondary" style={{ fontSize: 12 }}>
                     {currentPhase ? currentPhase.label : '准备中'} · {currentPhase ? currentPhase.progress : 0}%
@@ -2766,7 +3048,18 @@ export default function Workbench() {
                 <div className="delivery-task-actions delivery-task-actions--single">
                   <Button size="small" icon={<EyeOutlined />} onClick={() => activeItem.job?.url && webviewApi.current?.openInNewTab(activeItem.job.url, activeItem.job?.title)}>打开岗位</Button>
                   <span className="action-spacer" />
-                  <Button size="small" danger icon={<StopOutlined />} onClick={() => pauseAssist('用户手动暂停当前投递')}>暂停投递</Button>
+                  <Button
+                    size="small"
+                    danger
+                    icon={<StopOutlined />}
+                    onClick={() => {
+                      // 先置位中止信号再暂停：在途通道若还在等节流/页面就绪，必须在沟通动作下发前退出
+                      deliveryAbortRef.current = true;
+                      pauseAssist('用户手动暂停当前投递');
+                    }}
+                  >
+                    暂停投递
+                  </Button>
                 </div>
               </div>
             </div>
@@ -2804,8 +3097,25 @@ export default function Workbench() {
         <div className="wb-sort-hint">
           <InfoCircleOutlined className="wb-sort-hint__icon" />
           <Text type="secondary" style={{ fontSize: 11, lineHeight: 1.4 }}>
-            待确认岗位按 AI 匹配分从高到低排列；点「确认」即加入「投递中」队列，确认前可先修改求职招呼语（招呼语为空则无法确认）。
+            {filter === 'sent'
+              ? `共 ${sentTotal} 个已投递岗位记录；可逐条删除，也可一次清理全部。`
+              : '待确认岗位按 AI 匹配分从高到低排列；点「确认」即加入「投递中」队列，确认前可先修改求职招呼语（招呼语为空则无法确认）。'}
           </Text>
+          {/* 批量清理入口挂在提示条右侧：只在「已投递」标签下出现，不挤占上方 3 列主操作按钮组 */}
+          {filter === 'sent' && (
+            <Button
+              size="small"
+              danger
+              type="text"
+              className="wb-sort-hint__action"
+              icon={<DeleteOutlined />}
+              onClick={onClearDelivered}
+              disabled={!sentTotal}
+              title="一次删除全部已投递岗位记录（清空已投递列表）"
+            >
+              清理已投递
+            </Button>
+          )}
         </div>
         <div className="wb-jobs">
           {ranked.length === 0 ? (
@@ -2817,11 +3127,37 @@ export default function Workbench() {
               {(jobsExpanded ? ranked : ranked.slice(0, 5)).map((p: PendingItem) => {
                 const chip = scoreChip(p.analysis?.score);
                 const st = STATUS_TAG[p.status] || { color: 'default', label: p.status };
+                const dd = dueDiligenceTag(p.job?.dueDiligence);
                 const isPending = p.status === 'pending';
                 const isExpanded = expandedIds.has(p.id);
                 // 元信息行只展示真实解析到的「公司 · 地点 · 薪资」；缺字段时整行不渲染，绝不显示占位/裸链接占位，
                 // 投递/招呼语依赖这些真实字段（见 overlay 权威解析），缺失即视为旧卡，需重新「加入任务」触发自愈补齐。
                 const metaLine = formatMetaLine(p.job?.company, p.job?.location, p.job?.salary);
+                // 「面试」入口：把该岗位的 JD 快照带入模拟面试（岗位缓存只留 7 天，必须当场快照）
+                const openMockInterview = () => {
+                  const st = useAppStore.getState();
+                  st.requestMockInterview({
+                    jobId: p.job?.jobId ? String(p.job.jobId) : null,
+                    jobTitle: String(p.job?.title || ''),
+                    company: String(p.job?.company || ''),
+                    jdText: String(p.job?.description || p.job?.cardText || ''),
+                  });
+                  st.setRoute('mockInterview');
+                };
+                // 终态岗位统一删除入口（已投递 / 失败 / 已忽略 / 已跳过）：这些状态没有其他出口，
+                // 不给删除就只能永久堆积在「已投递」标签或「显示已忽略/跳过」里。
+                const deleteTerminalButton = (statusLabel: string) => (
+                  <Popconfirm
+                    title={`删除该${statusLabel}岗位？`}
+                    description="仅删除本地岗位记录，不影响已发出的消息与平台上的实际投递；删除后相关计数同步减少。"
+                    okText="确认删除"
+                    cancelText="取消"
+                    okButtonProps={{ danger: true }}
+                    onConfirm={() => onDeleteTerminal(p.id)}
+                  >
+                    <Button size="small" danger icon={<DeleteOutlined />}>删除</Button>
+                  </Popconfirm>
+                );
                 return (
                   <div key={p.id} className={'job-card ' + jobCardStatus(p) + (p.id === activeId ? ' is-active' : '')}>
                     <div className="job-header" role="button" tabIndex={0} aria-expanded={isExpanded}
@@ -2876,12 +3212,36 @@ export default function Workbench() {
                           )}
                           {welfareTag(p)}
                           {interviewModeTag(p)}
+                          {/* 工商摘要（只读公司主页字段）：注销/吊销等状态一眼可见，正常态则显示注册资本 */}
+                          {p.job?.companyProfile && bizProfileTag(p.job.companyProfile) ? (
+                            <Tooltip title="来自招聘平台公司主页的工商信息（只读公开字段），只做提示，不影响是否投递">
+                              <span className="task-flag-badge task-flag-badge--neutral">{bizProfileTag(p.job.companyProfile)}</span>
+                            </Tooltip>
+                          ) : null}
+                          {/* 背调摘要（B/C 层）：只在中/高风险时出现；评级非权威，绝不自动跳过岗位 */}
+                          {dd ? (
+                            <Tooltip title={`AI 背调评级：${dd.label}（非权威，仅提示，不影响是否投递）。${dd.stale ? '负面信号已变化，建议展开重新评估；' : ''}${dd.summary || '展开岗位卡可查看依据与来源。'}`}>
+                              <span className="task-flag-badge task-flag-badge--neutral">{dd.text}</span>
+                            </Tooltip>
+                          ) : null}
                         </div>
                       </div>
+                      {p.needsReview && (
+                        <Tooltip title="已点击发送，但页面没有出现可确认的「本次新增己方气泡」。可能已发出，请人工核对后再决定是否重试（不会自动重发）。">
+                          <Tag color="orange" style={{ margin: 0, flex: '0 0 auto' }}>需人工核对</Tag>
+                        </Tooltip>
+                      )}
                       <Tag color={st.color} style={{ margin: 0, flex: '0 0 auto' }}>{st.label}</Tag>
                     </div>
                     {isExpanded && (
                       <div className="job-body" onClick={(e) => e.stopPropagation()}>
+                        {/* 求职进展（P1-6）：与投递状态正交，只做 HR 侧流程跟踪；未投递的岗位不展示 */}
+                        {(p.status === 'sent' || p.progressStage) && (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '2px 0 8px' }}>
+                            <span style={{ fontSize: 12, color: 'var(--fg-subtle)' }}>求职进展</span>
+                            <ProgressStageSelect value={p.progressStage} onChange={(patch) => updatePending(p.id, patch)} />
+                          </div>
+                        )}
                         {p.analysis?.reason && <div className="job-reason">{p.analysis.reason}</div>}
                         {p.analysis?.aiNote && <div className="job-ainote">{p.analysis.aiNote}</div>}
                         {p.deliveryGreeting || p.analysis?.greeting ? (
@@ -2895,6 +3255,34 @@ export default function Workbench() {
                         ) : (
                           <Text type="secondary" style={{ fontSize: 12, padding: '4px 0' }}>暂无招呼语</Text>
                         )}
+                        {/* 企业工商（P1-5 A 层）：只读公司主页自身字段，只做提示，不参与投递判定 */}
+                        <CompanyBizPanel
+                          company={String(p.job?.company || '')}
+                          profile={p.job?.companyProfile}
+                          readPage={async () => {
+                            const api = webviewApi.current;
+                            if (!api) return { error: '内置浏览器未就绪' };
+                            if (!api.readPage) return { error: '当前浏览器通道不支持只读读取（请切换到内置浏览器）' };
+                            const tabId = api.getActiveTabId?.() || '';
+                            return await api.readPage(tabId);
+                          }}
+                          onSave={(profile) => updatePending(p.id, { job: { ...(p.job || {}), companyProfile: profile } })}
+                        />
+                        {/* 企业背调 B/C 层：负面信号 + AI 评级。同样只提示，不改岗位状态与投递顺序 */}
+                        <CompanyDueDiligencePanel
+                          company={String(p.job?.company || '')}
+                          biz={p.job?.companyProfile}
+                          state={p.job?.dueDiligence}
+                          openUrl={(url, title) => webviewApi.current?.openInNewTab(url, title)}
+                          readPage={async () => {
+                            const api = webviewApi.current;
+                            if (!api) return { error: '内置浏览器未就绪' };
+                            if (!api.readPage) return { error: '当前浏览器通道不支持只读读取（请切换到内置浏览器）' };
+                            const tabId = api.getActiveTabId?.() || '';
+                            return await api.readPage(tabId);
+                          }}
+                          onSave={(dueDiligence) => updatePending(p.id, { job: { ...(p.job || {}), dueDiligence } })}
+                        />
                       </div>
                     )}
                     {p.error && <div className="job-error">⚠ {p.error}</div>}
@@ -2906,8 +3294,9 @@ export default function Workbench() {
                             <Button size="small" type="primary" icon={<CheckOutlined />} onClick={() => onApprove(p.id)}>确认沟通</Button>
                           </div>
                           <div className="job-actions-left">
-                            <Button size="small" icon={<EyeOutlined />} onClick={() => p.job?.url && webviewApi.current?.openInNewTab(p.job.url, p.job?.title)}>打开</Button>
-                            <Button size="small" onClick={() => onIgnore(p.id)}>忽略</Button>
+                            <Tooltip title={JOB_ACTION_TIPS.openInApp}><Button size="small" icon={<EyeOutlined />} onClick={() => p.job?.url && webviewApi.current?.openInNewTab(p.job.url, p.job?.title)}>打开</Button></Tooltip>
+                            <Tooltip title={JOB_ACTION_TIPS.mockInterview}><Button size="small" onClick={openMockInterview}>面试</Button></Tooltip>
+                            <Tooltip title={JOB_ACTION_TIPS.ignore}><Button size="small" onClick={() => onIgnore(p.id)}>忽略</Button></Tooltip>
                           </div>
                         </>
                       ) : p.status === 'approved_queue' || p.status === 'approved' ? (
@@ -2920,8 +3309,9 @@ export default function Workbench() {
                             <Button size="small" icon={<UndoOutlined />} onClick={() => onRevert(p.id)}>撤回</Button>
                           </div>
                           <div className="job-actions-left">
-                            <Button size="small" icon={<EyeOutlined />} onClick={() => p.job?.url && webviewApi.current?.openInNewTab(p.job.url, p.job?.title)}>打开</Button>
-                            <Button size="small" onClick={() => onIgnore(p.id)}>忽略</Button>
+                            <Tooltip title={JOB_ACTION_TIPS.openInApp}><Button size="small" icon={<EyeOutlined />} onClick={() => p.job?.url && webviewApi.current?.openInNewTab(p.job.url, p.job?.title)}>打开</Button></Tooltip>
+                            <Tooltip title={JOB_ACTION_TIPS.mockInterview}><Button size="small" onClick={openMockInterview}>面试</Button></Tooltip>
+                            <Tooltip title={JOB_ACTION_TIPS.ignore}><Button size="small" onClick={() => onIgnore(p.id)}>忽略</Button></Tooltip>
                           </div>
                         </>
                       ) : (
@@ -2934,13 +3324,25 @@ export default function Workbench() {
                               // 失败等非终态：允许重新投递（回到投递队列）。
                               // 不再叫「批准」——该岗位已确认过，此时只是重跑投递，叫「重试」才不会
                               // 与待确认卡的「确认沟通」混淆（用户反馈：已确认的岗位还显示「批准」很怪）。
-                              <Button size="small" type="primary" icon={<ReloadOutlined />} onClick={() => onRetry(p.id)}>重试</Button>
+                              <Tooltip title={JOB_ACTION_TIPS.retry}><Button size="small" type="primary" icon={<ReloadOutlined />} onClick={() => onRetry(p.id)}>重试</Button></Tooltip>
                             )}
                           </div>
                           <div className="job-actions-right">
-                            <Button size="small" icon={<EyeOutlined />} onClick={() => p.job?.url && webviewApi.current?.openInNewTab(p.job.url, p.job?.title)}>打开</Button>
-                            <Button size="small" onClick={() => onIgnore(p.id)} disabled={p.status === 'sent'}>忽略</Button>
-                            <Button size="small" onClick={() => onSkip(p.id)} disabled={p.status === 'sent'}>跳过</Button>
+                            <Tooltip title={JOB_ACTION_TIPS.openInApp}><Button size="small" icon={<EyeOutlined />} onClick={() => p.job?.url && webviewApi.current?.openInNewTab(p.job.url, p.job?.title)}>打开</Button></Tooltip>
+                            <Tooltip title={JOB_ACTION_TIPS.mockInterview}><Button size="small" onClick={openMockInterview}>面试</Button></Tooltip>
+                            {p.status === 'sent' ? (
+                              // 已投递是终态：忽略/跳过对它无意义（此前两个按钮恒灰），替换为可用的「删除」
+                              deleteTerminalButton('已投递')
+                            ) : p.status === 'skipped' || p.status === 'ignored' ? (
+                              // 已跳过 / 已忽略本就收口，再给「忽略 / 跳过」是同义重复；要恢复请用左侧「重试」
+                              deleteTerminalButton(p.status === 'skipped' ? '已跳过' : '已忽略')
+                            ) : (
+                              // 失败等未收口终态：保留「跳过」出口，同时允许直接删除不再需要的记录
+                              <>
+                                <Tooltip title={JOB_ACTION_TIPS.skip}><Button size="small" onClick={() => onSkip(p.id)}>跳过</Button></Tooltip>
+                                {deleteTerminalButton('失败')}
+                              </>
+                            )}
                           </div>
                         </>
                       )}

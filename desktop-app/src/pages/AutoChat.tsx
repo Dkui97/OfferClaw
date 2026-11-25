@@ -3,14 +3,15 @@
  * 子模块：
  * - 页头状态栏（执行模式 / 隐身引擎就绪 / 风控冷却 三个 status-pill）
  * - 隐身引擎投递控制卡（开始批量沟通 / 停止 / 检测状态 + 待沟通/已沟通/失败指标 + 各平台登录态与扫码登录 autochat-platform-grid）
- * - 待沟通岗位队列卡（job-card 列表：平台/岗位/优先级/状态，招呼语可编辑，选中进行沟通）
- * - 沟通与附件设置卡（打招呼语非空红线、附件开关与水印、图片简历上传）
+ * - 待沟通岗位队列卡（job-card 列表：平台/岗位/优先级/状态，招呼语可编辑，选中进行沟通；
+ *   已沟通岗位默认收起，可展开查看并逐条删除，避免长期累积把待沟通岗位挤出可视区）
+ * - 沟通与附件设置卡（打招呼语非空红线、附件开关与水印、图片简历上传、AI 跟聊监听开关）
  * - 沟通信息卡（AI 跟聊引用：薪资期望/面试时间/到岗时间等人工填写）
  * - 防封号节奏限制卡（岗位间隔 / 每分动作 / 冷却 / 每日上限等 Rate Limit）
  */
 import { useEffect, useState, useMemo, useCallback, useRef, useLayoutEffect } from 'react';
 import {
-  Alert, Button, Card, Input, InputNumber, Space, Switch, Tag, Typography, Upload, message, Progress,
+  Alert, Button, Card, Input, InputNumber, Popconfirm, Space, Switch, Tag, Tooltip, Typography, Upload, message, Progress,
 } from 'antd';
 import {
   MessageOutlined, QrcodeOutlined,
@@ -20,6 +21,7 @@ import {
   UsergroupAddOutlined, FieldTimeOutlined,
   ThunderboltOutlined, HourglassOutlined, PlusOutlined, CodeOutlined,
   RobotOutlined, SyncOutlined,
+  ClockCircleOutlined, CoffeeOutlined, InfoCircleOutlined, DesktopOutlined,
 } from '@ant-design/icons';
 import { ChevronDown } from '@/components/ChevronDown';
 import GreetingEditor from '@/components/GreetingEditor';
@@ -34,8 +36,10 @@ import {
 } from '@/lib/bossclaw/camoufox';
 import { electronApi } from '@/lib/electronApi';
 import {
-  isLockedOut, cooldownRemaining,
+  isLockedOut, cooldownRemaining, SAFETY_LIMITS,
 } from '@/lib/bossclaw/safety';
+// 活跃时段 / 批次休息默认值（唯一权威在 activityWindow.ts；此处仅作 UI 兜底，避免 `??` 处写字面量）
+import { DEFAULT_ACTIVE_HOURS, DEFAULT_BATCH_REST } from '@/lib/bossclaw/activityWindow';
 import { rerankPending } from '@/lib/bossclaw/priority';
 import { cleanTitle, cleanSalary, formatMetaLine } from '@/lib/bossclaw/jobDisplay';
 import { getErrorMessage } from '@/lib/bossclaw/helpers';
@@ -44,8 +48,14 @@ import type { PendingItem, ImageResume } from '@/lib/bossclaw/types';
 import { EmptyState } from '@/components/feedback';
 import { ChatLogPanel } from '@/components/ChatLogPanel';
 import PlatformChip from '@/components/PlatformChip';
+import ProgressStageSelect from '@/components/ProgressStageSelect';
 
 const { Text, Paragraph } = Typography;
+
+// 图片简历上限：张数与单张体积。放在模块级 —— 写在组件体内会让每个读取它的 useCallback
+// 依赖一个「每渲染都新建的绑定」，既触发 exhaustive-deps，也让回调无谓重建。
+const MAX_IMAGE_RESUMES = 4;
+const MAX_IMAGE_BYTES = 1024 * 1024;
 
 const STATUS_TAG: Record<string, { color: string; label: string }> = {
   pending: { color: 'gold', label: '待确认' },
@@ -58,8 +68,10 @@ const STATUS_TAG: Record<string, { color: string; label: string }> = {
   ignored: { color: 'default', label: '已忽略' },
 };
 
-/** 待沟通队列默认最多展示的卡片数；超出部分改为容器内滚动，避免整页被拉长。 */
-const QUEUE_VISIBLE_COUNT = 3;
+/** 会话身份归一：去全部空白 + 转小写（通知聚焦、会话匹配共用同一口径） */
+function normConvKey(v: unknown): string {
+  return String(v || '').replace(/\s+/g, '').toLowerCase();
+}
 
 export default function AutoChat() {
   // ===== Store 订阅（按字段选择并使用 useShallow 避免全量重渲染） =====
@@ -67,7 +79,9 @@ export default function AutoChat() {
   const updatePending = useDataStore((s) => s.updatePending);
   const chatLogs = useRuntimeLogsStore(useShallow((s) => s.chatLogs));
   const clearChatLogs = useRuntimeLogsStore((s) => s.clearChatLogs);
+  const addLog = useRuntimeLogsStore((s) => s.addLog);
   const recomputeStats = useDataStore((s) => s.recomputeStats);
+  const removePending = useDataStore((s) => s.removePending);
   const imageResumes = useDataStore(useShallow((s) => s.imageResumes));
   const addImageResume = useDataStore((s) => s.addImageResume);
   const removeImageResume = useDataStore((s) => s.removeImageResume);
@@ -81,9 +95,14 @@ export default function AutoChat() {
   // ===== 自动沟通后台引擎（全局持久：切页仍继续运行，工作台新批准岗位自动加入）=====
   const chatRunning = useAutoChatStore((s) => s.chatRunning);
   const activeChatId = useAutoChatStore((s) => s.activeChatId);
+  const watchRunning = useAutoChatStore((s) => s.watchRunning);
+  const watchActiveId = useAutoChatStore((s) => s.watchActiveId);
+  const conversationFocus = useAutoChatStore((s) => s.conversationFocus);
+  const clearConversationFocus = useAutoChatStore((s) => s.clearConversationFocus);
   const progress = useAutoChatStore((s) => s.progress);
   const chatOne = useAutoChatStore((s) => s.chatOne);
   const start = useAutoChatStore((s) => s.start);
+  const setWatch = useAutoChatStore((s) => s.setWatch);
   const stop = useAutoChatStore((s) => s.stop);
 
   // ===== Camoufox 隐身引擎状态 =====
@@ -112,15 +131,30 @@ export default function AutoChat() {
 
   const refreshCamoufox = useCallback(async (silent = false) => {
     if (!silent) setCfxLoading(true);
-    const s = await camoufoxStatus();
-    setCfx(s);
-    // 依赖安装中不算「不可用」，不自动关闭引擎开关
-    if (!s.ready && !s.installing && cfxConfig.enabled) setConfig({ camoufox: { ...cfxConfig, enabled: false } });
-    if (!silent) setCfxLoading(false);
-  }, [cfxConfig, setConfig]);
+    // M-38：探测失败必须复位 loading（原实现无 catch，挂载时的 fire-and-forget 失败会让 cfxLoading 卡住）
+    try {
+      const s = await camoufoxStatus();
+      setCfx(s);
+      // 依赖安装中不算「不可用」，不自动关闭引擎开关。
+      // Camoufox 模式下探活失败也保留用户选择：静默置 false 会让采集回退内置浏览器，
+      // 用户会误以为隐身采集生效。真实原因由采集入口提示「引擎未就绪」。
+      if (!s.ready && !s.installing && cfxConfig.enabled && config.engineMode !== 'camoufox') {
+        setConfig({ camoufox: { ...cfxConfig, enabled: false } });
+      }
+      return s;
+    } catch {
+      /* 探测失败：保持上一次状态，不打断页面 */
+      return null;
+    } finally {
+      if (!silent) setCfxLoading(false);
+    }
+  }, [cfxConfig, config.engineMode, setConfig]);
 
   // 页面挂载时静默刷新引擎状态：跨路由重挂载后 `cfx` 会被重置为 null，导致误显示「引擎未就绪」。
   // 后台已预热，此处会即时返回就绪。
+  // 依赖刻意留空：refreshCamoufox 依赖 cfxConfig / engineMode，而它内部失败时会 setConfig 关掉增强，
+  // 一旦把函数写进依赖，就会「探测 → 改配置 → 探测」自激。这里只要挂载时那一次。
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { refreshCamoufox(true); }, []);
   // 多平台：挂载时加载各平台登录态
   useEffect(() => {
@@ -149,8 +183,6 @@ export default function AutoChat() {
   }, [refreshPlatformStatus]);
 
   // ===== 图片简历管理 =====
-  const MAX_IMAGE_RESUMES = 4;
-  const MAX_IMAGE_BYTES = 1024 * 1024;
   const onImageResumeFile = useCallback((file: File) => {
     if (imageResumes.length >= MAX_IMAGE_RESUMES) { message.warning(`最多保存 ${MAX_IMAGE_RESUMES} 张图片简历`); return; }
     if (!/image\/(jpeg|jpg|png)/.test(file.type || '')) { message.warning('仅支持 JPG / PNG 图片简历'); return; }
@@ -165,11 +197,14 @@ export default function AutoChat() {
   }, [imageResumes.length, addImageResume]);
 
   // ===== 派生计算与队列过滤缓存 =====
+  // 「已沟通」默认从队列收起：sent 是终态，长期累积会把待沟通岗位挤出可视区。
+  // 需要查看或清理时用卡片右上角的「显示已沟通」展开（记录仍在工作台/任务进度里）。
+  const [showSent, setShowSent] = useState(false);
   const queueItems = useMemo(() => {
-    return rerankPending(pending, config).filter((p) =>
-      ['pending', 'approved', 'approved_queue', 'opened', 'failed', 'sent'].includes(p.status)
-    );
-  }, [pending, config]);
+    return rerankPending(pending, config)
+      .filter((p) => ['pending', 'approved', 'approved_queue', 'opened', 'failed', 'sent'].includes(p.status))
+      .filter((p) => showSent || p.status !== 'sent');
+  }, [pending, config, showSent]);
 
   const batchQueue = useMemo(() => {
     // 与后台引擎分工：本控制台只处理「已批准待沟通(approved)」与「已打开未发打招呼语(opened)」；
@@ -188,40 +223,63 @@ export default function AutoChat() {
   const sentCount = useMemo(() => pending.filter((p) => p.status === 'sent').length, [pending]);
   const failedCount = useMemo(() => pending.filter((p) => p.status === 'failed').length, [pending]);
 
-  // ===== 队列滚动展示：默认只露出前 3 张卡片，其余在容器内滚动 =====
-  // 直接量测「第 1 张 → 第 4 张」的垂直跨度，把它（含容器上下内边距）设为 max-height，
-  // 这样无论卡片因招呼语多行/失败提示而变高，都恰好完整展示 3 张、不出现半截卡片。
+  // ===== 终态岗位删除（已沟通 / 失败）=====
+  // 自动沟通此前没有删除出口（工作台 / 任务进度均已支持），sent 会无限堆积；
+  // 失败记录同样会一直留在队列里。删除仅移除本地记录，不影响已发出的消息与平台上的实际投递。
+  const onDeleteTerminal = useCallback((p: PendingItem) => {
+    if (!['sent', 'failed'].includes(p.status)) { message.warning('仅「已沟通 / 失败」岗位支持删除'); return; }
+    removePending(p.id);
+    addLog('warn', `已删除岗位记录（${p.status === 'sent' ? '已沟通' : '失败'}）：${cleanTitle(p.job?.title, p.job?.salary)}${p.job?.company ? ` @ ${p.job.company}` : ''}`);
+    message.success('已删除该岗位记录');
+    recomputeStats();
+  }, [addLog, recomputeStats, removePending]);
+
+  // ===== 队列滚动展示：卡片撑满列高（底边与右列对齐），超出部分在容器内滚动 =====
+  // 高度不再由 JS 量测卡片并按「固定 3 张」写死 max-height —— 那种做法一旦量到的卡片高度偏小
+  // （例如 antd `Input.TextArea` 的 autoSize 在 passive 相位才生效，layout 相位读到的是未撑开的高度），
+  // 队列区就被压到一张卡，差额全部变成卡底空白。现在布局交给 CSS：
+  //   .autochat-main { contain: size }                 ← 行高只由右列决定，队列再长也不拉长整页
+  //   .setting-card:last-child { flex: 1 1 0 }         ← 卡片撑满左列，底边与右列对齐
+  //   .autochat-queue-scroll { flex: 1 1 auto }        ← 列表区吃掉卡内剩余高度（不留空白）
+  // 这里只做一件事：探测列表是否真的溢出，用于决定底部「向下滚动查看全部」提示是否出现。
   const queueScrollRef = useRef<HTMLDivElement | null>(null);
-  const [queueMaxHeight, setQueueMaxHeight] = useState<number | undefined>(undefined);
+  const [queueScrollable, setQueueScrollable] = useState(false);
 
   useLayoutEffect(() => {
     const el = queueScrollRef.current;
     if (!el) return;
+    let raf = 0;
     const measure = () => {
-      const kids = Array.from(el.children) as HTMLElement[];
-      if (kids.length <= QUEUE_VISIBLE_COUNT) {
-        setQueueMaxHeight(undefined);
-        return;
-      }
-      const firstTop = kids[0].getBoundingClientRect().top;
-      const nextTop = kids[QUEUE_VISIBLE_COUNT].getBoundingClientRect().top;
-      const span = nextTop - firstTop;
-      if (!(span > 0)) return;
-      const cs = getComputedStyle(el);
-      const pad = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
-      const next = Math.round(span + pad);
-      setQueueMaxHeight((prev) => (prev === next ? prev : next));
+      const over = el.scrollHeight > el.clientHeight + 1;
+      setQueueScrollable((prev) => (prev === over ? prev : over));
     };
     measure();
-    // 卡片高度会随招呼语行数 / 失败提示变化，逐个监听卡片尺寸以便跟随重算
+    // 补一次下一帧复测：autoSize（passive 相位）晚于本 effect（layout 相位），首测可能还没撑开
+    raf = window.requestAnimationFrame(measure);
+    // 卡片高度随招呼语行数 / 失败提示变化，逐个监听卡片尺寸以便跟随判定
     const ro = new ResizeObserver(measure);
     Array.from(el.children).forEach((c) => ro.observe(c as HTMLElement));
     window.addEventListener('resize', measure);
     return () => {
+      window.cancelAnimationFrame(raf);
       ro.disconnect();
       window.removeEventListener('resize', measure);
     };
   }, [queueItems]);
+
+  // 通知点击 → 聚焦会话（HR 回复提醒）：滚动到对应岗位卡，并在 10 秒后自动撤掉高亮。
+  // 依赖 queueItems.length：通知点击时队列可能还没渲染完（刚切到本页），列表就位后要再试一次。
+  useEffect(() => {
+    if (!conversationFocus) return;
+    // 通知一定来自「已沟通」会话：先展开已沟通，否则高亮目标被默认收起，点击后看起来没反应。
+    // showSent 变化会改变 queueItems.length，下面的依赖会再跑一次并完成滚动。
+    setShowSent(true);
+    const el = queueScrollRef.current?.querySelector<HTMLElement>('.job-card.is-focus');
+    el?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    // 高亮只是「我刚提醒的是这条」，不需要常驻；用户没动过也该自己消失，避免被当成运行态高亮
+    const timer = window.setTimeout(() => clearConversationFocus(), 10_000);
+    return () => window.clearTimeout(timer);
+  }, [conversationFocus, queueItems.length, clearConversationFocus]);
 
   const handleStartBatch = useCallback(async () => {
     if (!profile) { message.warning('请先在简历中心生成职业画像'); return; }
@@ -230,6 +288,7 @@ export default function AutoChat() {
       return;
     }
     const st = await camoufoxStatus();
+    setCfx(st); // 顺带把页头/平台卡状态校准到最新，避免旧状态继续误导
     if (!st.ready) {
       message.warning('隐身引擎未就绪：' + (st.message || '请先下载 Camoufox 隐身引擎内核（暂未下载）'));
       return;
@@ -239,25 +298,56 @@ export default function AutoChat() {
       return;
     }
     // 多平台适配：验证队列中各平台均已登录（独立验证，未登录平台阻断启动）
+    // BOSS 与其他平台走同一口径：**未登录就不要启动**，否则只会打开浏览器后
+    // 被平台以「身份验证失效 / 重新登录」拒掉，用户白等一轮还看不出原因。
     const involved = [...new Set(batchQueue.map((p) => String(p.job?.platform || 'boss')))];
     for (const pf of involved) {
-      // BOSS 走全局引擎就绪判断；其余平台需对应平台已登录
-      if (pf !== 'boss') {
-        let st = cfxPlatformLogin[pf];
-        if (!st) st = await refreshPlatformStatus(pf);
-        if (!st?.ready) {
-          message.warning(`平台「${platformLabel(pf as JobPlatform)}」隐身引擎未就绪：${st?.message || '请到设置页检测'}`);
+      if (pf === 'boss') {
+        if (!st.engine?.loggedIn) {
+          message.warning('BOSS 未登录或登录态已失效：请先在上方「BOSS 直聘」卡片扫码登录后再启动');
           return;
         }
-        if (!st?.engine?.loggedIn) {
-          message.warning(`平台「${platformLabel(pf as JobPlatform)}」未登录，请先在下方扫码登录后再启动`);
-          return;
-        }
+        continue;
+      }
+      let pst = cfxPlatformLogin[pf];
+      if (!pst) pst = await refreshPlatformStatus(pf);
+      if (!pst?.ready) {
+        message.warning(`平台「${platformLabel(pf as JobPlatform)}」隐身引擎未就绪：${pst?.message || '请到设置页检测'}`);
+        return;
+      }
+      if (!pst?.engine?.loggedIn) {
+        message.warning(`平台「${platformLabel(pf as JobPlatform)}」未登录，请先在下方扫码登录后再启动`);
+        return;
       }
     }
     // 启动后台持久沟通：切到工作台仍继续运行，新批准的岗位会自动加入
     start();
   }, [profile, config, batchQueue, start, cfxPlatformLogin, refreshPlatformStatus]);
+
+  // ===== AI 跟聊监听：常驻巡检已投递的 BOSS 会话，HR 回消息即带上下文自动回复 =====
+  const handleToggleWatch = useCallback(async (on: boolean) => {
+    if (!on) { setWatch(false); return; }
+    if (!profile) { message.warning('请先在简历中心生成职业画像'); return; }
+    if (isLockedOut(config)) {
+      message.warning(`账号处于冷却期（剩余约 ${Math.ceil(cooldownRemaining(config) / 60000)} 分钟），暂不能开启跟聊监听`);
+      return;
+    }
+    const st = await camoufoxStatus();
+    if (!st.ready) {
+      message.warning('隐身引擎未就绪：' + (st.message || '请先下载 Camoufox 隐身引擎内核（暂未下载）'));
+      return;
+    }
+    if (!st.engine?.loggedIn) {
+      message.warning('BOSS 未登录，请先在上方扫码登录后再开启跟聊监听');
+      return;
+    }
+    setWatch(true);
+  }, [profile, config, setWatch]);
+
+  // 活跃时段折算小时数（**仅用于界面提示**）。真正的时段判定权威仍是 activityWindow.ts；
+  // 日抖动只平移边界、不改变跨度，故此处直接用起止小时做差，跨午夜（end <= start）时 +24 归一。
+  const activeHoursCfg = config.activeHours ?? DEFAULT_ACTIVE_HOURS;
+  const activeHoursPerDay = ((activeHoursCfg.endHour - activeHoursCfg.startHour + 24) % 24) || 24;
 
   return (
     <main className="page" aria-label="自动沟通控制台">
@@ -418,33 +508,52 @@ export default function AutoChat() {
                   <MessageOutlined style={{ color: 'var(--brand)', marginRight: 8 }} />
                   待沟通岗位队列
                 </span>
-                <Tag color="cyan" style={{ margin: 0, borderRadius: 10, fontWeight: 600 }}>
-                  {queueCount} 个岗位
-                </Tag>
+                <Space size={8}>
+                  {(sentCount > 0 || showSent) && (
+                    <Button
+                      size="small"
+                      type="text"
+                      icon={<EyeOutlined />}
+                      onClick={() => setShowSent((v) => !v)}
+                      title={showSent
+                        ? '收起已沟通岗位（记录仍保留在工作台 / 任务进度）'
+                        : '已沟通岗位默认收起，避免长期累积把待沟通岗位挤出可视区'}
+                    >
+                      {showSent ? '收起已沟通' : `显示已沟通（${sentCount}）`}
+                    </Button>
+                  )}
+                  <Tag color="cyan" style={{ margin: 0, borderRadius: 10, fontWeight: 600 }}>
+                    {queueCount} 个岗位
+                  </Tag>
+                </Space>
               </div>
             }
           >
             {queueItems.length === 0 ? (
               <EmptyState
                 title="暂无待沟通岗位"
-                description="请先在工作台搜索采集岗位并确认加入队列。"
+                description={sentCount > 0
+                  ? `已沟通 ${sentCount} 个岗位已从队列收起，可点右上角「显示已沟通」查看或删除。`
+                  : '请先在工作台搜索采集岗位并确认加入队列。'}
               />
             ) : (
               <>
-                {/* 默认最多露出前 3 张卡片，其余在容器内滚动，避免整页被队列拉长 */}
-                <div
-                  ref={queueScrollRef}
-                  className={'wb-jobs autochat-queue-scroll' + (queueItems.length > QUEUE_VISIBLE_COUNT ? ' is-scrollable' : '')}
-                  style={queueMaxHeight ? { maxHeight: queueMaxHeight } : undefined}
-                >
+                {/* 卡片撑满列高、队列在卡内滚动（可视条数随窗口自适应，不写死张数） */}
+                <div ref={queueScrollRef} className="wb-jobs autochat-queue-scroll">
                   {queueItems.map((p: PendingItem) => {
                     const st = STATUS_TAG[p.status] || { color: 'default', label: p.status };
-                    const isActive = p.id === activeChatId;
+                    const isActive = p.id === activeChatId
+                      || (!!watchActiveId && [p.job?.recruiterName, p.job?.company]
+                        .some((v) => String(v || '').replace(/\s+/g, '') === String(watchActiveId).replace(/\s+/g, '')));
+                    // 通知点击聚焦：「HR 名 / 公司名」按去空白小写归一比对（与浏览器端会话匹配口径一致）
+                    const focusKey = conversationFocus ? normConvKey(conversationFocus.key) : '';
+                    const isFocused = !!focusKey && [p.job?.recruiterName, p.job?.company]
+                      .some((v) => normConvKey(v) === focusKey);
                     const canChat = p.status !== 'sent';
                     // 薪资：cleanSalary 已还原 BOSS 直聘的字体混淆（PUA 数字），并过滤无效/占位值
                     const salaryText = cleanSalary(p.job?.salary);
                     return (
-                      <div key={p.id} className={'job-card' + (isActive ? ' is-active' : '')} style={{ marginBottom: 12 }}>
+                      <div key={p.id} className={'job-card' + (isActive ? ' is-active' : '') + (isFocused ? ' is-focus' : '')} style={{ marginBottom: 12 }}>
                         <div className="job-header">
                           <div className="job-header-main" style={{ minWidth: 0 }}>
                             <div className="job-title-row">
@@ -462,6 +571,13 @@ export default function AutoChat() {
                           </Tag>
                         </div>
                         <div className="job-body" style={{ paddingTop: 10 }}>
+                          {/* 求职进展（P1-6）：与投递状态正交，只做 HR 侧流程跟踪；未沟通的岗位不展示 */}
+                          {(p.status === 'sent' || p.progressStage) && (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                              <span style={{ fontSize: 12, color: 'var(--fg-subtle)' }}>求职进展</span>
+                              <ProgressStageSelect value={p.progressStage} onChange={(patch) => updatePending(p.id, patch)} />
+                            </div>
+                          )}
                           <div className="job-greeting-label" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
                             <span>
                               <MessageOutlined style={{ color: 'var(--brand)', marginRight: 4 }} />
@@ -504,6 +620,20 @@ export default function AutoChat() {
                             <Button size="small" icon={<EyeOutlined />} onClick={() => p.job?.url && electronApi.external.open(p.job.url)} style={{ borderRadius: 6 }}>
                               打开岗位
                             </Button>
+                            {(p.status === 'sent' || p.status === 'failed') && (
+                              <Popconfirm
+                                title={`删除该${p.status === 'sent' ? '已沟通' : '失败'}岗位？`}
+                                description="仅删除本地记录，不影响已发出的消息与平台上的实际投递；删除后相关计数同步减少。"
+                                okText="确认删除"
+                                cancelText="取消"
+                                okButtonProps={{ danger: true }}
+                                onConfirm={() => onDeleteTerminal(p)}
+                              >
+                                <Button size="small" danger icon={<DeleteOutlined />} style={{ borderRadius: 6 }}>
+                                  删除
+                                </Button>
+                              </Popconfirm>
+                            )}
                             {canChat && (
                               <Button
                                 size="small"
@@ -532,7 +662,8 @@ export default function AutoChat() {
                   })}
                 </div>
 
-                {queueItems.length > QUEUE_VISIBLE_COUNT && (
+                {/* 仅当列表真的溢出（还有看不到的岗位）时才提示可滚动 */}
+                {queueScrollable && (
                   <div className="autochat-queue-more">
                     <ChevronDown size={13} style={{ marginRight: 6 }} aria-hidden="true" />
                     <span>共 {queueItems.length} 个岗位，向下滚动查看全部</span>
@@ -576,6 +707,18 @@ export default function AutoChat() {
                 <div className="setting-row__desc">自动跳过猎头招聘岗位</div>
               </div>
               <div className="setting-row__control"><Switch checked={config.excludeHeadhunters} onChange={(v) => setConfig({ excludeHeadhunters: v })} /></div>
+            </div>
+
+            <div className="setting-row">
+              <div className="setting-row__main">
+                <div className="setting-row__label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <RobotOutlined style={{ color: 'var(--brand)' }} />
+                  AI 跟聊监听
+                  {watchRunning && <Tag color="processing" icon={<SyncOutlined spin />} style={{ margin: 0, borderRadius: 6 }}>监听中</Tag>}
+                </div>
+                <div className="setting-row__desc">常驻 BOSS 会话页扫描全部 HR 会话，有新消息即结合聊天记录自动回复（不占用当日投递上限）</div>
+              </div>
+              <div className="setting-row__control"><Switch checked={watchRunning} onChange={(v) => { void handleToggleWatch(v); }} /></div>
             </div>
 
             {/* 图片简历 2x2 缩略图网格 */}
@@ -657,7 +800,27 @@ export default function AutoChat() {
                 message={`账号处于冷却期，剩余约 ${Math.ceil(cooldownRemaining(config) / 60000)} 分钟`}
               />
             )}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10 }}>
+            {/*
+              生效范围声明（用户反馈「不知道设置是自动沟通生效还是工作台一起生效」）。
+              这不是临时提示而是**字段级语义**：卡片挂在「自动沟通」页，容易被误读成只作用于本页 ——
+              实际上这五项都是**账号级**限制，工作台投递与自动沟通共用同一套配置与同一套判定。
+              故必须常驻（不适用 AGENTS.md 的「说明类文案走顶部 notification」），且只写一次（不逐卡重复）。
+            */}
+            <div className="sic-scope">
+              <InfoCircleOutlined />
+              <span>
+                生效范围：<DesktopOutlined style={{ margin: '0 2px' }} /><b>工作台投递</b>
+                <span style={{ margin: '0 6px' }}>+</span>
+                <MessageOutlined style={{ marginRight: 2 }} /><b>自动沟通</b>
+                <span style={{ marginLeft: 6 }}>—— 两者共用同一套限制，改一处两边同时生效</span>
+              </span>
+            </div>
+
+            {/* 基础节奏：三格等宽等高磁贴。数值与单位同行（原来输入框 width:100% 会把
+                「秒 / 次/分 / 分钟」挤到独占一行，卡片内留下大片空档）。
+                「风控冷却」的长说明改为标签旁的提示图标（字段级解释走 Tooltip，见 AGENTS.md §3.4）——
+                原先它常驻在卡底，把同排三格拉成不等高，前两格底部各留一块空白。 */}
+            <div className="sic-tiles">
               <div className="stat-input-card">
                 <span className="sic-label">
                   <FieldTimeOutlined className="sic-icon" />
@@ -669,7 +832,7 @@ export default function AutoChat() {
                     max={600}
                     value={config.betweenJobsSeconds}
                     onChange={(v) => setConfig({ betweenJobsSeconds: v ?? 20 })}
-                    style={{ width: '100%' }}
+                    style={{ flex: 1, minWidth: 0 }}
                   />
                   <span className="sic-unit">秒</span>
                 </div>
@@ -683,10 +846,10 @@ export default function AutoChat() {
                 <div className="sic-input-wrap">
                   <InputNumber
                     min={1}
-                    max={15}
+                    max={SAFETY_LIMITS.MAX_ACTIONS_PER_MINUTE}
                     value={config.maxActionsPerMinute}
-                    onChange={(v) => setConfig({ maxActionsPerMinute: v ?? 6 })}
-                    style={{ width: '100%' }}
+                    onChange={(v) => setConfig({ maxActionsPerMinute: Math.min(SAFETY_LIMITS.MAX_ACTIONS_PER_MINUTE, Math.max(1, v ?? 6)) })}
+                    style={{ flex: 1, minWidth: 0 }}
                   />
                   <span className="sic-unit">次/分</span>
                 </div>
@@ -696,14 +859,115 @@ export default function AutoChat() {
                 <span className="sic-label">
                   <HourglassOutlined className="sic-icon" />
                   风控冷却
+                  {/* 下界锁 30 分钟而不是 5：冷却遵循「只放大、不缩短」（safety.ts::resolveCooldownMs）——
+                      低于 30 分钟对各风险码的预设保护时长没有任何效果，给这个区间只会造成
+                      「调了但看不出变化」的误解。 */}
+                  <Tooltip title="调大可延长冷却时长；不会缩短各风险码的保护下限">
+                    <InfoCircleOutlined className="sic-hint" />
+                  </Tooltip>
                 </span>
                 <div className="sic-input-wrap">
                   <InputNumber
-                    min={5}
+                    min={30}
                     max={720}
                     value={config.autoCooldownMinutes}
                     onChange={(v) => setConfig({ autoCooldownMinutes: v ?? 30 })}
-                    style={{ width: '100%' }}
+                    style={{ flex: 1, minWidth: 0 }}
+                  />
+                  <span className="sic-unit">分钟</span>
+                </div>
+              </div>
+            </div>
+
+            {/*
+              作息与批次休息（详见 activityWindow.ts）：
+              操作时间戳是**服务端可见的账号级长期统计** —— 指纹可以伪装，
+              但「24 小时无睡眠」「连续上百次投递不中断」这类作息异常骗不过时间序列分析。
+              故这两项必须与工作台同口径（见文件顶部生效范围声明）。
+
+              布局用**单列整行**而不是并排两列：侧栏宽度是固定 420px（.autochat-side），
+              卡内可用宽度约 388px，而「批次休息」一行有 8 个控件（开关 + 4 个数字 + 3 个单位）
+              约需 336px —— 并排两列时每列只有 ~189px，必然折行成锯齿，甚至右侧整段被裁掉
+              （旧版用户截图里「个休息」之后的区间直接消失）。
+              整行铺开后：开关与标题同排（开关右对齐，与卡片右缘对齐），数值独占一行，
+              任何容器宽度下都不会裁切或乱折。`.sic-input-wrap` 的 flex-wrap 作为兜底保留。
+            */}
+            <div className="sic-rows">
+              <div className="stat-input-card">
+                <div className="sic-row-head">
+                  <span className="sic-label">
+                    <ClockCircleOutlined className="sic-icon" />
+                    活跃时段
+                  </span>
+                  <Switch
+                    size="small"
+                    checked={config.activeHours?.enabled !== false}
+                    onChange={(v) => setConfig({ activeHours: { ...(config.activeHours ?? DEFAULT_ACTIVE_HOURS), enabled: v } })}
+                  />
+                </div>
+                <div className="sic-input-wrap">
+                  <InputNumber
+                    min={0}
+                    max={23}
+                    style={{ width: 64 }}
+                    disabled={config.activeHours?.enabled === false}
+                    value={config.activeHours?.startHour ?? DEFAULT_ACTIVE_HOURS.startHour}
+                    onChange={(v) => setConfig({ activeHours: { ...(config.activeHours ?? DEFAULT_ACTIVE_HOURS), startHour: v ?? DEFAULT_ACTIVE_HOURS.startHour } })}
+                  />
+                  <span className="sic-unit">至</span>
+                  <InputNumber
+                    min={0}
+                    max={23}
+                    style={{ width: 64 }}
+                    disabled={config.activeHours?.enabled === false}
+                    value={config.activeHours?.endHour ?? DEFAULT_ACTIVE_HOURS.endHour}
+                    onChange={(v) => setConfig({ activeHours: { ...(config.activeHours ?? DEFAULT_ACTIVE_HOURS), endHour: v ?? DEFAULT_ACTIVE_HOURS.endHour } })}
+                  />
+                  <span className="sic-unit">点</span>
+                  {/* 折算提示既补足信息，也让这一行的行尾与下一行（批次休息）齐平 */}
+                  <span className="sic-note">每天约 {activeHoursPerDay} 小时</span>
+                </div>
+              </div>
+
+              <div className="stat-input-card">
+                <div className="sic-row-head">
+                  <span className="sic-label">
+                    <CoffeeOutlined className="sic-icon" />
+                    批次休息
+                  </span>
+                  <Switch
+                    size="small"
+                    checked={config.batchRest?.enabled !== false}
+                    onChange={(v) => setConfig({ batchRest: { ...(config.batchRest ?? DEFAULT_BATCH_REST), enabled: v } })}
+                  />
+                </div>
+                <div className="sic-input-wrap">
+                  <span className="sic-unit">每</span>
+                  <InputNumber
+                    min={3}
+                    max={200}
+                    style={{ width: 62 }}
+                    disabled={config.batchRest?.enabled === false}
+                    value={config.batchRest?.everyNJobs ?? DEFAULT_BATCH_REST.everyNJobs}
+                    onChange={(v) => setConfig({ batchRest: { ...(config.batchRest ?? DEFAULT_BATCH_REST), everyNJobs: v ?? DEFAULT_BATCH_REST.everyNJobs } })}
+                  />
+                  <span className="sic-unit">个休息</span>
+                  <InputNumber
+                    min={1}
+                    max={60}
+                    style={{ width: 62 }}
+                    disabled={config.batchRest?.enabled === false}
+                    value={config.batchRest?.minMinutes ?? DEFAULT_BATCH_REST.minMinutes}
+                    onChange={(v) => setConfig({ batchRest: { ...(config.batchRest ?? DEFAULT_BATCH_REST), minMinutes: v ?? DEFAULT_BATCH_REST.minMinutes } })}
+                  />
+                  <span className="sic-unit">–</span>
+                  <InputNumber
+                    min={1}
+                    max={60}
+                    style={{ width: 62 }}
+                    disabled={config.batchRest?.enabled === false}
+                    value={config.batchRest?.maxMinutes ?? DEFAULT_BATCH_REST.maxMinutes}
+                    onChange={(v) => setConfig({ batchRest: { ...(config.batchRest ?? DEFAULT_BATCH_REST), maxMinutes: v ?? DEFAULT_BATCH_REST.maxMinutes } })}
                   />
                   <span className="sic-unit">分钟</span>
                 </div>

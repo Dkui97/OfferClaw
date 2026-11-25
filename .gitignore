@@ -55,11 +55,14 @@ venv/
 .jobclaw/
 **/.jobclaw/
 
-# Local user data and private artifacts
-# 误传清理：CI 工作流与顶层 skills / scripts（软件内置技能在 desktop-app/skills；scripts 为本地沙箱辅助，均不入仓库根）
-.github/
+# Local user data and stray artifacts
+# 顶层 skills / scripts 为本地沙箱辅助，不入仓库根（软件内置技能在 desktop-app/skills）
 /skills/
 /scripts/
+# GitHub Actions 构建流水线随仓库分发（workflow 只含构建步骤与校验和，无用户数据）。
+# 注意写法：必须先排除 .github/* 再包含 workflows —— 直接排除 .github/ 后无法再用 ! 取回子目录。
+.github/*
+!.github/workflows/
 *resume*.pdf
 *resume*.docx
 *简历*.pdf
@@ -70,15 +73,18 @@ venv/
 # MCP 本地持久化残留（bossclaw_workspace 已删除，仅保留忽略规则防历史文件入库）
 mcp/bossclaw-mcp/.workspace-root
 
-# Internal dev docs (kept local, not committed)
-/docs/
-# 细分忽略（保留仅为记录；/docs/ 已整体忽略）
-/docs/仓库清理执行报告.md
-/docs/沟通功能对齐检查报告.md
-/docs/桌面版改造需求文档.md
-/docs/src/
-
 # Editors
 .vscode/
 .idea/
 *.swp
+
+# Local agent sandbox (design-skill copies, not part of the app)
+/.agents/
+
+# 封面设计草稿（本地素材，不入库）
+bossclaw-cover.miora
+/bossclaw-cover_assets/
+
+# 代码图谱分析产物（graphify 本地生成，约 8MB，不入库）
+graphify-out/
+graphify-project-graph.html

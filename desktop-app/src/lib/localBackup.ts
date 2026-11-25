@@ -16,8 +16,22 @@
 //   3) 主进程写盘改异步原子写（tmp+rename），不再用 writeFileSync 阻塞主进程事件循环。
 //   4) 心跳触发重收集前让出主线程（requestIdleCallback / setTimeout 兜底），不与用户交互撞车。
 import { electronApi } from './electronApi';
-import { persistDirtyEpoch, discardPendingPersistWrites } from './persistSafe';
-import { BACKUP_KEYS } from './storage'; // P2-03：备份键清单收敛到 storage.ts 登记表，不再单独维护
+import {
+  persistDirtyEpoch,
+  discardPendingPersistWrites,
+  persistFailureOf,
+  getLatestPersistSnapshot,
+  onPersistFailure,
+} from './persistSafe';
+import { BACKUP_KEYS, mergeLegacyResumeIntoQueueText, stripResumeFromLegacyDataText } from './storage'; // P2-03：备份键清单收敛到 storage.ts 登记表
+import { isQueueFileMode } from './bossclaw/queueMode';
+import {
+  QUEUE_STORE_KEY,
+  clearQueueStore,
+  flushQueueNow,
+  getQueueSnapshotText,
+  importQueueData,
+} from './bossclaw/queueRepo';
 
 export const BACKUP_INTERVAL_MS = 300_000; // 5 分钟
 
@@ -46,10 +60,26 @@ export async function getBackupDir(): Promise<string> {
   }
 }
 
-/** 收集 localStorage 中各 persist 键的值，组装备份包 */
+/** 收集各 persist 键的值，组装备份包（队列在文件模式下取 store 内存快照，见 issue #10） */
 export function gatherBundle(): BackupBundle {
   const keys: Record<string, string | null> = {};
   for (const k of BACKUP_KEYS) {
+    if (k === QUEUE_STORE_KEY && isQueueFileMode()) {
+      // 队列已迁至 <userData>/queue/：备份包内仍保留同一 key（格式不变，旧版本也能读），
+      // 值取自 store 内存，保证「备份时刻」的队列与用户眼前一致。
+      keys[k] = getQueueSnapshotText();
+      continue;
+    }
+    // issue #10：主存储写失败（配额写满 / 存储被禁用）期间，localStorage 里是**旧快照**，
+    // 备份若照抄就等于把同一份过期数据存两遍——重启后回签也救不回来。此时改用 persist
+    // 内存中「最后一次交出的完整值」，让备份文件成为真正的第二事实来源。
+    if (persistFailureOf(k)) {
+      const snap = getLatestPersistSnapshot(k);
+      if (snap != null) {
+        keys[k] = snap;
+        continue;
+      }
+    }
     try {
       keys[k] = typeof localStorage !== 'undefined' ? localStorage.getItem(k) : null;
     } catch {
@@ -57,6 +87,11 @@ export function gatherBundle(): BackupBundle {
     }
   }
   return { updatedAt: Date.now(), keys };
+}
+
+/** 参与脏检查的键：文件模式下队列也算一个（其 epoch 由 queueRepo 写成功后打点） */
+function epochKeys(): string[] {
+  return isQueueFileMode() ? [...BACKUP_KEYS, QUEUE_STORE_KEY] : BACKUP_KEYS;
 }
 
 /**
@@ -67,15 +102,34 @@ export function gatherBundle(): BackupBundle {
  * 快路径：自上次成功写盘后所有 key 均无 persist 新写入 → 内容必然未变，直接零开销返回；
  * 每 FULL_CHECK_EVERY 次快路径跳过后强制一次全量复核（兜底 persist 之外对 localStorage 的直写）。
  * force=true（设置页「立即备份」）跳过全部快路径与复核计数，始终全量执行。
+ *
+ * ⚠️ 并发串行化（审查 #29）：函数体内含 `await`（IPC 写盘），而调用点有两类 —— 5 分钟心跳的
+ * idle 回调与设置页「立即备份」；两者可能重叠，重叠时两个写盘会各自收集/拼接并先后落到**同一个**
+ * 备份文件上（主进程侧原用固定 `.tmp` 名 + rename），最坏结果是两次写交叉、备份文件内容错乱。
+ * 这里用一条 Promise 链把调用排成队列（不做「在飞就提前返回」，否则用户点「立即备份」会被
+ * 心跳的在飞写静默吞掉、看不到任何反馈）。
  */
-export async function writeLocalBackup(force = false): Promise<{ wrote: boolean; error?: string }> {
+let writeChain: Promise<unknown> = Promise.resolve();
+
+export function writeLocalBackup(force = false): Promise<{ wrote: boolean; error?: string }> {
+  const run = () => doWriteLocalBackup(force);
+  const next = writeChain.then(run, run);
+  // 队列本身不因单次失败而中断（结果由调用方各自的 next 拿到）
+  writeChain = next.catch(() => undefined);
+  return next;
+}
+
+async function doWriteLocalBackup(force = false): Promise<{ wrote: boolean; error?: string }> {
   try {
     if (!electronApi.backup || !electronApi.backup.write) {
       return { wrote: false, error: 'backup API 不可用（仅 Electron 可用）' };
     }
+    // issue #10：队列在文件模式下可能还停在 800ms 防抖窗口里。备份是「救命副本」，
+    // 必须先把在途/待写的队列落盘，再取快照；否则备份可能比用户眼前的队列慢一拍。
+    if (isQueueFileMode()) await flushQueueNow();
     // 快路径：各 key 写代数与基线一致 → 无内容变化，零开销跳过（多数心跳命中，不再卡顿）
     if (!force && baselineEpochs) {
-      const clean = BACKUP_KEYS.every((k) => persistDirtyEpoch(k) === (baselineEpochs?.get(k) ?? -1));
+      const clean = epochKeys().every((k) => persistDirtyEpoch(k) === (baselineEpochs?.get(k) ?? -1));
       if (clean) {
         skipChecks += 1;
         if (skipChecks < FULL_CHECK_EVERY) return { wrote: false };
@@ -86,7 +140,7 @@ export async function writeLocalBackup(force = false): Promise<{ wrote: boolean;
     // P2-07：采集 bundle 的**同一时刻**快照各 key 写代数——基线必须锚定「采集时」而非「写盘后」。
     // 旧实现：写盘返回后才读 epoch，而写盘期间（T2→T4）可能已有新变更，导致该变更被误标为
     // 「已备份」（实际落盘的是旧值 V），下一轮快路径判定 clean 跳过 → 漏备份最多 4 个心跳周期。
-    const epochSnapshot = new Map(BACKUP_KEYS.map((k) => [k, persistDirtyEpoch(k)]));
+    const epochSnapshot = new Map(epochKeys().map((k) => [k, persistDirtyEpoch(k)]));
     const bundle = gatherBundle();
     // 脏检查以 keys 内容为准（updatedAt 每次变化，不能纳入比对，否则会每分钟重写文件）
     const keysJson = JSON.stringify(bundle.keys);
@@ -122,16 +176,87 @@ export async function restoreFromLocalBackup(): Promise<{ restored: boolean; err
     // 全 null 备份、或各键与现状一致的备份都不算恢复成功——否则会谎报 restored，
     // 触发调用方整页 reload，落入「恢复→刷新→再恢复」的无限循环（首页假死）。
     let restoredCount = 0;
+    // issue #10：恢复同样是写 localStorage —— 若配额仍然写满（正是写失败导致丢数据的根因），
+    // 原实现的 `catch { /* 忽略 */ }` 会让「恢复成功」的提示与「其实一条都没写回来」同时出现。
+    // 这里统计失败键并在返回里如实告知，避免用户误以为已恢复。
+    const failedKeys: string[] = [];
+    // M-34：只接受**白名单键**且值为字符串 —— 原实现遍历备份中所有键无脑写回 localStorage，
+    // 一份被篡改/损坏的备份文件可写入任意键（如注入伪造的配置/数据键）。
+    const allowed = new Set<string>(BACKUP_KEYS);
+    let legacyQueueText: string | null = null;
+    // P3：旧备份的简历在 bossclaw-data 里，队列虚拟键（v1）没有 resume 字段
+    const legacyDataText = typeof r.bundle.keys['bossclaw-data'] === 'string' ? r.bundle.keys['bossclaw-data'] : null;
+    let queueRestoredFromBundle = false;
     for (const [k, v] of Object.entries(r.bundle.keys)) {
       try {
+        if (!allowed.has(k)) continue;
+        if (k === QUEUE_STORE_KEY && !isQueueFileMode()) {
+          // 回滚模式：队列要并回 bossclaw-data，不能孤立写入无人读取的键
+          legacyQueueText = typeof v === 'string' ? v : null;
+          continue;
+        }
+        if (k === QUEUE_STORE_KEY && isQueueFileMode()) {
+          // 队列回签走文件仓储：null 视为清空；其余必须是字符串且能通过结构校验
+          if (v == null) {
+            await clearQueueStore();
+          } else if (typeof v === 'string') {
+            const w = await importQueueData(mergeLegacyResumeIntoQueueText(v, legacyDataText));
+            if (!w.ok) throw new Error(w.error || '队列写入失败');
+          } else {
+            continue;
+          }
+          queueRestoredFromBundle = true;
+          restoredCount += 1;
+          continue;
+        }
         if (v == null) {
           localStorage.removeItem(k); // 与备份一致：备份时该键缺失则删除
-        } else if (localStorage.getItem(k) !== v) {
-          localStorage.setItem(k, v);
+        } else if (typeof v !== 'string') {
+          continue; // 非字符串值一律忽略
+        } else {
+          // P3：文件模式下简历已并入 resume.json，bossclaw-data 里的旧简历字段剥离后再写回
+          const next = k === 'bossclaw-data' && isQueueFileMode() ? stripResumeFromLegacyDataText(v) : v;
+          if (localStorage.getItem(k) !== next) {
+            localStorage.setItem(k, next);
+            restoredCount += 1;
+          }
+        }
+      } catch {
+        failedKeys.push(k); // 单个键恢复失败：记录后继续处理其余键
+      }
+    }
+    // P3：备份里没有队列键、但有旧简历 → 用当前队列 + 备份简历重写一次
+    if (isQueueFileMode() && !queueRestoredFromBundle && legacyDataText) {
+      try {
+        const snap = getQueueSnapshotText();
+        const merged = mergeLegacyResumeIntoQueueText(snap, legacyDataText);
+        if (merged !== snap) {
+          const w = await importQueueData(merged);
+          if (!w.ok) throw new Error(w.error || '简历写入失败');
           restoredCount += 1;
         }
       } catch {
-        /* 单个键恢复失败忽略 */
+        failedKeys.push(QUEUE_STORE_KEY);
+      }
+    }
+    if (legacyQueueText) {
+      try {
+        const q = JSON.parse(legacyQueueText) as { pending?: unknown; qualifiedExports?: unknown; resumeText?: unknown; resumeFileName?: unknown; imageResumes?: unknown };
+        const raw = localStorage.getItem('bossclaw-data');
+        const legacy = raw ? (JSON.parse(raw) as { state?: Record<string, unknown>; version?: number }) : { state: {}, version: 2 };
+        legacy.state = {
+          ...(legacy.state || {}),
+          pending: Array.isArray(q.pending) ? q.pending : [],
+          qualifiedExports: q.qualifiedExports && typeof q.qualifiedExports === 'object' ? q.qualifiedExports : {},
+        };
+        // P3：v2 队列载荷里的简历要并回 bossclaw-data（回滚模式只读这个键）
+        if (typeof q.resumeText === 'string') legacy.state.resumeText = q.resumeText;
+        if (typeof q.resumeFileName === 'string') legacy.state.resumeFileName = q.resumeFileName;
+        if (Array.isArray(q.imageResumes)) legacy.state.imageResumes = q.imageResumes;
+        localStorage.setItem('bossclaw-data', JSON.stringify(legacy));
+        restoredCount += 1;
+      } catch {
+        failedKeys.push(QUEUE_STORE_KEY);
       }
     }
     // 更新脏检查基准（以 keys 内容为准），避免恢复后立即误判重复写入
@@ -139,11 +264,27 @@ export async function restoreFromLocalBackup(): Promise<{ restored: boolean; err
     // 恢复是绕过 persist 的直写：作废旧基线，令下次备份重建（避免快路径误判「无变化」跳过）
     baselineEpochs = null;
     skipChecks = 0;
+    if (failedKeys.length > 0) {
+      return {
+        restored: restoredCount > 0,
+        error: `${failedKeys.length} 个键写回失败（本地存储可能已满或没有写入权限，请先导出备份，再检查磁盘空间/安全软件，必要时清空运行日志后重试）：${failedKeys.join('、')}`,
+      };
+    }
     if (restoredCount > 0) return { restored: true };
     return { restored: false, error: '备份中无有效数据（各键为空或与现有数据一致）' };
   } catch (e) {
     return { restored: false, error: (e as Error).message };
   }
+}
+
+/**
+ * 作废脏检查基线：令下一次备份心跳强制全量核对。
+ * 用于**绕过 persistSafe 写哨兵直写 localStorage** 的场景（如导入数据）——否则备份快路径会因
+ * 「自上次备份后写哨兵未变化」而跳过这次变更，导入的数据最长要等 FULL_CHECK_EVERY 次心跳才入备份。
+ */
+export function invalidateLocalBackupBaseline(): void {
+  baselineEpochs = null;
+  skipChecks = 0;
 }
 
 /** 删除本地备份文件（配合「清空全部数据」） */
@@ -161,6 +302,10 @@ export async function clearLocalBackup(): Promise<boolean> {
 /**
  * 启动 5 分钟备份心跳（幂等）。启动后先执行一次初次写入（建立基线），之后每
  * BACKUP_INTERVAL_MS 触发一次。
+ *
+ * issue #10：同时订阅 persist 写失败事件 —— 主存储写不进的那一刻立刻把**内存态**落一份备份
+ * （force 模式），把「已确认投递但没落盘」的暴露窗口从「下一次心跳（最多 5 分钟）」压缩到
+ * 「写失败当刻」。限频 60s：配额耗尽后每次 set 都会失败，不设限频会打满 IPC 与磁盘。
  *
  * 卡顿修复：重收集会同步 getItem + 序列化（可能占用主线程数十~数百 ms），故心跳先让出主线程
  * —— 优先等浏览器空闲（requestIdleCallback），兜底 setTimeout，避免「每到整 5 分钟」与用户
@@ -183,8 +328,19 @@ export function startLocalBackup(): () => void {
       void writeLocalBackup();
     });
   }, BACKUP_INTERVAL_MS);
+  // 写失败即落盘（限频 60s）。推迟到下一轮宏任务，避免在 persist 的写盘调用栈里递归写文件。
+  let lastEmergencyAt = 0;
+  const offFailure = onPersistFailure(() => {
+    const now = Date.now();
+    if (now - lastEmergencyAt < 60_000) return;
+    lastEmergencyAt = now;
+    window.setTimeout(() => {
+      void writeLocalBackup(true);
+    }, 0);
+  });
   return () => {
     started = false;
     window.clearInterval(timer);
+    offFailure();
   };
 }

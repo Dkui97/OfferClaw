@@ -6,7 +6,7 @@
  * - 任务控制中心（开始/暂停/停止、批量确认、失败恢复、目标进度）
  * - 辅助信息区（运行状态 / 配置进度 / 快速入口 / 最近动态）
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Button, Progress, Tag, Typography, Space, message, Divider, Drawer, Spin, Modal, notification } from 'antd';
 import {
@@ -44,7 +44,7 @@ import { rerankPending, promoteApprovedToQueue } from '@/lib/bossclaw/priority';
 import { createTasks } from '@/lib/bossclaw/tasks';
 import { MetricCard } from '@/components/MetricCard';
 import { electronApi } from '@/lib/electronApi';
-import { effectiveDailyCap, dailySentCount } from '@/lib/bossclaw/safety';
+import { effectiveDailyCap, enabledSentCount } from '@/lib/bossclaw/safety';
 import { PLATFORM_IDS, platformLabel, type JobPlatform } from '@/lib/bossclaw/platforms';
 import type { PendingItem } from '@/lib/bossclaw/types';
 import MarkdownView from '@/components/MarkdownView';
@@ -150,27 +150,62 @@ export default function Home() {
   const llmReady = isLLMConfigured();
   // 今日目标 = 各「已启用」平台每日目标合计（每平台上限于平台侧/防封号收窄；仅 BOSS 时即原 120）
   const dailyGoal = effectiveDailyCap(config);
-  // 「今日投递」必须按 sentAt 过滤当天，与每日上限（dailySentCountFor / paceDelivery）同口径。
+  // 「今日投递」必须按 sentAt 过滤当天，**且与每日上限（dailyGoal = effectiveDailyCap）同源**：
+  // 每日上限只累加「已启用」平台的额度，故分子也必须只统计「已启用」平台的今日投递，
+  // 否则用户关闭某平台后，该平台的历史投递仍计入分子、却不贡献分母 → 进度条显示
+  // 「今日 150 / 目标 120」这类越界值。（与批次 13 守卫口径对称，同一条规则）
   // 注意：store 的 stats.sent 是**累计**已投递总数（无日期过滤），直接拿来当「今日」会把
   // 昨天乃至更早投递的岗位也算进来（表现为「昨天投的显示成今日投递」）。
-  const sentToday = dailySentCount(pending);
+  const sentToday = enabledSentCount(config, pending);
   const [progress, setProgress] = useState(0);
   // 使用前必读文档抽屉
   const [docOpen, setDocOpen] = useState(false);
   const [docText, setDocText] = useState('');
   const [docLoading, setDocLoading] = useState(false);
+  // 首次启动引导：把「使用前必读」读完，只看一次
+  const docIntroSeen = useAppStore((s) => s.docIntroSeen);
+  const markDocIntroSeen = useAppStore((s) => s.markDocIntroSeen);
+  const [introOpen, setIntroOpen] = useState(false);
+  // 「是否补弹引导」只判定一次：导入简历/生成画像后这些依赖都会变，
+  // 若每次都重算，会在用户操作到一半时突然弹出（旧数据用户也会被误判成首次）。
+  const introDecided = useRef(false);
+
+  useEffect(() => {
+    if (introDecided.current) return;
+    introDecided.current = true;
+    if (docIntroSeen) return;
+    // 老版本升级：本地已有简历/画像/岗位记录，说明不是第一次用，不再打扰
+    if (resumeText || profile || pending.length > 0) return;
+    setIntroOpen(true);
+  }, [docIntroSeen, resumeText, profile, pending.length]);
 
   const handleOpenDoc = async () => {
     setDocOpen(true);
     if (docText || docLoading) return; // 已加载 / 加载中
     setDocLoading(true);
-    const r = await electronApi.readDoc();
-    setDocLoading(false);
-    if (r.ok && r.text) {
-      setDocText(r.text);
-    } else {
-      message.warning(r.error || '使用文档读取失败');
+    // M-36：IPC 拒绝/异常时必须复位 loading，否则按钮永久转圈（原实现无 try/catch）
+    try {
+      const r = await electronApi.readDoc();
+      if (r.ok && r.text) {
+        setDocText(r.text);
+      } else {
+        message.warning(r.error || '使用文档读取失败');
+      }
+    } catch (e: any) {
+      message.warning(`使用文档读取失败：${e?.message || '未知错误'}`);
+    } finally {
+      setDocLoading(false);
     }
+  };
+
+  /**
+   * 首次引导弹窗收口。两个按钮都要落「已看过」标记：
+   * 否则用户点了「我知道了」却没读，下次启动还会再弹一次，变成骚扰。
+   */
+  const closeIntro = (goRead: boolean) => {
+    markDocIntroSeen();
+    setIntroOpen(false);
+    if (goRead) void handleOpenDoc();
   };
 
   // 第 5 步（投递）的事实 + 归因：进度条、步骤条、诊断行三处共用同一个结果（单一真相）。
@@ -298,13 +333,15 @@ export default function Home() {
     recomputeStats();
   };
 
-  useEffect(() => { recomputeStats(); }, []);
+  useEffect(() => { recomputeStats(); }, [recomputeStats]);
 
   // 「状态事实」提醒：首页挂载时若大模型未配置 → 写一条 WARN + 弹一次顶部通知（各只一次）。
   // 与 llm.ts 里「AI 真回落本地时」的那条（行为事实）分工不同：这条在用户还没用任何 AI 功能时
   // 就能看到归因，不至于等到采集/投递跑完才去日志里猜「为什么没有 AI 结果」。
   useEffect(() => {
-    if (llmReady || llmNoticeShown) return;
+    // 首次引导弹窗开着时先不弹：两个浮层同时出现会互相抢注意力，
+    // 等引导关掉后依赖变化会重跑这里，届时再提示。
+    if (llmReady || llmNoticeShown || introOpen) return;
     llmNoticeShown = true;
     addLog(
       'warn',
@@ -324,7 +361,7 @@ export default function Home() {
       ),
       onClick: () => openSettings('llm'),
     });
-  }, [llmReady, addLog, openSettings]);
+  }, [llmReady, addLog, openSettings, introOpen]);
 
   return (
     <div className="page">
@@ -471,7 +508,7 @@ export default function Home() {
             strokeColor={{ from: '#14B8A6', to: '#0D9488' }}
           />
           <Text type="secondary" style={{ fontSize: 11, marginTop: 4, display: 'block' }}>
-            建议分时段投递（早 / 午 / 晚），避免触发平台风控。
+            已按真人作息分时段投递（默认 8:00–23:00 带每日抖动），非活跃时段自动暂停 —— 可在「自动沟通 → 防封号节奏」调整或关闭。
           </Text>
         </div>
       </div>
@@ -512,7 +549,7 @@ export default function Home() {
             const go = () => (s.tab ? openSettings(s.tab as SettingsTabKey) : setRoute(s.key as any));
             return (
               <div
-                key={i}
+                key={s.label}
                 className={'step-item is-' + st}
                 role="button"
                 tabIndex={0}
@@ -575,7 +612,11 @@ export default function Home() {
         ) : (
           <div>
             {logs.slice(-5).reverse().map((l, i) => (
-              <div className="timeline-item" key={i}>
+              // 审查 §四表 24：key 用日志的稳定 id（批次 7 #96 已为 LogEntry 引入），
+              // 不用 map 下标 —— 窗口 `slice(-5).reverse()` 每来一条新日志整体位移，
+              // 下标 key 会让所有行错位复用（动画/悬停态串到别的行）。
+              // 兼容历史持久化数据：缺 id 的旧条目回落 `time-i`（时间戳 + 当前下标，仍比裸下标稳定）。
+              <div className="timeline-item" key={l.id ?? `${l.time}-${i}`}>
                 <span className={'tl-dot ' + (l.level === 'error' ? 'error' : l.level === 'warn' ? 'warn' : l.level === 'success' ? 'success' : 'info')} />
                 <span className="tl-time">{new Date(l.time).toLocaleTimeString()}</span>
                 <span className="tl-msg">{l.msg}</span>
@@ -609,6 +650,34 @@ export default function Home() {
           <div style={{ textAlign: 'center', padding: 48, color: 'var(--fg-muted)' }}>文档加载失败，请稍后重试</div>
         )}
       </Drawer>
+
+      {/* 首次启动引导：先把使用说明读完再动手（只出现一次） */}
+      <Modal
+        open={introOpen}
+        onCancel={() => closeIntro(false)}
+        centered
+        width={580}
+        title="第一次用？先把使用说明读完"
+        okText="去读文档"
+        cancelText="我知道了"
+        onOk={() => closeIntro(true)}
+      >
+        <div style={{ fontSize: 13, lineHeight: '22px', color: 'var(--fg-muted)' }}>
+          <p style={{ margin: '0 0 12px' }}>
+            首页的「阅读使用文档」是一份完整说明书（约 5 分钟），建议一次从头读到尾 ——
+            配置、导入、投递、异常处理都在里面，遇到问题先翻它比到处试要快。
+          </p>
+          <div style={{ color: 'var(--fg)', fontWeight: 600, marginBottom: 6 }}>读之前，先知道这三件事：</div>
+          <ol style={{ margin: 0, paddingLeft: 20 }}>
+            <li>先在「设置 → AI / LLM 配置」填 API Key，否则岗位评分与打招呼语只会用本地规则生成；</li>
+            <li>导入简历 → 生成职业画像 → 确认投递方向，这三步是投递的前置；</li>
+            <li>投递在工作台右侧的真实浏览器里执行，首次成功投递后会自动暂停，供你核对对象与内容。</li>
+          </ol>
+          <div style={{ marginTop: 12, fontSize: 12, color: 'var(--fg-subtle)' }}>
+            文档随应用离线打开，不需要联网；之后随时可以从首页重新打开。
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

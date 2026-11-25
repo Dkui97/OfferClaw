@@ -8,6 +8,8 @@
 //      岗位会被算进上周的柱子。这里改用 `PendingItem.sentAt`（真实投递成功时间）。
 //   3) 原实现「今日目标达成」用累计已投递当分子，与「每日上限」语义倒错。这里改用
 //      今日 sentAt 计数，与 `effectiveDailyCap`（每日上限）对齐。
+//      口径对称要求（批次 14 补）：`effectiveDailyCap` 只累加**已启用**平台的额度，故今日
+//      已投递的分子也**只统计已启用平台**，否则关闭平台后会显示「今日 150 / 目标 120」越界值。
 //   4) 原实现的状态分布漏了 `opened`（已打开沟通窗未发送），导致各状态占比合计不足 100%。
 //      这里 STATUS_META 覆盖全部 PendingStatus 成员。
 //
@@ -16,7 +18,7 @@
 //     是否落在所选时间范围内筛选。
 //   - 趋势图「新增」按 createdAt 归桶；「已投递」按 sentAt 归桶（两者样本不受对方范围影响，
 //     因此趋势柱合计与已投递卡片可能不等 —— 这是时间序列与存量指标的固有差异，UI 已注明）。
-//   - 「今日目标」独立于时间范围，按 sentAt 统计今日已投递数。
+//   - 「今日目标」独立于时间范围，按 sentAt 统计今日已投递数；**分子分母均只计已启用平台**（口径对称）。
 //   - 平均匹配分只统计有 `analysis.score` 的记录，未分析的不计入分母（图上标注样本数）。
 
 import type {
@@ -26,13 +28,16 @@ import type {
   JobPlatform,
   PendingItem,
   PendingStatus,
+  ProgressStage,
   TaskRun,
 } from './types';
 import { cleanCompanyName } from './jobDisplay';
-import { platformLabel } from './platforms';
+import { platformLabel, platformEnabled } from './platforms';
 import { effectiveDailyCap } from './safety';
 import { selectedDirectionItems } from './directions';
 import { fitLevelFromScore, type FitLevel } from './fitLevel';
+import { normalizeProgressStage } from './progressStage';
+import { STATUS_COLORS } from '../../theme';
 
 /* ============================ 时间范围 ============================ */
 
@@ -68,10 +73,10 @@ export const STATS_STATUS_META: { key: PendingStatus; label: string; color: stri
   { key: 'approved', label: '待投递', color: '#3B82F6', hint: '已确认、进入投递队列' },
   { key: 'approved_queue', label: '投递中', color: '#06B6D4', hint: '正在执行投递' },
   { key: 'opened', label: '已打开', color: '#A78BFA', hint: '已打开沟通窗口、尚未发送文字气泡' },
-  { key: 'sent', label: '已投递', color: '#10B981', hint: '投递成功' },
-  { key: 'failed', label: '失败', color: '#EF4444', hint: '投递失败，可重试或忽略' },
+  { key: 'sent', label: '已投递', color: STATUS_COLORS.success, hint: '投递成功' },
+  { key: 'failed', label: '失败', color: STATUS_COLORS.danger, hint: '投递失败，可重试或忽略' },
   { key: 'skipped', label: '已跳过', color: '#CBD5E1', hint: '未投递（外部网申 / 命中过滤条件等）' },
-  { key: 'rejected', label: '不推荐', color: '#F59E0B', hint: 'AI 判定不推荐' },
+  { key: 'rejected', label: '不推荐', color: STATUS_COLORS.warning, hint: 'AI 判定不推荐' },
   { key: 'ignored', label: '已忽略', color: '#E2E8F0', hint: '人工忽略' },
 ];
 
@@ -79,17 +84,20 @@ export const STATS_STATUS_META: { key: PendingStatus; label: string; color: stri
 export const WAITING_STATUSES: PendingStatus[] = ['pending', 'approved', 'approved_queue', 'opened'];
 
 export const STATS_DECISION_META: Record<Decision, { label: string; color: string }> = {
-  recommend: { label: '推荐投递', color: '#10B981' },
-  cautious: { label: '谨慎投递', color: '#F59E0B' },
-  reject: { label: '不推荐', color: '#EF4444' },
+  recommend: { label: '推荐投递', color: STATUS_COLORS.success },
+  cautious: { label: '谨慎投递', color: STATUS_COLORS.warning },
+  reject: { label: '不推荐', color: STATUS_COLORS.danger },
 };
+
+/** 「匹配（65-80）」档的中性青绿 —— 与品牌色系同族但不等于 success，故独立常量（审查 #114）。 */
+export const MATCH_SCORE_COLOR = '#13B5AC';
 
 /** 提示词四档适配度口径（strong >80 / match 65-80 / cautious 50-64 / unfit <50） */
 export const STATS_FIT_LEVEL_META: { key: FitLevel; label: string; scoreRange: string; color: string; hint: string }[] = [
-  { key: 'strong', label: '推荐', scoreRange: '81-100', color: '#10B981', hint: 'AI 整体裁决：高度吻合（81-100分）' },
-  { key: 'match', label: '匹配', scoreRange: '65-80', color: '#13B5AC', hint: 'AI 整体裁决：正常达标（65-80分）' },
-  { key: 'cautious', label: '谨慎', scoreRange: '50-64', color: '#F59E0B', hint: 'AI 整体裁决：存在缺口（50-64分），需人工确认' },
-  { key: 'unfit', label: '不推荐', scoreRange: '<50', color: '#EF4444', hint: 'AI 整体裁决：门槛不符或方向错位（0-49分）' },
+  { key: 'strong', label: '推荐', scoreRange: '81-100', color: STATUS_COLORS.success, hint: 'AI 整体裁决：高度吻合（81-100分）' },
+  { key: 'match', label: '匹配', scoreRange: '65-80', color: MATCH_SCORE_COLOR, hint: 'AI 整体裁决：正常达标（65-80分）' },
+  { key: 'cautious', label: '谨慎', scoreRange: '50-64', color: STATUS_COLORS.warning, hint: 'AI 整体裁决：存在缺口（50-64分），需人工确认' },
+  { key: 'unfit', label: '不推荐', scoreRange: '<50', color: STATUS_COLORS.danger, hint: 'AI 整体裁决：门槛不符或方向错位（0-49分）' },
 ];
 
 export type MatchDimensionKey = 'skill' | 'direction' | 'experience' | 'education' | 'salary' | 'location';
@@ -203,7 +211,7 @@ export interface StatsSnapshot {
    * 投递漏斗（转化看板）：采集 → 投递 → 打开沟通窗 → 收到回复 → 面试。
    * - discovered：范围内岗位数（已入队视角的采集量）
    * - sent / opened / replied：同上的状态与 replySentAt 派生；**replied ⊆ sent**（回复条目 status 仍为 sent）
-   * - interviewCount：无采集来源（PendingItem 无面试态字段），恒为 0，仅占位展示
+   * - interviewCount：progressStage 为已约面 / 已面试 / 已获 Offer 的岗位数（P1-6 起有真实来源）
    * - replyRate：replied / sent（最核心的转化指标，分母 0 时为 null）
    * - openRate：opened / sent
    */
@@ -215,6 +223,18 @@ export interface StatsSnapshot {
     interviewCount: number;
     replyRate: number | null;
     openRate: number | null;
+  };
+
+  /**
+   * 求职流程进展分布（P1-6）：与 status 正交，分母为范围内岗位总数；
+   * 缺失 / 非法值（含旧数据）统一归入 `unknown`，不报错。
+   */
+  progressStages: {
+    counts: Record<ProgressStage, number>;
+    unknown: number;
+    total: number;
+    /** 已标记（非 unknown）的条数 */
+    marked: number;
   };
 
   companyTop: [string, number][];
@@ -462,6 +482,16 @@ export function buildStatsSnapshot(input: BuildStatsInput): StatsSnapshot {
   let analyzed = 0;
   // 漏斗末环「已回复」计数：见下方 PendingItem.replySentAt 判定处。
   let replied = 0;
+  // 漏斗「面试」与进展分布（P1-6）：progressStage 是唯一来源，旧数据无该字段归入 unknown。
+  let interviews = 0;
+  let progressMarked = 0;
+  const progressCounts: Record<ProgressStage, number> = {
+    replied: 0,
+    interview_scheduled: 0,
+    interviewed: 0,
+    offer: 0,
+    rejected_by_hr: 0,
+  };
   let scored = 0;
   let scoreSum = 0;
   let scoreNone = 0;
@@ -516,6 +546,14 @@ export function buildStatsSnapshot(input: BuildStatsInput): StatsSnapshot {
     // 已回复（漏斗最后一环）：HR 来消息后 AI 跟聊回复成功即有 replySentAt。
     // 该条 status 仍为 'sent'，故 replied ⊆ sent，天然构成漏斗而不重复计数。
     if (p.replySentAt) replied += 1;
+
+    // 求职进展（P1-6）：缺失 / 脏数据不报错，统一按「未标记」处理。
+    const stage = normalizeProgressStage(p.progressStage);
+    if (stage) {
+      progressCounts[stage] += 1;
+      progressMarked += 1;
+      if (stage === 'interview_scheduled' || stage === 'interviewed' || stage === 'offer') interviews += 1;
+    }
 
     if (p.analysis?.decision && decisions[p.analysis.decision] !== undefined) decisions[p.analysis.decision] += 1;
 
@@ -586,7 +624,8 @@ export function buildStatsSnapshot(input: BuildStatsInput): StatsSnapshot {
     if (p.status === 'sent') pfAcc.sent += 1;
     else if (p.status === 'failed') pfAcc.failed += 1;
     else if (WAITING_STATUSES.includes(p.status)) pfAcc.waiting += 1;
-    if (score !== null) { pfAcc.scoreSum += score; pfAcc.analyzed += 1; }
+    // L-21：与 dimensionAvg 口径对齐（要求 v>=0）—— 原实现只用 `score !== null`，负分也被计入均分
+    if (score !== null && score >= 0) { pfAcc.scoreSum += score; pfAcc.analyzed += 1; }
     platformAcc.set(pf, pfAcc);
 
     const dirKey = p.runId ? runDirection.get(String(p.runId)) || '未归属方向' : '未归属方向';
@@ -595,15 +634,25 @@ export function buildStatsSnapshot(input: BuildStatsInput): StatsSnapshot {
     if (p.status === 'sent') dirAcc.sent += 1;
     else if (p.status === 'failed') dirAcc.failed += 1;
     else if (WAITING_STATUSES.includes(p.status)) dirAcc.waiting += 1;
-    if (score !== null) { dirAcc.scoreSum += score; dirAcc.analyzed += 1; }
+    // L-21：同上游口径（v>=0）保持一致
+    if (score !== null && score >= 0) { dirAcc.scoreSum += score; dirAcc.analyzed += 1; }
     directionAcc.set(dirKey, dirAcc);
   }
 
   /* ---- 今日投递（独立于时间范围，按 sentAt） ---- */
+  // ⚠️ 口径必须与 `dailyTarget`（= effectiveDailyCap，只累加**已启用**平台的额度）**同源**：
+  // 分子若统计全部平台（含已关闭的），则用户关闭某平台后今日进度会显示越界值
+  // （如「今日 150 / 目标 120」），PDF 报表的 hbar 也会溢出。
+  // 这正是批次 13「额度/用量口径不对称」在**统计与展示路径**的漏网处 —— 与 enforcement
+  // 路径（checkDeliveryGuards / controlRuntime.autochatStep）同一条规则。
+  // 已启用平台的判定与 `effectiveDailyCap` 共用 `platformEnabled`，确保两侧永远同源。
+  const cfgForStats = input.config || ({} as AppConfig);
   let todaySent = 0;
   for (const p of pending) {
     const sentAt = safeTs(p.sentAt);
-    if (sentAt !== null && sentAt >= todayStart) todaySent += 1;
+    if (sentAt === null || sentAt < todayStart) continue;
+    const pf = (p.job?.platform ?? 'boss') as JobPlatform;
+    if (platformEnabled(cfgForStats, pf)) todaySent += 1;
   }
 
   /* ---- 任务维度（现有口径：任务数量与方向 Top 仍按 taskRuns） ---- */
@@ -616,7 +665,8 @@ export function buildStatsSnapshot(input: BuildStatsInput): StatsSnapshot {
     if (name) directionMap.set(name, (directionMap.get(name) || 0) + 1);
   });
 
-  const dailyTarget = Math.max(1, effectiveDailyCap(input.config || ({} as AppConfig)));
+  // 与上面的 todaySent 同源：分母只累加**已启用**平台，分子亦然（见 todaySent 处注释）。
+  const dailyTarget = Math.max(1, effectiveDailyCap(cfgForStats));
 
   const snapshot: StatsSnapshot = {
     range,
@@ -666,11 +716,18 @@ export function buildStatsSnapshot(input: BuildStatsInput): StatsSnapshot {
       sent: counts.sent,
       opened: counts.opened,
       replied,
-      // 无采集来源：PendingItem 无面试态字段（只有 sentAt / replySentAt / openedAt）。
-      // 留 0 而非删字段，是为了让看板有「面试」这一环的占位，后续接真实数据源时不必改 UI。
-      interviewCount: 0,
+      // P1-6：来自 progressStage（已约面 / 已面试 / 已获 Offer）。旧数据无该字段时为 0，
+      // 属「暂无记录」而非「没有面试」—— 页面提示已注明来源。
+      interviewCount: interviews,
       replyRate: rate(replied, counts.sent),
       openRate: rate(counts.opened, counts.sent),
+    },
+
+    progressStages: {
+      counts: progressCounts,
+      unknown: Math.max(0, total - progressMarked),
+      total,
+      marked: progressMarked,
     },
 
     companyTop: topN(companyMap, 8),
@@ -709,7 +766,8 @@ function buildNotes(range: StatsRangeMeta, gran: TrendGranularity): string[] {
     `趋势${granText}归桶：「新增」按加入日期、「已投递」按投递成功时间，两者归桶依据不同。`,
     '「今日目标」按投递成功时间统计今日已投递数，与每日投递上限同口径，不随时间范围变化。',
     '平均匹配分只统计已有 AI 分数的岗位，未分析岗位不计入分母。',
-    '投递漏斗「已回复」按 AI 跟聊回复成功时间（replySentAt）计数，已回复条目仍属「已投递」；「面试」暂无采集来源。',
+    '投递漏斗「已回复」按 AI 跟聊回复成功时间（replySentAt）计数，已回复条目仍属「已投递」；',
+    '「面试」按求职进展（progressStage）为已约面 / 已面试 / 已获 Offer 的岗位数统计；进展缺失的旧数据归「未标记」。',
   ];
 }
 

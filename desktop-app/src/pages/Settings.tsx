@@ -54,8 +54,10 @@ import {
   FileTextOutlined,
   HddOutlined,
   SyncOutlined,
+  CloudDownloadOutlined,
   DisconnectOutlined,
   InfoCircleOutlined,
+  AudioOutlined,
   RedoOutlined,
   FolderOpenOutlined,
   SaveOutlined,
@@ -63,6 +65,7 @@ import {
   ArrowUpOutlined,
   ArrowDownOutlined,
   SwapOutlined,
+  BellOutlined,
 } from '@ant-design/icons';
 import { useSettingsStore, PROVIDER_DEFAULTS } from '@/store/useSettingsStore';
 import { useAppStore, ThemeMode } from '@/store/useAppStore';
@@ -79,21 +82,27 @@ import {
   type CustomSkillFields,
 } from '@/lib/bossclaw/skills';
 import { exportData, importData, clearAllData } from '@/lib/storage';
+import { clearMockInterviewAll, exportMockSessions } from '@/lib/bossclaw/mockInterviewRepo';
+import { formatSpeechBytes } from '@/lib/bossclaw/mockInterviewVoice';
 import { useDataStore } from '@/store/useDataStore';
+import SpeechSettingsCard from '@/components/SpeechSettingsCard';
+import StorageUsageCard from '@/components/StorageUsageCard';
 import { bridgeStatus } from '@/lib/bridgeClient';
 import { electronApi } from '@/lib/electronApi';
+import { checkForUpdates, openReleasesPage, type UpdateCheckResult } from '@/lib/bossclaw/updateCheck';
 import {
   getBackupDir,
   writeLocalBackup,
   restoreFromLocalBackup,
   clearLocalBackup,
+  invalidateLocalBackupBaseline,
 } from '@/lib/localBackup';
 import { HR_ACTIVITY_FILTER_OPTIONS } from '@/lib/bossclaw/hrActivity';
 import { INTERVIEW_MODE_FILTER_OPTIONS } from '@/lib/bossclaw/interviewMode';
 import { CHINA_PROVINCES } from '@/lib/bossclaw/locationFilter';
 import { writeTargetLocations } from '@/lib/bossclaw/targetLocationSync';
 import { cleanSalary } from '@/lib/bossclaw/jobDisplay';
-import { camoufoxStatus, camoufoxLogin, camoufoxLogout, camoufoxStop, type CamoufoxStatus } from '@/lib/bossclaw/camoufox';
+import { camoufoxStatus, camoufoxLogin, camoufoxLogout, camoufoxStop, CAMOUFOX_MAX_PAGES, CAMOUFOX_PAGE_SIZE, type CamoufoxStatus } from '@/lib/bossclaw/camoufox';
 import {
   PLATFORM_META, PLATFORM_IDS, platformEnabled, platformPriority,
   platformDailyCap, PLATFORM_DEFAULT_DAILY_TARGET,
@@ -106,6 +115,13 @@ import {
   isThinkingActive,
   thinkingEffortLabel,
 } from '@/lib/bossclaw/thinkingCapability';
+import {
+  getCachedCapability,
+  listGatewayModels,
+  probeModelCapabilities,
+  invalidateCapabilitiesCache,
+  type CapabilityProbeResult,
+} from '@/lib/bossclaw/capabilitiesStore';
 import {
   CONTEXT_USAGE_LABELS,
   CONTEXT_WINDOW_MIN,
@@ -140,6 +156,7 @@ const SKILL_SCOPE_OPTIONS = [
   { label: '岗位匹配评估（job-analysis）', value: 'job-analysis' },
   { label: '打招呼语（greetings）', value: 'greetings' },
   { label: '岗位定制简历（assistant）', value: 'assistant' },
+  { label: '模拟面试（mock-interview）', value: 'mock-interview' },
 ];
 
 // 新建技能的默认表单
@@ -203,6 +220,9 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
 
   // ===== 最低薪资口径切换（日薪 ↔ 月薪）=====
   const isMonthlySalary = (config.minSalaryMode ?? 'day') === 'month';
+  // 排除已过截止日期岗位：未配置时（旧持久化数据）回落到「开启」——触发源是猎聘 JD 里显式的
+  // 截止日期字段，属「过期即无意义」的确定性过滤（口径见 lib/bossclaw/jobExpiry.ts）。
+  const isExpiryFilterOn = config.excludeExpiredJobs !== false;
   const toggleSalaryMode = useCallback(() => {
     if (isMonthlySalary) {
       // 切换为日薪：K元/月 * 1000 / 22 工作日
@@ -317,9 +337,13 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
   const [cfxLoading, setCfxLoading] = useState(false);
   const [cfxLogining, setCfxLogining] = useState(false);
   const cfxConfig = config.camoufox || { enabled: false, os: 'windows', pages: 1, prefer: false };
+  // issue #7 P2：页数上限以服务端 max_search_pages() 为准（BOSCLAW_MAX_SEARCH_PAGES 可覆盖），
+  // 拿不到状态时回落到前端常量，避免两处各写一个 5。
+  const cfxMaxPages = cfx?.engine?.maxPages && cfx.engine.maxPages > 0 ? cfx.engine.maxPages : CAMOUFOX_MAX_PAGES;
 
   // ===== 多平台适配：各平台 Camoufox 登录态与登录动作 =====
   const [cfxPlatforms, setCfxPlatforms] = useState<Record<string, CamoufoxStatus | null>>({});
+  const [cfxPlatformLogining, setCfxPlatformLogining] = useState<Record<string, boolean>>({});
   // 各平台在「内置浏览器（工作台）」会话中的登录态（webview persist 分区；j.c:boss-login 返回 platforms 映射）
   const [webviewPlatforms, setWebviewPlatforms] = useState<Record<string, boolean>>({});
   const refreshWebviewStatus = useCallback(async () => {
@@ -384,11 +408,21 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
 
   const refreshCamoufox = async (silent = false) => {
     if (!silent) setCfxLoading(true);
-    const s = await camoufoxStatus();
-    setCfx(s);
-    // 依赖首次安装中不算「不可用」，不自动关闭引擎开关
-    if (!s.ready && !s.installing && cfxConfig.enabled) setConfig({ camoufox: { ...cfxConfig, enabled: false } });
-    if (!silent) setCfxLoading(false);
+    // M-37：探测失败必须复位 loading（原实现无 catch，失败后按钮永久转圈）
+    try {
+      const s = await camoufoxStatus();
+      setCfx(s);
+      // 依赖首次安装中不算「不可用」，不自动关闭引擎开关。
+      // 仅在「引擎模式已不是 Camoufox」时清理陈旧开关；Camoufox 模式下探活失败也保留用户选择，
+      // 由采集入口给出「引擎未就绪」的真实原因，避免静默回退内置浏览器（用户会误以为隐身采集生效）。
+      if (!s.ready && !s.installing && cfxConfig.enabled && config.engineMode !== 'camoufox') {
+        setConfig({ camoufox: { ...cfxConfig, enabled: false } });
+      }
+    } catch (e: any) {
+      if (!silent) message.error(`引擎状态检测失败：${e?.message || '未知错误'}`);
+    } finally {
+      if (!silent) setCfxLoading(false);
+    }
   };
 
   // ===== 多平台适配：刷新各平台 Camoufox 登录态（并行探活，避免 4 平台串行 await 阻塞）=====
@@ -407,6 +441,35 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
     requestBrowserLogin(p as JobPlatform, meta.loginUrl);
     setRoute('workbench');
     message.info(`${meta.label} 登录页已在工作台打开，请在右侧内置浏览器中完成扫码/账号登录`);
+  };
+
+  // Camoufox 隐身通道使用**独立** Cookie 存储，与内置浏览器登录态不互通：
+  // 必须提供各平台独立的「隐身扫码登录」，否则非 BOSS 隐身采集会一直判定未登录。
+  const onPlatformCamoufoxLogin = async (p: JobPlatform) => {
+    const meta = PLATFORM_META[p];
+    setCfxPlatformLogining((prev) => ({ ...prev, [p]: true }));
+    try {
+      const r = await camoufoxLogin(180, cfxConfig.os, p);
+      if (r.ok && r.loggedIn) message.success(`${meta.label} 隐身登录成功，会话 Cookie 已持久化`);
+      else message.warning(r.message || r.error || `${meta.label} 隐身登录未完成（可能超时或取消）`);
+    } catch (e: any) {
+      message.error(`${meta.label} 隐身登录失败：${e?.message || e}`);
+    } finally {
+      setCfxPlatformLogining((prev) => ({ ...prev, [p]: false }));
+      refreshAllPlatformStatus();
+    }
+  };
+
+  const onPlatformCamoufoxLogout = async (p: JobPlatform) => {
+    const meta = PLATFORM_META[p];
+    try {
+      await camoufoxLogout(p);
+      message.success(`${meta.label} 已退出隐身登录`);
+    } catch (e: any) {
+      message.error(`${meta.label} 退出隐身登录失败：${e?.message || e}`);
+    } finally {
+      refreshAllPlatformStatus();
+    }
   };
 
   // 当前启用中的招聘平台数（用于「至少启用一个平台」约束：唯一启用平台禁止取消勾选）
@@ -500,9 +563,15 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
 
   const refreshBridge = async () => {
     setBridgeLoading(true);
-    const s = await bridgeStatus();
-    setBridge(s as any);
-    setBridgeLoading(false);
+    // M-37：失败必须复位 loading 且给出降级状态（桥为可选模块，未连接属正常）
+    try {
+      const s = await bridgeStatus();
+      setBridge(s as any);
+    } catch {
+      setBridge({ ok: false } as any);
+    } finally {
+      setBridgeLoading(false);
+    }
   };
 
   const testConnection = async () => {
@@ -525,6 +594,80 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
       setTesting(false);
     }
   };
+
+  // ===== 网关能力动态探测（modelCapabilities.ts / capabilitiesStore.ts）=====
+  // 本地网关 / 自定义 OpenAI 兼容端点：思考开关、上下文窗口、文本/图像/工具能力无法离线猜测，
+  // 拉一次 GET {baseUrl}/models 拿网关声明。探测结果持久化到 localStorage（跨重启有效），
+  // 失败不缓存 —— 模型名/端点改了就重新探测。
+  const [probing, setProbing] = useState(false);
+  const [probeResult, setProbeResult] = useState<CapabilityProbeResult | null>(null);
+  // 模型名 / Base URL 变更 → 作废旧探测结果 + 缓存（防旧能力误用），并静默重探（缓存命中则不发请求）。
+  // ref 初始为 ''：组件挂载即触发一次探测（已配置时），让思考开关/上下文/能力徽标立即反映网关声明。
+  // apiKey 不入依赖：/v1/models 通常无需鉴权或宽松放行，且随密码框逐键重探是浪费。
+  const baseUrlRef = useRef('');
+  const modelRef = useRef('');
+  const probeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 依赖只列 baseUrl / model：apiKey 故意不入 —— /v1/models 通常无需鉴权或宽松放行，
+  // 且随密码框逐键重探是浪费（重新探测可在下次改动 baseUrl/model 或重启时触发）。
+  // eslint-disable react-hooks/exhaustive-deps
+  useEffect(() => {
+    const b = config.model.baseUrl || '';
+    const m = config.model.model || '';
+    if (b === baseUrlRef.current && m === modelRef.current) return;
+    baseUrlRef.current = b;
+    modelRef.current = m;
+    if (!b || !m) {
+      invalidateCapabilitiesCache(b, m);
+      setProbeResult(null);
+      return;
+    }
+    // 输入停顿 ~450ms 后再探测：AutoComplete 每键都触发 onChange，本地网关虽快，
+    // 也不该让每次击键都打一次 /v1/models（失败不缓存，避免疯狂重试）
+    invalidateCapabilitiesCache(b, m);
+    setProbeResult(null);
+    if (probeTimerRef.current) clearTimeout(probeTimerRef.current);
+    probeTimerRef.current = setTimeout(() => {
+      setProbing(true);
+      probeModelCapabilities(b, m, config.model.apiKey || '')
+        .then((r) => setProbeResult(r))
+        .catch(() => {})
+        .finally(() => setProbing(false));
+    }, 450);
+    return () => {
+      if (probeTimerRef.current) clearTimeout(probeTimerRef.current);
+    };
+  }, [config.model.baseUrl, config.model.model]);
+  // eslint-enable react-hooks/exhaustive-deps
+
+  // ===== 模型候选列表：与能力探测解耦 =====
+  // 能力探测要求「baseUrl + 模型名」都非空；但模型候选必须反向先拿到（否则「先填名才能选」死锁）。
+  // 这里只依赖 baseUrl：端点一填好就去拉 /v1/models，把网关模型灌进下拉。
+  // apiKey 不入依赖（通常无需鉴权或宽松放行，逐键重探是浪费）；输入停顿 450ms 再拉。
+  const [gatewayModels, setGatewayModels] = useState<string[]>([]);
+  // apiKey 经 ref 读取：不触发重探测（/v1/models 通常无需鉴权），也避免 exhaustive-deps 噪音。
+  const apiKeyRef = useRef('');
+  useEffect(() => {
+    apiKeyRef.current = config.model.apiKey || '';
+  }, [config.model.apiKey]);
+  useEffect(() => {
+    const b = config.model.baseUrl || '';
+    setGatewayModels([]);
+    if (!b.trim()) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      listGatewayModels(b, apiKeyRef.current)
+        .then((list) => {
+          if (!cancelled) setGatewayModels(list);
+        })
+        .catch(() => {
+          /* 拉取失败保持空候选：用户仍可手输，不影响保存 */
+        });
+    }, 450);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [config.model.baseUrl]);
 
   const onExport = () => {
     const json = exportData();
@@ -633,8 +776,11 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
     if (!file) return;
     try {
       const json = await file.text();
-      const r = importData(json);
+      const r = await importData(json);
       if (!r.ok) { message.error('导入失败：' + (r.error || '格式错误')); return; }
+      // 导入是绕过 persist 写哨兵的直写：必须作废备份基线，否则备份快路径会判「无变化」而跳过，
+      // 导入的数据要等数次心跳才落进备份（见审查 #45）。
+      invalidateLocalBackupBaseline();
       message.success('导入成功，正在刷新数据…');
       setTimeout(() => window.location.reload(), 600);
     } catch (err: any) {
@@ -644,31 +790,68 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
     }
   };
 
-  const onClear = () => {
+  const onClear = async () => {
+    // 先把「会删掉几个克隆音色、占多少」查出来写进弹窗（验收 #9 要求清空前可见）
+    const voiceUsage = await electronApi.mockInterview.voiceUsage();
+    const voiceLine = voiceUsage.ok && voiceUsage.count > 0
+      ? `另有 ${voiceUsage.count} 个克隆音色（${formatSpeechBytes(voiceUsage.bytes)}）会一并删除，删后需重新录制。`
+      : '当前没有克隆音色。';
     Modal.confirm({
       title: '清空全部本地数据？',
-      content: '将删除简历原文、职业画像、投递方向、任务记录与全部设置（包括 LLM 配置）。此操作不可恢复，建议先导出备份。',
+      content:
+        '将删除简历原文、职业画像、投递方向、任务记录与全部设置（包括 LLM 配置），' +
+        '以及 <userData>/queue/ 下的岗位队列文件（issue #10 起队列不再放在 localStorage）。' +
+        '并删除 <userData>/mock-interview/ 下的全部模拟面试记录、题库（含你导入/自建的题库与索引缓存）。' +
+        voiceLine +
+        '此操作不可恢复，建议先分别导出「JSON 备份」与「面试记录」。',
       okText: '确认清空',
       okButtonProps: { danger: true },
       cancelText: '取消',
-      onOk: () => {
-        clearAllData();
+      onOk: async () => {
+        await clearAllData();
         void clearLocalBackup();
+        // 面试记录是主进程文件数据，不在 localStorage 清空范围内，必须单独删目录
+        void clearMockInterviewAll();
+        // 克隆音色的参考音频在 speech/voices/，不在面试目录里（模型包保留，避免重下 163MB）
+        void electronApi.mockInterview.voiceClear();
         message.success('已清空本地数据，正在刷新…');
         setTimeout(() => window.location.reload(), 600);
       },
     });
   };
 
+  const onExportMockInterview = async () => {
+    const r = await exportMockSessions();
+    if (r.canceled) return;
+    if (!r.ok) { message.error('导出面试记录失败：' + (r.error || '未知错误')); return; }
+    message.success(`已导出 ${r.count || 0} 场面试记录：${r.filePath || ''}`);
+  };
+
   const llmReady = isLLMConfigured();
+
+  // ===== 模型名称下拉选项（预设 ∪ 网关探测列表）=====
+  // 自定义 / 本地网关端点的预设列表为空（PROVIDER_DEFAULTS.custom.models = []），
+  // 动态探测（/v1/models）已拿到网关全部模型 id —— 合并进下拉，让用户可点选而非只能手输。
+  // 探测未完成 / 失败时只剩预设列表（退化为现状）。去重保持顺序：预设在前，探测结果在后。
+  const modelOptions = [
+    ...(PROVIDER_DEFAULTS[config.model.provider as LLMProvider]?.models || []),
+    ...gatewayModels,
+    ...(probeResult?.ok ? probeResult.models : []),
+  ].filter((v, i, arr) => arr.indexOf(v) === i);
 
   // ===== 思考强度（唯一判据见 lib/bossclaw/thinkingCapability.ts）=====
   // 能力只由「服务商 + 模型名」决定：未验证支持的模型恒为关闭，且请求侧也不会发任何思考参数
   // —— 即使 localStorage 里残留 enabled:true，UI 与实际请求都按关闭处理（开关不可用）。
+  // 自定义 / 本地网关端点：优先用 /v1/models 动态探测的能力（probeResult / 缓存），
+  // 探测未完成或失败时回落到静态前缀判定。
+  const discoveredCapability = probeResult?.ok && probeResult.capability
+    ? { reasoning: probeResult.capability.reasoning, reasoningLevels: probeResult.capability.reasoningLevels }
+    : getCachedCapability(config.model.baseUrl, config.model.model);
   const thinkingProfile = resolveThinkingProfile(
     config.model.provider,
     config.model.model,
     config.model.baseUrl,
+    discoveredCapability || undefined,
   );
   const thinkingSupported = thinkingProfile.mode !== 'unsupported';
   const thinkingOn = isThinkingActive(thinkingProfile, config.model.thinking);
@@ -708,6 +891,10 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
   // ===== 开机自启动 & 本地备份目录 =====
   const [autostart, setAutostart] = useState<boolean | null>(null);
   const [backupDir, setBackupDir] = useState('');
+  // ===== 版本与更新 =====
+  const [appVersion, setAppVersion] = useState('');
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
   useEffect(() => {
     electronApi.autostart
       .get()
@@ -718,7 +905,26 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
       .get()
       .then(setQualifiedJobsDir)
       .catch(() => setQualifiedJobsDir(''));
+    // 版本号只用于展示，读不到不影响任何功能
+    electronApi.getAppInfo().then((info) => setAppVersion(String(info?.version || ''))).catch(() => {});
   }, []);
+
+  // 检查更新：force=true 才能绕开 6 小时缓存（用户主动点了按钮就该真去查）
+  const onCheckUpdate = useCallback(async () => {
+    setUpdateChecking(true);
+    try {
+      const r = await checkForUpdates(true);
+      setUpdateResult(r);
+      if (!r.ok) message.warning(r.error || '检查更新失败');
+      else if (r.hasUpdate) message.success(`发现新版本 v${r.latest}`);
+      else message.success(`已是最新版本（v${r.current}）`);
+    } catch (e: unknown) {
+      setUpdateResult({ ok: false, current: appVersion, error: e instanceof Error ? e.message : String(e) });
+      message.warning('检查更新失败');
+    } finally {
+      setUpdateChecking(false);
+    }
+  }, [appVersion]);
 
   const onToggleAutostart = async (v: boolean) => {
     try {
@@ -848,6 +1054,78 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
             <Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0, fontSize: 13 }}>
               开启后，Windows 登录时将自动启动 BossClaw（打包安装版生效）。配合「定时任务」可在应用保持运行时按设定时刻自动投递 / 采集 / 备份。
             </Paragraph>
+          </div>
+
+          <div className="settings-section-card">
+            <div className="settings-section-header">
+              <div className="settings-section-header__title">
+                <div className="section-icon-box">
+                  <BellOutlined />
+                </div>
+                后台运行与通知
+              </div>
+            </div>
+            <div className="safety-grid">
+              <div className="sg-item">
+                <span className="field-label">关闭窗口时收进系统托盘</span>
+                <Switch
+                  checked={config.closeToTray !== false}
+                  onChange={(v) => setConfig({ closeToTray: v })}
+                />
+              </div>
+              <div className="sg-item">
+                <span className="field-label">关键事件发送系统通知</span>
+                <Switch
+                  checked={config.systemNotify !== false}
+                  onChange={(v) => setConfig({ systemNotify: v })}
+                />
+              </div>
+              <div className="sg-item">
+                <span className="field-label">HR 回复提醒</span>
+                <Switch
+                  checked={config.hrReplyNotify !== false}
+                  disabled={config.systemNotify === false}
+                  onChange={(v) => setConfig({ hrReplyNotify: v })}
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="settings-section-card">
+            <div className="settings-section-header">
+              <div className="settings-section-header__title">
+                <div className="section-icon-box">
+                  <CloudDownloadOutlined />
+                </div>
+                版本与更新
+              </div>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+              <span className="field-label">当前版本 {appVersion || '读取中…'}</span>
+              <Space>
+                {updateResult?.ok && updateResult.hasUpdate ? (
+                  <Button type="primary" onClick={() => openReleasesPage(updateResult.url)}>
+                    前往下载 v{updateResult.latest}
+                  </Button>
+                ) : null}
+                <Button icon={<SyncOutlined />} loading={updateChecking} onClick={onCheckUpdate}>
+                  检查更新
+                </Button>
+              </Space>
+            </div>
+            {updateResult && !updateResult.ok ? (
+              <Alert
+                style={{ marginTop: 12 }}
+                type="warning"
+                showIcon
+                message={updateResult.error || '检查更新失败'}
+              />
+            ) : null}
+            {updateResult?.ok && !updateResult.hasUpdate ? (
+              <Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0, fontSize: 13 }}>
+                已是最新版本（v{updateResult.current}）。
+              </Paragraph>
+            ) : null}
           </div>
 
           <div className="settings-section-card">
@@ -990,6 +1268,22 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
                       >
                         退出
                       </Button>
+                      {config.engineMode === 'camoufox' && (
+                        <Button
+                          size="small"
+                          icon={<QrcodeOutlined />}
+                          loading={Boolean(cfxPlatformLogining[p])}
+                          disabled={cfxLoggedIn || !st?.ready}
+                          onClick={() => onPlatformCamoufoxLogin(p)}
+                        >
+                          {cfxLoggedIn ? '隐身已登录' : '隐身扫码登录'}
+                        </Button>
+                      )}
+                      {config.engineMode === 'camoufox' && cfxLoggedIn && (
+                        <Button size="small" danger onClick={() => onPlatformCamoufoxLogout(p)}>
+                          退出隐身
+                        </Button>
+                      )}
                     </div>
                     <table style={{ marginTop: 8, width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                       <thead>
@@ -1006,7 +1300,7 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
                           </td>
                         </tr>
                         <tr>
-                          <td style={{ padding: '4px 8px' }}>自动沟通（Camoufox 隐身）</td>
+                          <td style={{ padding: '4px 8px' }}>采集 / 自动沟通（Camoufox 隐身）</td>
                           <td style={{ padding: '4px 8px' }}>
                             <Tag color={cfxLoggedIn ? 'green' : 'default'} style={{ margin: 0 }}>
                               {!st?.ready ? '引擎未就绪' : (cfxLoggedIn ? '已登录' : '未登录')}
@@ -1082,12 +1376,35 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
                 />
               </div>
               <div className="sg-item">
-                <span className="field-label">薪资期望</span>
+                <span className="field-label">
+                  薪资期望
+                  <Tooltip title="按月薪填写（如 15-25K）。BOSS 按 BOSS 档位映射；猎聘只认年薪档，月薪区间会自动换算为年薪自定义区间（15-25K → 18-30万）；只填单值（如 20K）时猎聘侧不附加筛选。">
+                    <InfoCircleOutlined className="field-label__hint" />
+                  </Tooltip>
+                </span>
                 <Input
                   value={config.salary}
                   onChange={(e) => setConfig({ salary: e.target.value })}
                   placeholder="不限 / 15-25K"
                 />
+              </div>
+              {/* 薪资单位切换：属「薪资口径」设置，与上面的「薪资期望」同区更合语义。
+                  原先它挂在「硬性智能过滤」卡片里，会让该卡片多出孤零零的第 3 行（右侧两格留白），
+                  故移到这里；卡片内「最低日薪」输入框右侧的「元/天」徽标仍可一键切换（同一动作）。 */}
+              <div className="sg-item">
+                <span className="field-label">
+                  最低薪资筛选单位
+                  <Tooltip title="决定「硬性智能过滤 → 最低薪资」按日薪还是月薪比较：日薪档位细、适合兼职/实习；月薪档位贴近绝大多数全职岗位。切换会同步换算当前阈值，也可直接点「最低薪资」输入框右侧的单位徽标切换。">
+                    <InfoCircleOutlined className="field-label__hint" />
+                  </Tooltip>
+                </span>
+                <Button
+                  icon={<SwapOutlined />}
+                  onClick={toggleSalaryMode}
+                  style={{ width: '100%' }}
+                >
+                  {isMonthlySalary ? '切换为日薪' : '切换为月薪'}
+                </Button>
               </div>
               <div className="sg-item">
                 <span className="field-label">求职类型</span>
@@ -1123,7 +1440,12 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
                 />
               </div>
               <div className="sg-item">
-                <span className="field-label">公司规模</span>
+                <span className="field-label">
+                  公司规模
+                  <Tooltip title="猎聘的规模档位与本站不同（1-49 / 50-99 / 100-499 / 500-999 / 1000-2000 / 2000-5000 / 5000-10000 / 10000人以上）：「0-20人」按猎聘「1-49人」筛；「20-99人」「1000-9999人」跨多个猎聘档位，无法单值表达，猎聘侧不附加筛选（宁可多召回）。智联 / 前程无忧各自独立映射。">
+                    <InfoCircleOutlined className="field-label__hint" />
+                  </Tooltip>
+                </span>
                 <Select
                   style={{ width: '100%' }}
                   value={config.companyScale || '不限'}
@@ -1137,7 +1459,7 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
               <div className="sg-item">
                 <span className="field-label">
                   公司性质
-                  <Tooltip title="智联招聘已接通（国企 / 外企 / 民营 / 中外合资 / 港澳台企业 / 机关/事业单位 / 其他）；猎聘 / 前程无忧暂不支持该项，选择后不会附加筛选。">
+                  <Tooltip title="智联招聘（国企 / 外企 / 民营 / 中外合资 / 港澳台企业 / 机关·事业单位 / 其他）与猎聘（外企 / 中外合资 / 民营 / 国企 / 其他）已接通；「港澳台企业」「机关/事业单位」在猎聘无对应项，猎聘侧不附加筛选；前程无忧暂不支持该项。">
                     <InfoCircleOutlined className="field-label__hint" />
                   </Tooltip>
                 </span>
@@ -1151,7 +1473,7 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
               <div className="sg-item">
                 <span className="field-label">
                   融资阶段
-                  <Tooltip title="智联招聘已接通（不需要融资 / 未融资 / 有融资）；猎聘 / 前程无忧暂不支持该项，选择后不会附加筛选。">
+                  <Tooltip title="两套口径互不通用，按目标平台各填各的：智联（不需要融资 / 未融资 / 有融资）；猎聘（天使轮 / A轮 / B轮 / C轮 / D轮及以上 / 已上市 / 战略融资 / 融资未公开）。选了某平台不认的取值时，该平台侧不附加筛选；前程无忧暂不支持该项。">
                     <InfoCircleOutlined className="field-label__hint" />
                   </Tooltip>
                 </span>
@@ -1160,7 +1482,10 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
                   style={{ width: '100%' }}
                   value={config.financing}
                   onChange={(v) => setConfig({ financing: v })}
-                  options={['不限', '不需要融资', '未融资', '有融资'].map((x) => ({ label: x, value: x }))}
+                  options={[
+                    '不限', '不需要融资', '未融资', '有融资',
+                    '天使轮', 'A轮', 'B轮', 'C轮', 'D轮及以上', '已上市', '战略融资', '融资未公开',
+                  ].map((x) => ({ label: x, value: x }))}
                   tokenSeparators={[',', '，', '、']}
                 />
               </div>
@@ -1208,7 +1533,12 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
                 />
               </div>
               <div className="sg-item">
-                <span className="field-label">HR 活跃度过滤</span>
+                <span className="field-label">
+                  HR 活跃度过滤
+                  <Tooltip title="BOSS 按页面活跃度文本过滤（采集后筛选）；猎聘已接通，映射为平台「招聘者活跃」时间窗（一天 / 三天 / 一周 / 一个月以内，仅在线无对应窗口）。智联 / 前程无忧暂不适用。">
+                    <InfoCircleOutlined className="field-label__hint" />
+                  </Tooltip>
+                </span>
                 <Select
                   style={{ width: '100%' }}
                   value={config.hrActivityFilter || 'any'}
@@ -1259,14 +1589,23 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
                 />
               </div>
               <div className="sg-item">
-                <span className="field-label">薪资单位切换</span>
-                <Button
-                  icon={<SwapOutlined />}
-                  onClick={toggleSalaryMode}
-                  style={{ width: '100%' }}
-                >
-                  {isMonthlySalary ? '切换为日薪' : '切换为月薪'}
-                </Button>
+                <span className="field-label">
+                  排除已过截止日期岗位
+                  <Tooltip title="猎聘 JD 正文末尾常带「截止日期：2027年07月16日」。开启后，命中该字段且日期早于今天的岗位会被硬性排除（截止日当天仍有效），不再消耗 AI 分析 Token 与投递配额。仅在 JD 明确写出截止日期时才判定——未写截止日期、或写成「长期有效 / 招满即止」的岗位一律照常放行；该字段是猎聘 JD 的常见形态，故默认开启。">
+                    <InfoCircleOutlined className="field-label__hint" />
+                  </Tooltip>
+                </span>
+                {/* 开关类字段纵向排布会在控件行留出大片空白、与同排输入框不成列；
+                    改为「标签在左、开关在右」单行内联布局（见 .sg-item--inline）。 */}
+                <div className="sg-item__switch">
+                  <Switch
+                    checked={isExpiryFilterOn}
+                    onChange={(v) => {
+                      setConfig({ excludeExpiredJobs: v });
+                      message.info(v ? '已开启：JD 截止日期已过的岗位将被跳过' : '已关闭：不再按 JD 截止日期过滤岗位');
+                    }}
+                  />
+                </div>
               </div>
             </div>
           </div>
@@ -1461,7 +1800,12 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
               </div>
             </div>
             <Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0, fontSize: 13 }}>
-              开启后，每次「搜索采集」会自动将 BOSS 岗位列表向下滑动以加载无限列表。已入库岗位将自动根据 URL 去重跳过。
+              开启后，每次「搜索采集」会自动将岗位列表向下滑动以加载更多。已入库岗位将自动根据 URL 去重跳过。
+            </Paragraph>
+            <Paragraph type="secondary" style={{ marginTop: 6, marginBottom: 0, fontSize: 13 }}>
+              两条采集通道的「加载更多」模型不同：<b>BOSS 直聘是无限加载</b>，滚动会持续追加岗位，轮数调大即可拿到远超首屏的量；
+              <b>猎聘 / 智联 / 前程无忧是真分页</b>，内置浏览器的可视化采集只采第 1 页，要多页请改用
+              Camoufox 隐身采集并在上方「搜索结果页数」里设置翻页数。
             </Paragraph>
           </div>
         </div>
@@ -1522,7 +1866,7 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
                   style={{ width: '100%' }}
                   value={config.model.model}
                   onChange={(v) => { setModel({ model: v }); setTestResult(null); }}
-                  options={(PROVIDER_DEFAULTS[config.model.provider as LLMProvider]?.models || []).map((m) => ({
+                  options={modelOptions.map((m) => ({
                     value: m,
                     label: m,
                   }))}
@@ -1680,8 +2024,57 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
               />
             )}
 
+            {/* 网关能力探测结果：本地 / 自定义 OpenAI 兼容端点经 /v1/models 动态判定能力。
+                徽标展示思考 / 上下文 / 文本 / 图像 / 工具；探测失败时给一行轻提示（不打断配置）。 */}
+            {probing && !probeResult && (
+              <div className="llm-probe-hint" style={{ marginTop: 14 }}>
+                <span className="llm-probe-hint__spinner" aria-hidden />
+                正在探测网关模型能力…
+              </div>
+            )}
+            {!probing && probeResult && probeResult.ok && probeResult.capability && (
+              <div className="llm-probe-result" style={{ marginTop: 14 }}>
+                <span className="llm-probe-result__model">
+                  {probeResult.capability.displayName || probeResult.capability.id}
+                </span>
+                <span className="llm-cap-badge">
+                  {probeResult.capability.reasoning ? '思考' : '无思考'}
+                  {probeResult.capability.reasoningLevels.length > 0
+                    ? `（${probeResult.capability.reasoningLevels.join('/')}）`
+                    : ''}
+                </span>
+                {probeResult.capability.contextWindow > 0 && (
+                  <span className="llm-cap-badge">
+                    上下文 {formatTokenCount(probeResult.capability.contextWindow)}
+                  </span>
+                )}
+                <span className="llm-cap-badge">
+                  {probeResult.capability.inputModalities.includes('image') ? '图' : '文'}
+                  {' → '}
+                  {probeResult.capability.outputModalities.join('/') || '文本'}
+                </span>
+                <span className="llm-cap-badge">
+                  {probeResult.capability.toolCall ? '支持工具调用' : '不支持工具'}
+                </span>
+              </div>
+            )}
+            {!probing && probeResult && !probeResult.ok && (
+              <Alert
+                style={{ marginTop: 14, borderRadius: 8 }}
+                type="warning"
+                showIcon
+                message="网关能力探测未完成"
+                description={
+                  probeResult.notes.join('；') ||
+                  (probeResult.error
+                    ? `探测失败：${probeResult.error}`
+                    : '模型名在网关返回的模型列表中未找到，思考开关将按未验证处理')
+                }
+              />
+            )}
+
             <Paragraph type="secondary" style={{ marginTop: 14, marginBottom: 0, fontSize: 13 }}>
-              🔒 API Key 仅加密保存在本机 localStorage，绝不会上传至第三方服务器。未配置时职业画像与岗位匹配将自动回退到本地规则初稿。
+              🔒 API Key 保存在本机 localStorage（<strong>明文存储，应用未做额外加密</strong>），仅用于直连你在上方配置的模型服务商，绝不会上传至第三方服务器；请避免在共用设备上使用。未配置时职业画像与岗位匹配将自动回退到本地规则初稿。
             </Paragraph>
           </div>
 
@@ -1704,7 +2097,7 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
               <div className="ai-cache-banner__content">
                 <div className="ai-cache-banner__title">智能本地结果缓存与 Context 节约</div>
                 <div className="ai-cache-banner__desc">
-                  职业画像、岗位分析与求职招呼语生成结果均加密保存在本机。相同输入（简历/画像/岗位/提示词均未变）时<strong>直接复用缓存（0 延迟、0 Token 计费）</strong>；更新简历或提示词后将自动重新计算生成。
+                  职业画像、岗位分析与求职招呼语生成结果均保存在本机（<strong>明文存储</strong>）。相同输入（简历/画像/岗位/提示词均未变）时<strong>直接复用缓存（0 延迟、0 Token 计费）</strong>；更新简历或提示词后将自动重新计算生成。
                 </div>
               </div>
             </div>
@@ -1993,6 +2386,13 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
                 <div className="field-group__title">
                   <RobotOutlined className="fg-icon" /> CloakBrowser 隐身浏览器面板
                 </div>
+                <Alert
+                  type="warning"
+                  showIcon
+                  style={{ borderRadius: 8, marginBottom: 12 }}
+                  message="CloakBrowser 已支持工作台采集，但暂不支持自动投递"
+                  description="采集链路已接入该通道；发送招呼 / 附件等投递动作仍需切换到 WebView 或 Camoufox 引擎。"
+                />
                 <div className="setting-actions" style={{ marginBottom: 12 }}>
                   <Space>
                     <Button size="middle" onClick={refreshCloakBinary} loading={cloakBinaryLoading}>
@@ -2028,86 +2428,106 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
               </div>
             )}
 
-            {config.engineMode === 'camoufox' && (
-              <div className="field-group" style={{ marginTop: 14 }}>
-                <div className="field-group__title">
-                  <ThunderboltOutlined className="fg-icon" /> Camoufox 隐身引擎面板
-                </div>
-                <div className="setting-actions" style={{ marginBottom: 12 }}>
-                  <Space>
-                    <Button size="middle" onClick={() => refreshCamoufox()} loading={cfxLoading}>
-                      检测状态
+            {/* issue #7 P0：面板常驻渲染。原先包在 `engineMode === 'camoufox'` 里，
+                默认 WebView 模式下整块不存在 —— 用户「找不到翻页设置」的根因。 */}
+            <div className="field-group" style={{ marginTop: 14 }}>
+              <div className="field-group__title">
+                <ThunderboltOutlined className="fg-icon" /> Camoufox 隐身引擎面板
+                <Tag
+                  color={config.engineMode === 'camoufox' ? 'green' : 'default'}
+                  style={{ marginLeft: 8 }}
+                >
+                  {config.engineMode === 'camoufox' ? '当前引擎' : '当前未启用'}
+                </Tag>
+              </div>
+              {config.engineMode !== 'camoufox' && (
+                <Paragraph type="secondary" style={{ margin: '0 0 10px', fontSize: 12 }}>
+                  下列参数暂不生效（当前引擎不是 Camoufox）。搜索结果页数只在切换为 Camoufox 并使用隐身采集时生效；
+                  内置浏览器的可视化采集不分页 —— BOSS 靠页内滚动持续加载，猎聘 / 智联 / 前程无忧只采第 1 页。
+                </Paragraph>
+              )}
+              <div className="setting-actions" style={{ marginBottom: 12 }}>
+                <Space>
+                  <Button size="middle" onClick={() => refreshCamoufox()} loading={cfxLoading}>
+                    检测状态
+                  </Button>
+                  {cfx?.running && (
+                    <Button size="middle" danger icon={<PoweroffOutlined />} onClick={onCamoufoxStop}>
+                      停止桥
                     </Button>
-                    {cfx?.running && (
-                      <Button size="middle" danger icon={<PoweroffOutlined />} onClick={onCamoufoxStop}>
-                        停止桥
-                      </Button>
-                    )}
-                  </Space>
-                </div>
-                {!cfx?.ready && (
-                  <Alert
-                    type="warning"
-                    showIcon
-                    style={{ borderRadius: 8, marginBottom: 10 }}
-                    message="隐身引擎未就绪"
-                    description={cfx?.message || '请先下载 Camoufox 隐身引擎内核（暂未下载），或点击「检测状态」。'}
+                  )}
+                </Space>
+              </div>
+              {/* 未就绪告警只在用户**真的选了 Camoufox** 时给：
+                  面板现在常驻，若 WebView 用户也看到黄色「未就绪」，会误以为哪里坏了。 */}
+              {config.engineMode === 'camoufox' && !cfx?.ready && (
+                <Alert
+                  type="warning"
+                  showIcon
+                  style={{ borderRadius: 8, marginBottom: 10 }}
+                  message="隐身引擎未就绪"
+                  description={cfx?.message || '请先下载 Camoufox 隐身引擎内核（暂未下载），或点击「检测状态」。'}
+                />
+              )}
+              <div className="settings-grid">
+                <div className="sg-item">
+                  <span className="field-label">指纹伪装系统</span>
+                  <Select
+                    style={{ width: '100%' }}
+                    value={cfxConfig.os}
+                    onChange={(v) => setConfig({ camoufox: { ...cfxConfig, os: v } })}
+                    options={[
+                      { label: 'Windows（推荐）', value: 'windows' },
+                      { label: 'macOS', value: 'macos' },
+                      { label: 'Linux', value: 'linux' },
+                    ]}
                   />
-                )}
-                <div className="settings-grid">
-                  <div className="sg-item">
-                    <span className="field-label">指纹伪装系统</span>
-                    <Select
-                      style={{ width: '100%' }}
-                      value={cfxConfig.os}
-                      onChange={(v) => setConfig({ camoufox: { ...cfxConfig, os: v } })}
-                      options={[
-                        { label: 'Windows（推荐）', value: 'windows' },
-                        { label: 'macOS', value: 'macos' },
-                        { label: 'Linux', value: 'linux' },
-                      ]}
-                    />
-                  </div>
-                  <div className="sg-item">
-                    <span className="field-label">隐身搜索页数</span>
-                    <InputNumber
-                      min={1}
-                      max={5}
-                      value={cfxConfig.pages}
-                      onChange={(v) => setConfig({ camoufox: { ...cfxConfig, pages: v ?? 1 } })}
-                      style={{ width: '100%' }}
-                    />
-                  </div>
                 </div>
-                <div className="setting-actions" style={{ marginTop: 12 }}>
-                  <Space wrap>
-                    <Text>优先隐身通道</Text>
-                    <Switch
-                      checked={cfxConfig.prefer}
-                      onChange={(v) => setConfig({ camoufox: { ...cfxConfig, prefer: v } })}
-                    />
-                    <Button
-                      size="middle"
-                      icon={<QrcodeOutlined />}
-                      loading={cfxLogining}
-                      disabled={Boolean(cfx?.engine?.loggedIn) || (!cfx?.ready && !cfxConfig.enabled)}
-                      onClick={onCamoufoxLogin}
-                    >
-                      {cfx?.engine?.loggedIn ? '已登录' : '隐身扫码登录'}
-                    </Button>
-                    <Button
-                      size="middle"
-                      danger
-                      icon={<StopOutlined />}
-                      disabled={!cfx?.engine?.loggedIn}
-                      onClick={onCamoufoxLogout}
-                    >
-                      退出登录
-                    </Button>
-                  </Space>
+                <div className="sg-item">
+                  <span className="field-label">搜索结果页数</span>
+                  <InputNumber
+                    min={1}
+                    max={cfxMaxPages}
+                    value={cfxConfig.pages}
+                    onChange={(v) => setConfig({ camoufox: { ...cfxConfig, pages: v ?? 1 } })}
+                    addonAfter="页"
+                    style={{ width: '100%' }}
+                  />
+                  <Text type="secondary" style={{ display: 'block', marginTop: 4, fontSize: 12 }}>
+                    每个「关键词 × 城市」逐页采集，每页约 {CAMOUFOX_PAGE_SIZE} 条，最多 {cfxMaxPages} 页。
+                    默认 1 页（只采首屏）；搜到的岗位偏少时可调到 3~5 页。
+                    页数调大后，24 小时内采过的组合会重新采集，不会被断点跳过。
+                  </Text>
                 </div>
               </div>
-            )}
+              <div className="setting-actions" style={{ marginTop: 12 }}>
+                <Space wrap>
+                  <Text>优先隐身通道</Text>
+                  <Switch
+                    checked={cfxConfig.prefer}
+                    onChange={(v) => setConfig({ camoufox: { ...cfxConfig, prefer: v } })}
+                  />
+                  <Button
+                    size="middle"
+                    icon={<QrcodeOutlined />}
+                    loading={cfxLogining}
+                    disabled={Boolean(cfx?.engine?.loggedIn) || (!cfx?.ready && !cfxConfig.enabled)}
+                    onClick={onCamoufoxLogin}
+                  >
+                    {cfx?.engine?.loggedIn ? '已登录' : '隐身扫码登录'}
+                  </Button>
+                  <Button
+                    size="middle"
+                    danger
+                    icon={<StopOutlined />}
+                    disabled={!cfx?.engine?.loggedIn}
+                    onClick={onCamoufoxLogout}
+                  >
+                    退出登录
+                  </Button>
+                </Space>
+              </div>
+            </div>
           </div>
 
           <div className="settings-section-card">
@@ -2138,6 +2558,17 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
           </div>
         </div>
       ),
+    },
+
+    {
+      key: 'speech',
+      label: (
+        <span>
+          <AudioOutlined style={{ marginRight: 6 }} />
+          语音
+        </span>
+      ),
+      children: <SpeechSettingsCard active={settingsTab === 'speech'} />,
     },
 
     {
@@ -2180,6 +2611,14 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
                 <Button
                   size="middle"
                   className="btn-uniform"
+                  icon={<DownloadOutlined />}
+                  onClick={() => void onExportMockInterview()}
+                >
+                  导出面试记录
+                </Button>
+                <Button
+                  size="middle"
+                  className="btn-uniform"
                   danger
                   icon={<ClearOutlined />}
                   onClick={onClear}
@@ -2191,6 +2630,7 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
             </div>
             <Paragraph type="secondary" style={{ marginTop: 14, marginBottom: 0, fontSize: 13 }}>
               数据（简历、画像、投递方向、任务记录、偏好设置）全量保存在本机浏览器 localStorage。建议定期导出 JSON 文件备份。
+              模拟面试记录是独立的主进程文件（userData/mock-interview/），不随 JSON 备份导出，请用「导出面试记录」单独备份。
             </Paragraph>
           </div>
 
@@ -2237,6 +2677,8 @@ export default function Settings({ isVisible = true }: { isVisible?: boolean }) 
               每个自然日一个文件（bossclaw-qualified-jobs-YYYY-MM-DD.json）；同一天重复点击只追新增并去重，当日数据累积完整，不跨天重算、不删除。
             </Paragraph>
           </div>
+
+          <StorageUsageCard />
 
           <div className="settings-section-card">
             <div className="settings-section-header">

@@ -31,7 +31,7 @@ import { useSettingsStore } from '@/store/useSettingsStore';
 import electronApi from '@/lib/electronApi';
 import { PLATFORM_META, PLATFORM_IDS, PLATFORM_CHIP_PALETTE, platformEnabled, resolvePlatform, type JobPlatform } from '@/lib/bossclaw/platforms';
 import { isWhitelistedUrl, whitelistSitesOf, WHITELIST_GROUPS, type BrowserSite as BrowserWhitelistSite } from '@/lib/bossclaw/browserWhitelist';
-import { registerBrowser, unregisterBrowser } from '@/lib/browserRegistry';
+import { registerBrowser, unregisterBrowser, type BrowserApplyOutcome } from '@/lib/browserRegistry';
 import CloakView from '@/components/CloakView';
 import BrowserNewTabPage, { type NewTabGroup } from '@/components/BrowserNewTabPage';
 
@@ -135,8 +135,8 @@ export interface WebviewApi {
    * platform-apply，终态经 platform-apply-result 回传 resolve。返回 {ok, stage, external?, code?, message?, error?, tabId}。
    * stage: success | external | skip | stop | risk | failed。
    */
-  platformApply: (url: string, platform: JobPlatform, job: any) => Promise<{
-    ok: boolean; stage: string; external?: boolean; code?: number; message?: string; error?: string; tabId?: string;
+  platformApply: (url: string, platform: JobPlatform, job: any, greeting?: string) => Promise<{
+    ok: boolean; stage: string; external?: boolean; code?: number; message?: string; error?: string; tabId?: string; needsReview?: boolean;
   }>;
   /**
    * 只读探测页面自身的就绪事实（readyState / 岗位卡片命中数 / 选择器计数 / 骨架屏启发式）。
@@ -144,6 +144,12 @@ export interface WebviewApi {
    * 避免事件序列异常时一直误判「加载中」。返回 {error} 表示探测失败（preload 未就绪等）。
    */
   pageStatus: (tabId?: string) => Promise<any>;
+  /**
+   * 只读读取当前页面正文（preload 的 page-read：URL / 标题 / bodyText 前 12k / 列表卡摘要）。
+   * 企业工商信息（P1-5 A 层）用它取公司主页正文，解析放在渲染层（companyProfile.ts）——
+   * 这样解析逻辑能离线回归，而 preload 里的代码没法单测。不滚动、不点击、不改页面。
+   */
+  readPage: (tabId?: string) => Promise<any>;
 }
 
 interface Props {
@@ -245,23 +251,38 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
   // 所有“隐藏遮罩”的定时器到期后先校验序号——期间若发生新导航（序号变化）
   // 则该定时器自动失效，避免旧导航残留的定时器误清新导航的 loading 态（遮罩提前消失/闪烁）。
   const loadSeqRef = useRef<Record<string, number>>({});
+  // 遮罩定时器统一登记 + 卸载清理（审查 #92）：原实现每个导航排的 setTimeout 既不记录也不清理，
+  // 卸载后仍会触发 setState（浪费 + 潜在告警），长会话里还会积累大量已失效的定时器。
+  const overlayTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+  const trackTimeout = useCallback((fn: () => void, ms: number) => {
+    const t = setTimeout(() => {
+      overlayTimersRef.current.delete(t);
+      fn();
+    }, ms);
+    overlayTimersRef.current.add(t);
+    return t;
+  }, []);
+  useEffect(() => () => {
+    for (const t of overlayTimersRef.current) clearTimeout(t);
+    overlayTimersRef.current.clear();
+  }, [trackTimeout]);
   // 立即进入淡出阶段，FADE_MS 后真正卸载节点（带序号校验）
   const hideLoading = useCallback((id: string, seq: number) => {
     setFadingTabs((prev) => { if (prev.has(id)) return prev; const s = new Set(prev); s.add(id); return s; });
-    setTimeout(() => {
+    trackTimeout(() => {
       if ((loadSeqRef.current[id] || 0) !== seq) return; // 期间已有新导航：放弃本次隐藏
       setLoadingTabs((prev) => { if (!prev.has(id)) return prev; const s = new Set(prev); s.delete(id); return s; });
       setFadingTabs((prev) => { if (!prev.has(id)) return prev; const s = new Set(prev); s.delete(id); return s; });
     }, LOADING_FADE_MS);
-  }, []);
+  }, [trackTimeout]);
   // 定时淡出（快照当前序号，到期校验）；被更新的导航接管时自动失效
   const scheduleHide = useCallback((id: string, afterMs: number) => {
     const seq = loadSeqRef.current[id] || 0;
-    setTimeout(() => {
+    trackTimeout(() => {
       if ((loadSeqRef.current[id] || 0) !== seq) return;
       hideLoading(id, seq);
     }, afterMs);
-  }, [hideLoading]);
+  }, [hideLoading, trackTimeout]);
 
   const markLoading = useCallback((id: string, loading: boolean) => {
     if (loading) {
@@ -276,6 +297,11 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
   // 事件回调统一经本 ref 取最新版计时函数
   const loadingCtlRef = useRef({ markLoading, hideLoading, scheduleHide });
   loadingCtlRef.current = { markLoading, hideLoading, scheduleHide };
+
+  // 挂载标记（审查 #91）：投递前就绪探测循环（最长 ~25s、每 300ms 一轮）必须在卸载/关标签后立即退出，
+  // 否则切页后仍在后台空转、并对已卸载组件写状态。
+  const aliveRef = useRef(true);
+  useEffect(() => () => { aliveRef.current = false; }, []);
 
   // 确保 activeId 与 tabs 同步
   const activeTab = useMemo(() => tabs.find((t) => t.id === activeId) ?? tabs[0] ?? null, [tabs, activeId]);
@@ -372,7 +398,18 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
   const registeredTabs = useRef<Record<string, boolean>>({});
   // boss-api 的 seq → resolve 映射
   const apiResolvers = useRef<Map<string, (v: any) => void>>(new Map());
+  // L-28：seq → 超时定时器句柄，供卸载时统一清理（原实现未决 Promise + 定时器最长滞留 26s）
+  const apiTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const seqRef = useRef(0);
+
+  // L-28：卸载时清理未决的 seq 等待与超时定时器 —— 原实现两者都不清理，
+  // 未决 Promise 与定时器最长滞留 26s，且回调在组件卸载后仍会 resolve/操作已卸载状态。
+  useEffect(() => () => {
+    for (const t of apiTimers.current.values()) { try { clearTimeout(t); } catch { /* 忽略 */ } }
+    for (const resolve of apiResolvers.current.values()) { try { resolve({ error: '页面已卸载' }); } catch { /* 忽略 */ } }
+    apiTimers.current.clear();
+    apiResolvers.current.clear();
+  }, []);
 
   // ===== 活跃 tab 引用（始终是最新的）=====
   const activeIdRef = useRef(activeId);
@@ -494,7 +531,11 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
         }
         case 'page-read-result':
         case 'page-status-result':
-        case 'prefill-greeting-result': {
+        case 'prefill-greeting-result':
+        // ui-eval-result：通用 UI 接管（query/click/type/scroll）的回执。此前 preload 侧
+        // webview.cjs 会 notify('ui-eval-result')，但此处漏了该 case → cmdOnce('ui-eval') 的
+        // seq 永不 resolve、必然超时，导致控制桥对内置浏览器的 UI 接管全链路失效（一并修复）。
+        case 'ui-eval-result': {
           const resolve = apiResolvers.current.get(String(payload?.seq));
           if (resolve) {
             apiResolvers.current.delete(String(payload?.seq));
@@ -617,7 +658,7 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
     // 表现为智联等站点的 target=_blank 链接「点了没反应」。真正处理在主进程
     // did-attach-webview 的 guest.setWindowOpenHandler：http(s) 弹窗在当前标签内 loadURL，
     // 其余 deny。此处不再挂无效监听。
-  }, [patchTab, touchTab]); // 唯一依赖是最新的 patchTab / 稳定的 touchTab
+  }, [patchTab, touchTab, reportNavigate, forceResizeWebview]); // 四个都是 `[]` 依赖的稳定 useCallback，列入不会引起重建
 
   // ===== 每标签一个「身份稳定」的 ref 回调 =====
   // 根因（非 BOSS「一键投递」恒报「详情页加载超时」）：
@@ -651,20 +692,23 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
   }, []);
 
   // ===== 创建标签页（多标签版本）=====
-  const createTab = useCallback((url: string, title: string, _activate: boolean, kind: 'main' | 'detail' = 'main'): string => {
+  const createTab = useCallback((url: string, title: string, activate: boolean, kind: 'main' | 'detail' = 'main'): string => {
     const fallbackTitle = PLATFORM_META[resolvePlatform(url)]?.label || 'BOSS直聘';
     const tab = makeTab(url, title || fallbackTitle, kind);
     setTabs((prev) => [...prev, tab]);
-    setActiveId(tab.id);
+    // M-40：原实现忽略 activate 恒抢焦点 —— 后台开引擎标签会打断用户当前浏览（与 CloakView 行为不一致）。
+    // 现按入参决定是否激活；不激活时保持当前激活标签不变。
+    if (activate) setActiveId(tab.id);
+    else setActiveId((prev) => prev || tab.id); // 无激活标签时（首个标签）仍需激活，避免空白
     return tab.id;
   }, []);
 
-  // 白名单拦截：非招聘平台网址不允许在内置浏览器访问，可转系统浏览器
+  // 白名单拦截：非白名单网址不允许在内置浏览器访问，可转系统浏览器
   const confirmOpenExternal = useCallback((url: string) => {
     const host = (() => { try { return new URL(url).hostname; } catch { return url; } })();
     Modal.confirm({
-      title: '该网址不在招聘平台白名单内',
-      content: `「${host}」不在白名单中。内置浏览器仅允许访问白名单内的招聘平台，可在系统浏览器中打开。`,
+      title: '该网址不在内置浏览器白名单内',
+      content: `「${host}」不在白名单中。内置浏览器仅允许访问白名单内的招聘平台与背调核查站点，可在系统浏览器中打开。`,
       okText: '在系统浏览器打开',
       cancelText: '取消',
       onOk: () => { electronApi.external.open(url); },
@@ -687,7 +731,7 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
   // ===== 在新标签打开 URL：默认 detail（沟通详情页，完成后自动关闭）；非白名单网址拦截 =====
   const openInNewTab = useCallback((url?: string, title?: string, kind: 'main' | 'detail' = 'detail'): string => {
     const target = url || BOSS_HOME;
-    // 白名单约束：仅招聘平台网址允许在内置浏览器新建标签（其余可转系统浏览器）
+    // 白名单约束：仅招聘平台与背调核查站点允许在内置浏览器新建标签（其余可转系统浏览器）
     if (url && !isWhitelistedUrl(target)) {
       confirmOpenExternal(target);
       return '';
@@ -736,11 +780,10 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
   // ===== 向指定标签页发送 IPC 消息（按 tabId 真正派发）=====
   const sendInTab = useCallback((id: string, channel: string, ...args: any[]) => {
     const tabId = id || tabsRef.current.find((t) => t.kind === 'main')?.id || tabsRef.current[0]?.id;
-    if (!tabId) return;
+    if (!tabId) return false;
     const el = webviewEls.current[tabId];
-    if (el) {
-      try { el.send(channel, ...args); } catch {}
-    }
+    if (!el) return false;
+    try { el.send(channel, ...args); return true; } catch { return false; }
   }, []);
 
   const send = useCallback((channel: string, ...args: any[]) => {
@@ -870,10 +913,12 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
       const timer = setTimeout(() => {
         if (apiResolvers.current.has(seq)) {
           apiResolvers.current.delete(seq);
+          apiTimers.current.delete(seq);
           resolve({ error: 'boss-api 超时（15s）' });
         }
       }, 16000);
-      apiResolvers.current.set(seq, (payload: any) => { clearTimeout(timer); resolve(payload); });
+      apiTimers.current.set(seq, timer);
+      apiResolvers.current.set(seq, (payload: any) => { clearTimeout(timer); apiTimers.current.delete(seq); resolve(payload); });
       sendInTab(tabIdToUse, 'boss-api', { seq, action, params });
     });
   }, [sendInTab]);
@@ -888,10 +933,12 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
       const timer = setTimeout(() => {
         if (apiResolvers.current.has(seq)) {
           apiResolvers.current.delete(seq);
+          apiTimers.current.delete(seq);
           resolve({ error: `${channel} 超时（${timeoutMs}ms）` });
         }
       }, timeoutMs);
-      apiResolvers.current.set(seq, (payload: any) => { clearTimeout(timer); resolve(payload); });
+      apiTimers.current.set(seq, timer);
+      apiResolvers.current.set(seq, (payload: any) => { clearTimeout(timer); apiTimers.current.delete(seq); resolve(payload); });
       sendInTab(id, channel, { seq, ...args });
     });
   }, [sendInTab]);
@@ -909,7 +956,7 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
   // 一旦该标记因任何原因未置位（详见 handleRegister 上方「身份稳定 ref 回调」的根因说明），
   // 就会把「页面 2s 内早已可用」误判成「详情页加载超时」——本次报告的智联投递失败即此。
   const platformApply = useCallback(
-    (url: string, platform: JobPlatform, job: any): Promise<{ ok: boolean; stage: string; external?: boolean; code?: number; message?: string; error?: string; tabId?: string }> =>
+    (url: string, platform: JobPlatform, job: any, greeting = ''): Promise<{ ok: boolean; stage: string; external?: boolean; code?: number; message?: string; error?: string; tabId?: string; needsReview?: boolean }> =>
       new Promise((resolve) => {
         const tabId = openInNewTab(url, PLATFORM_META[platform]?.label || '岗位投递', 'detail');
         if (!tabId) {
@@ -923,9 +970,11 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
           const timer = setTimeout(() => {
             if (apiResolvers.current.has(seq)) {
               apiResolvers.current.delete(seq);
-              resolve({ ok: false, stage: 'failed', error: 'platform-apply 超时（25s）', tabId });
+              // 猎聘 chat 口径要在会话里完成「填入招呼语 → 可信点击发送 → 确认新增气泡」，
+              // 26s 不够用；超时后一律交人工核对，绝不猜成功。
+              resolve({ ok: false, stage: 'failed', error: '投递结果未在规定时间内确认，请人工核对', needsReview: platform === 'liepin', tabId });
             }
-          }, 26000);
+          }, platform === 'liepin' ? 55000 : 26000);
           apiResolvers.current.set(seq, (payload: any) => {
             clearTimeout(timer);
             resolve({ ...(payload || {}), tabId });
@@ -934,6 +983,7 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
             seq,
             platform,
             job,
+            greeting,
             externalApplyHints: PLATFORM_META[platform]?.externalApplyHints || [],
           });
         };
@@ -941,8 +991,9 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
           let lastProbe: any = null;
           let preloadFlag = false;
           let overlay = false;
-          while (Date.now() - startedAt < APPLY_PAGE_READY_MS) {
+          while (aliveRef.current && Date.now() - startedAt < APPLY_PAGE_READY_MS) {
             await sleep(300);
+            if (!aliveRef.current) break;
             preloadFlag = isPreloadReady(tabId);
             overlay = isLoading(tabId);
             if (preloadFlag && !overlay) { start(); return; } // 快路径：宿主标记齐全，不额外探测
@@ -959,7 +1010,9 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
           resolve({
             ok: false,
             stage: 'failed',
-            error: `详情页加载超时（preload ${preloadFlag ? '就绪' : '未就绪'}，加载遮罩 ${overlay ? '未收敛' : '已隐藏'}${describeApplyProbe(lastProbe)}）`,
+            error: aliveRef.current
+              ? `详情页加载超时（preload ${preloadFlag ? '就绪' : '未就绪'}，加载遮罩 ${overlay ? '未收敛' : '已隐藏'}${describeApplyProbe(lastProbe)}）`
+              : '组件已卸载 / 标签页已关闭，投递探测中止',
             tabId,
           });
         })();
@@ -987,6 +1040,7 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
       bossApi,
       platformApply,
       pageStatus,
+      readPage,
       getActiveTabId: () => activeIdRef.current || '',
       getFirstTabId: () => tabsRef.current[0]?.id || '',
       // 多平台采集入口复用标签：优先 main 标签（detail 标签会被空闲回收），其次任意同平台标签
@@ -996,18 +1050,21 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
         return (main || list.find((t) => resolvePlatform(t.url) === platform))?.id || '';
       },
     };
-  }, [apiRef, send, loadURL, closeTabById, openInNewTab, openEngineTab, loadURLInTab, sendInTab, hasTab, isPreloadReady, isLoading, getMainTabId, getDetailTabIds, bossApi, platformApply, pageStatus]);
+  }, [apiRef, send, loadURL, closeTabById, openInNewTab, openEngineTab, loadURLInTab, sendInTab, hasTab, isPreloadReady, isLoading, getMainTabId, getDetailTabIds, bossApi, platformApply, pageStatus, readPage]);
   const prefillGreeting = useCallback((greeting: string) => cmdOnce('prefill-greeting', { greeting }, 20000), [cmdOnce]);
   const runDomDump = useCallback((tabId?: string) => {
     sendInTab(tabId || '', 'webview-command', { action: 'dom-dump' });
     return { ok: true, note: '已触发 DOM 诊断（结果见日志区）' };
   }, [sendInTab]);
-  const sendApply = useCallback((payload: Record<string, any> = {}) => {
+  const sendApply = useCallback((payload: Record<string, any> = {}): Promise<BrowserApplyOutcome> => {
     const id = activeIdRef.current || tabsRef.current[0]?.id || '';
-    if (!id) return Promise.resolve({ ok: false, reason: '无可用标签页' });
-    sendInTab(id, 'start-apply', payload);
+    if (!id) return Promise.resolve({ ok: false, accepted: false, sent: false, reason: '无可用标签页' });
+    if (!sendInTab(id, 'start-apply', payload)) {
+      return Promise.resolve({ ok: false, accepted: false, sent: false, reason: '当前标签页不可用，投递请求未派发' });
+    }
     // domApply 自带招呼语非空/外部网申跳过/气泡确认/风控即停；触发后结果经 apply-stage 回传。
-    return Promise.resolve({ ok: true, hint: '已触发自动投递（domApply），结果见 apply-stage/日志；首次成功会自动暂停验收' });
+    // Electron 的 send() 只确认请求已派发；真实发送结果仍以 preload verify_result 为准。
+    return Promise.resolve({ ok: true, accepted: true, sent: null, hint: '已派发自动投递请求，发送结果见 apply-stage/日志；首次成功会自动暂停验收' });
   }, [sendInTab]);
 
   // ===== 通用 UI 接管（ui-eval）：对 webview 页面执行白名单 DOM 操作（query/click/type/scroll）=====
@@ -1236,6 +1293,15 @@ function BrowserViewImpl({ defaultPlatform = 'boss', onNavigate, onJoinTask, onJ
                 partition="persist:bossclaw"
                 // backgroundThrottling=no：工作台切到其它模块时隐藏但保持挂载，
                 // 禁用 Chromium 后台节流，保证采集/投递的 guest 页 setTimeout/rAF 全速运行
+                //
+                // ⚠️ sandbox=no 为**硬约束，不可改为 yes**（审查 H-13 已评估）：
+                //   electron/preload/webview.cjs 依赖本地 `require('./platform-adapters.cjs')` /
+                //   `require('./humanize.cjs')`；沙箱化 preload 只允许 `require('electron')`，
+                //   本地相对 require 会被禁 → 采集/投递 preload 全废。
+                //   风险与补偿：guest 承载第三方站点且注入 preload 运行在非沙箱上下文，一旦 Chromium
+                //   漏洞被利用影响面更大。补偿措施 = 渲染层 navigate/openExternal 均走
+                //   browserWhitelist.ts 白名单 + 主进程 guest setWindowOpenHandler；宿主主窗口
+                //   （mainWindow.webContents）仍保持默认沙箱。彻底收敛需把 preload 依赖打包内联，属待办。
                 webpreferences="sandbox=no, backgroundThrottling=no"
                 src={t.url}
               />

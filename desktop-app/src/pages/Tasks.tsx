@@ -30,7 +30,7 @@ import { useSettingsStore } from '@/store/useSettingsStore';
 import { useScheduleStore } from '@/store/useScheduleStore';
 import { rerankPending, promoteApprovedToQueue } from '@/lib/bossclaw/priority';
 import { pendingStatusMeta } from '@/lib/bossclaw/taskState';
-import { jobCardStatus, scoreChip } from '@/lib/bossclaw/statusMeta';
+import { jobCardStatus, scoreChip, JOB_ACTION_TIPS } from '@/lib/bossclaw/statusMeta';
 import PlatformChip from '@/components/PlatformChip';
 import { cleanTitle, cleanSalary } from '@/lib/bossclaw/jobDisplay';
 import { detectWorkSchedule } from '@/lib/bossclaw/workSchedule';
@@ -127,6 +127,8 @@ export default function Tasks() {
   const profile = useDataStore((s) => s.profile);
   const updatePending = useDataStore((s) => s.updatePending);
   const setPending = useDataStore((s) => s.setPending);
+  const removePending = useDataStore((s) => s.removePending);
+  const removePendingMany = useDataStore((s) => s.removePendingMany);
   const updateTaskRun = useDataStore((s) => s.updateTaskRun);
   const removeTaskRun = useDataStore((s) => s.removeTaskRun);
   const addLog = useRuntimeLogsStore((s) => s.addLog);
@@ -146,14 +148,18 @@ export default function Tasks() {
     () =>
       rerankPending(pending, config).filter((p) => {
         if (filter !== 'all') return p.status === filter;
+        // 「全部」只展示尚未投递的岗位（与工作台同口径）：sent 是终态，混进总览会让列表越用越长。
+        // 已投递记录完整保留，可通过「已投递」筛选单独查看、逐条删除或一次清理。
+        if (p.status === 'sent') return false;
         return showIgnored || !isHiddenStatus(p.status);
       }),
     [pending, config, filter, showIgnored]
   );
 
   const counts = useMemo(() => {
+    const active = pending.filter((p) => p.status !== 'sent');
     return {
-      all: pending.length,
+      all: showIgnored ? active.length : active.filter((p) => !isHiddenStatus(p.status)).length,
       pending: pending.filter((p) => p.status === 'pending').length,
       approved: pending.filter((p) => p.status === 'approved').length,
       approved_queue: pending.filter((p) => p.status === 'approved_queue').length,
@@ -161,15 +167,39 @@ export default function Tasks() {
       failed: pending.filter((p) => p.status === 'failed').length,
       ignored: pending.filter((p) => ['skipped', 'ignored'].includes(p.status)).length,
     };
-  }, [pending]);
+  }, [pending, showIgnored]);
+
+  // 终态守卫：已投递(sent) / 投递中(approved_queue) 不允许被打回「待确认」或标记忽略 / 跳过，
+  // 否则会造成状态机倒流、污染投递漏斗与统计口径（Workbench 侧已对 sent 做同类防御，此处对齐）。
+  const isTerminalForActions = (status: string) => status === 'sent' || status === 'approved_queue';
+
+  // 「忽略 / 跳过」是同一语义（把岗位从流程里收口）的两个出口，同一行只保留一个，避免并排造成选择困难：
+  // - 待确认 / 待投递 → 忽略（与工作台同口径；跳过留给投递失败的岗位）
+  // - 失败 / 已打开未沟通 / AI 已拒 → 跳过（失败已说明没投成，再给忽略是同义重复）
+  // - 已跳过 / 已忽略 → 两个都不给（已收口，需要恢复请用「重试」）
+  const canIgnoreStatus = (status: PendingStatus) => status === 'pending' || status === 'approved' || status === 'approved_queue';
+  const canSkipStatus = (status: PendingStatus) => status === 'failed' || status === 'opened' || status === 'rejected';
 
   const onRetry = (id: string) => {
-    updatePending(id, { status: 'pending', retryCount: (pending.find((p) => p.id === id)?.retryCount || 0) + 1, error: '' });
+    const cur = pending.find((p) => p.id === id);
+    if (cur && isTerminalForActions(cur.status)) {
+      message.warning('该岗位已投递或正在投递，不能重置为「待确认」');
+      return;
+    }
+    updatePending(id, { status: 'pending', retryCount: (cur?.retryCount || 0) + 1, error: '' });
     addLog('info', '已重置岗位，可重新分析/投递');
     recomputeStats();
   };
-  const onIgnore = (id: string) => { updatePending(id, { status: 'ignored' }); recomputeStats(); };
-  const onSkip = (id: string) => { updatePending(id, { status: 'skipped' }); recomputeStats(); };
+  const onIgnore = (id: string) => {
+    const cur = pending.find((p) => p.id === id);
+    if (cur && isTerminalForActions(cur.status)) { message.warning('该岗位已投递或正在投递，不能忽略'); return; }
+    updatePending(id, { status: 'ignored' }); recomputeStats();
+  };
+  const onSkip = (id: string) => {
+    const cur = pending.find((p) => p.id === id);
+    if (cur && isTerminalForActions(cur.status)) { message.warning('该岗位已投递或正在投递，不能跳过'); return; }
+    updatePending(id, { status: 'skipped' }); recomputeStats();
+  };
   const onApprove = (id: string) => {
     const next = rerankPending(pending.map((p) => p.id === id ? { ...p, status: 'approved' as const, approvedAt: p.approvedAt || Date.now() } : p), useSettingsStore.getState().config);
     setPending(next); message.success('已确认岗位，等待「一键投递」'); recomputeStats();
@@ -179,6 +209,37 @@ export default function Tasks() {
     setPending(next);
     message.info('已撤回岗位，退回「待确认」');
     recomputeStats();
+  };
+
+  // ===== 终态岗位删除（终态清理）=====
+  // sent / failed / skipped / ignored 都是终态：重试/忽略/跳过对它们无意义或无入口，
+  // 此前只有「已投递」能删除，失败与已忽略/已跳过只能永久留存。
+  // 删除仅移除本地记录，不影响已发出的招呼语与平台上的真实投递。
+  const DELETABLE_STATUSES = ['sent', 'failed', 'skipped', 'ignored'];
+  const onDeleteItem = (p: PendingItem) => {
+    if (!DELETABLE_STATUSES.includes(p.status)) { message.warning('仅终态岗位（已投递 / 失败 / 已忽略 / 已跳过）支持删除'); return; }
+    removePending(p.id);
+    addLog('warn', `已删除岗位记录（${STATUS_COLOR[p.status]?.label || p.status}）：${cleanTitle(p.job?.title, p.job?.salary)}${p.job?.company ? ` @ ${p.job.company}` : ''}`);
+    message.success('已删除该岗位记录');
+    recomputeStats();
+  };
+
+  const onClearSent = () => {
+    const sentItems = pending.filter((p) => p.status === 'sent');
+    if (!sentItems.length) { message.info('暂无已投递岗位'); return; }
+    Modal.confirm({
+      title: `清理全部「已投递」岗位（${sentItems.length} 个）？`,
+      content: '仅删除本地岗位记录，不影响已发出的招呼语与平台上的实际投递；删除后「已投递」计数同步减少，且不可恢复。',
+      okText: '确认清理',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: () => {
+        removePendingMany(sentItems.map((p) => p.id));
+        addLog('warn', `已清理 ${sentItems.length} 个已投递岗位记录`);
+        message.success(`已清理 ${sentItems.length} 个已投递岗位`);
+        recomputeStats();
+      },
+    });
   };
 
   // ===== 执行任务列表：开始/继续 + 删除 =====
@@ -272,7 +333,7 @@ export default function Tasks() {
             <span>执行任务列表</span>
           </div>
         }
-        className="mb-16"
+        style={{ marginBottom: 16 }}
         extra={<Text type="secondary" style={{ fontSize: 12 }}>采集任务自动生成 · 投递任务基于已确认的投递方向</Text>}
       >
         {taskRuns.length === 0 ? (
@@ -372,11 +433,23 @@ export default function Tasks() {
               显示已忽略 / 已跳过
             </Checkbox>
             <Text type="secondary" style={{ fontSize: 12 }}>
-              当前显示 <Text strong>{list.length}</Text> / {pending.length} 个岗位
+              当前显示 <Text strong>{list.length}</Text> 个岗位
             </Text>
           </Space>
         </div>
       </Card>
+
+      {/* 已投递筛选下的批量清理入口：独立一行，避免第 4 个按钮挤压上方筛选工具栏 */}
+      {filter === 'sent' && (
+        <div className="delivered-cleanup-bar">
+          <span className="delivered-cleanup-bar__text">
+            共 {counts.sent} 个已投递岗位记录；可逐条删除，也可一次清理全部。
+          </span>
+          <Button size="small" danger type="text" icon={<DeleteOutlined />} onClick={onClearSent} disabled={!counts.sent}>
+            清理已投递
+          </Button>
+        </div>
+      )}
 
       {/* 岗位记录列表 */}
       {list.length === 0 ? (
@@ -467,8 +540,8 @@ export default function Tasks() {
                           <Tooltip
                             title={
                               <div style={{ maxWidth: 360, fontSize: 12 }}>
-                                {p.analysis.hardBlocks.map((b, i) => (
-                                  <div key={i}>· {b}</div>
+                                {p.analysis.hardBlocks.map((b) => (
+                                  <div key={b}>{b}</div>
                                 ))}
                               </div>
                             }
@@ -567,8 +640,9 @@ export default function Tasks() {
                         <CheckOutlined /> 优势匹配
                       </span>
                       <div className="task-prop-chips">
-                        {p.analysis.matchedEvidence.slice(0, 3).map((e, i) => (
-                          <Tooltip key={i} title={e}>
+                        {p.analysis.matchedEvidence.slice(0, 3).map((e) => (
+                          // 审查 §四表 24：条目文案唯一 → 用文本作 key
+                          <Tooltip key={e} title={e}>
                             <span className="task-prop-chip">{e}</span>
                           </Tooltip>
                         ))}
@@ -590,11 +664,11 @@ export default function Tasks() {
                         <WarningOutlined /> 缺口与提醒
                       </span>
                       <div className="task-prop-chips">
-                        {p.analysis.gaps?.slice(0, 4).map((g, i) => {
+                        {p.analysis.gaps?.slice(0, 4).map((g) => {
                           const { name, note } = splitGapWithNote(g);
                           return (
                             <Tooltip
-                              key={i}
+                              key={g}
                               title={
                                 <div style={{ maxWidth: 320 }}>
                                   <div>{g}</div>
@@ -607,7 +681,8 @@ export default function Tasks() {
                           );
                         })}
                         {p.analysis.risks?.map((r, i) => (
-                          <Tooltip key={`risk-${i}`} title={r}>
+                          // L-30：纯索引 key 在刷新后会导致节点复用错位；以内容为主键
+                          <Tooltip key={`risk-${r}-${i}`} title={r}>
                             <span className="task-prop-chip task-prop-chip--risk">{r}</span>
                           </Tooltip>
                         ))}
@@ -634,18 +709,60 @@ export default function Tasks() {
               {/* 操作按钮栏 */}
               <div className="job-actions job-actions--tasks">
                 <div className="task-actions-left">
-                  <Button size="small" className="task-ghost-btn" icon={<EyeOutlined />} onClick={() => p.job?.url && electronApi.external.open(p.job.url)}>
-                    查看详情
-                  </Button>
-                  <Button size="small" className="task-ghost-btn" icon={<ReloadOutlined />} onClick={() => onRetry(p.id)}>
-                    重试
-                  </Button>
-                  <Button size="small" className="task-ghost-btn" icon={<StopOutlined />} onClick={() => onIgnore(p.id)}>
-                    忽略
-                  </Button>
-                  <Button size="small" className="task-ghost-btn" icon={<ForwardOutlined />} onClick={() => onSkip(p.id)}>
-                    跳过
-                  </Button>
+                  <Tooltip title={JOB_ACTION_TIPS.openExternal}>
+                    <Button size="small" className="task-ghost-btn" icon={<EyeOutlined />} onClick={() => p.job?.url && electronApi.external.open(p.job.url)}>
+                      查看详情
+                    </Button>
+                  </Tooltip>
+                  <Tooltip title={JOB_ACTION_TIPS.retry}>
+                    <Button size="small" className="task-ghost-btn" icon={<ReloadOutlined />} onClick={() => onRetry(p.id)} disabled={isTerminalForActions(p.status)}>
+                      重试
+                    </Button>
+                  </Tooltip>
+                  {canIgnoreStatus(p.status) && (
+                    <Tooltip title={JOB_ACTION_TIPS.ignore}>
+                      <Button size="small" className="task-ghost-btn" icon={<StopOutlined />} onClick={() => onIgnore(p.id)} disabled={isTerminalForActions(p.status)}>
+                        忽略
+                      </Button>
+                    </Tooltip>
+                  )}
+                  {canSkipStatus(p.status) && (
+                    <Tooltip title={JOB_ACTION_TIPS.skip}>
+                      <Button size="small" className="task-ghost-btn" icon={<ForwardOutlined />} onClick={() => onSkip(p.id)} disabled={isTerminalForActions(p.status)}>
+                        跳过
+                      </Button>
+                    </Tooltip>
+                  )}
+                  {/* 已投递为终态：其余动作均禁用，只保留「删除」，作为终态记录的唯一出口 */}
+                  {p.status === 'sent' && (
+                    <Popconfirm
+                      title="删除该已投递岗位？"
+                      description="仅删除本地记录，不影响已发出的招呼语与平台上的实际投递；删除后「已投递」计数同步减少。"
+                      okText="确认删除"
+                      cancelText="取消"
+                      okButtonProps={{ danger: true }}
+                      onConfirm={() => onDeleteItem(p)}
+                    >
+                      <Button size="small" danger className="task-ghost-btn" icon={<DeleteOutlined />}>
+                        删除
+                      </Button>
+                    </Popconfirm>
+                  )}
+                  {/* 失败 / 已忽略 / 已跳过：重试之外再给删除出口，避免长期堆积（与工作台同口径） */}
+                  {['failed', 'skipped', 'ignored'].includes(p.status) && (
+                    <Popconfirm
+                      title="删除该岗位记录？"
+                      description="仅删除本地记录，不影响平台上的实际投递；删除后相关计数同步减少。"
+                      okText="确认删除"
+                      cancelText="取消"
+                      okButtonProps={{ danger: true }}
+                      onConfirm={() => onDeleteItem(p)}
+                    >
+                      <Button size="small" danger className="task-ghost-btn" icon={<DeleteOutlined />}>
+                        删除
+                      </Button>
+                    </Popconfirm>
+                  )}
                 </div>
                 <div className="task-actions-right">
                   {p.status === 'pending' ? (
@@ -705,7 +822,8 @@ export default function Tasks() {
         {detailModal && detailModal.kind === 'match' && (
           <ul className="detail-modal-list">
             {(detailModal.item.analysis?.matchedEvidence || []).map((e, i) => (
-              <li key={i} className="detail-modal-item detail-modal-item--match">
+              // 审查 §四表 24：条目为唯一文案 → 用文本作 key（`i` 仅用于展示序号）
+              <li key={e} className="detail-modal-item detail-modal-item--match">
                 <span className="detail-modal-idx">{i + 1}</span>
                 <span className="detail-modal-text">{e}</span>
               </li>
@@ -718,7 +836,8 @@ export default function Tasks() {
               {(detailModal.item.analysis?.gaps || []).map((g, i) => {
                 const { name, note } = splitGapWithNote(g);
                 return (
-                  <li key={i} className="detail-modal-item">
+                  // 审查 §四表 24：缺口原文（g）在同一条目内唯一 → 用它作 key（`i` 仅用于序号）
+                  <li key={g} className="detail-modal-item">
                     <span className="detail-modal-idx">{i + 1}</span>
                     <div className="detail-modal-gap">
                       <span className={'detail-modal-gap-name' + (g.startsWith('表达缺口') ? ' detail-modal-gap-name--expr' : '')}>{name}</span>
@@ -735,7 +854,8 @@ export default function Tasks() {
                 </div>
                 <ul className="detail-modal-list">
                   {(detailModal.item.analysis.risks || []).map((r, i) => (
-                    <li key={i} className="detail-modal-item detail-modal-item--risk">
+                    // 审查 §四表 24：风险文案唯一 → 用文本作 key（`i` 仅用于序号）
+                    <li key={r} className="detail-modal-item detail-modal-item--risk">
                       <span className="detail-modal-idx">{i + 1}</span>
                       <span className="detail-modal-text">{r}</span>
                     </li>

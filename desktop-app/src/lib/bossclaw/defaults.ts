@@ -43,7 +43,20 @@ export const DEFAULT_CONFIG: AppConfig = {
   financing: [],
   sendResumeImage: true,
   sendOnlineResume: false,
+  // 关窗收进托盘：让定时任务 / 投递引擎在窗口隐藏后继续跑（设置页可关，关掉即关窗退出）
+  closeToTray: true,
+  // 系统通知：首次投递验收 / 风控暂停 / 定时任务完成时弹一条，用户不必一直盯着窗口
+  systemNotify: true,
+  // HR 回复提醒：AI 跟聊扫到 HR 新消息时弹一条（同会话 10 分钟内聚合一次）。
+  // 默认开 —— 「HR 回了什么」用户完全看不到，是通知基建最该补的洞；嫌吵可在设置页单独关掉。
+  hrReplyNotify: true,
   betweenJobsSeconds: 20,
+  // 活跃时段（模拟真人作息）：时段外自动暂停投递。
+  // 依据：操作时间戳分布是**服务端可见的账号级长期统计**，指纹补丁掩盖不了「24 小时无睡眠」；
+  // 且「每天精确同一分钟开始/结束」本身也是机器特征，故默认带每日 ±25 分钟确定性抖动。
+  activeHours: { enabled: true, startHour: 8, endHour: 23, jitterMinutes: 25 },
+  // 批次休息：连续投递 15 个后长休息 8–15 分钟（真人不会连续上百次不中断）。
+  batchRest: { enabled: true, everyNJobs: 15, minMinutes: 8, maxMinutes: 15 },
   attachmentDelaySeconds: 4,
   // 沟通阶段卡住超时（秒）：默认 60s（1 分钟，09-16 由 180s 收紧）。
   // 投递常「立即沟通/继续沟通」整页跳转聊天页，聊天窗口渲染慢时留给它时间；
@@ -62,6 +75,10 @@ export const DEFAULT_CONFIG: AppConfig = {
   minSalaryPerMonth: 0,
   // 猎头过滤（对齐 AI-BossJob 的 excludeHeadhunters，默认关闭）
   excludeHeadhunters: false,
+  // 排除「JD 已过截止日期」的岗位（确定性硬约束）：默认开启 —— 触发源是猎聘 JD 里显式的
+  // 「截止日期：YYYY年MM月DD日」字段，过期岗位无投递价值。判定只在 JD 写了截止日期时生效，
+  // 未写 / 日期不可解析一律放行（见 jobExpiry.ts），因此对没有该字段的平台零副作用。
+  excludeExpiredJobs: true,
   // 搜索采集自动下拉加载更多岗位（默认开启，解决「收集太少」问题）
   listAutoScroll: true,
   listScrollRounds: 12,
@@ -161,7 +178,16 @@ export const DEFAULT_WORKFLOW: Workflow = {
   activeRunId: null,
 };
 
-export const today = () => new Date().toISOString().slice(0, 10);
+/**
+ * 本地日历日（`YYYY-MM-DD`）。
+ * ⚠️ 不能用 `new Date().toISOString().slice(0, 10)`（审查 §四·25）—— `toISOString()` 取的是
+ * **UTC** 日期，东八区 00:00–08:00 会得到「昨天」，使每日统计/重置基准错位一天。
+ */
+export const today = () => {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
 
 export const uniq = (items: (string | undefined | null)[] = []) =>
   [...new Set(items.filter(Boolean))] as string[];

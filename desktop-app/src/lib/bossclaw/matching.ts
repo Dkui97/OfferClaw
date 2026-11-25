@@ -20,6 +20,17 @@ import { allocateContextBudget, fitContextToTokens } from './contextBudget';
 import { prepareContextText } from './oversizedContext';
 import type { Decision } from './types';
 
+/**
+ * 启用「AI 整体分 × AI 维度加权分」融合所需的**最小 AI 维度覆盖度**（审查 #3）。
+ *
+ * 覆盖度 = AI 实际给出的维度权重 / AI 五维总权重（skill .34 / direction .28 / salary .14 /
+ * education .08 / experience .06）。取 0.6 的语义：AI 必须给出覆盖 ≥60% 权重的维度
+ * （实际等价于「技能 + 方向」两个主维都在，或至少三个次级维齐全）才允许维度分以 40% 权重
+ * 参与总分；否则退化为纯整体分 —— 避免「AI 只回一维、且那一维恰好偏高/偏低」时，
+ * 这单一维度独占 40% 权重把总分拽偏。
+ */
+const AI_DIM_FUSION_MIN_COVERAGE = 0.6;
+
 // P3-06：旧版本地匹配 localMatchScore 已删除——它基于「标题命中×3/描述命中×1」的旧口径，
 // 与现口径（computeLocalMatch 按维度命中映射 + 缺口惩罚）分叉，且「供 AI 分轻微平滑兜底」
 // 的用途已不存在（本地分仅 AI 不可用时出场）。现无任何调用方，直接移除。
@@ -143,7 +154,9 @@ export function fallbackApplicantGreeting(job: JobMeta, profile: Profile | null)
 
   const body: string[] = [];
   if (identity) body.push(`我是${identity}`);
-  if (showSkills.length) body.push(`熟悉${showSkills.join('、')}`);
+  // M-19：本地兜底**不得**给技能硬加「熟悉」前缀 —— 会把简历里写「了解」的技能升格为「熟悉」。
+  // 兜底只表达「简历技能区列出了这些」，不附加水平描述语（水平由 AI 或原文决定）。
+  if (showSkills.length) body.push(`技能涉及${showSkills.join('、')}`);
   if (award) body.push(`曾获${award}`);
   const parts = [`您好，我想应聘贵公司的${title}岗位。`];
   if (body.length) parts.push(`${body.join('，')}。`);
@@ -288,9 +301,9 @@ export function normalizeApplicantGreeting(result: any, job: JobMeta, profile: P
 }
 
 /**
- * 长度不符合 → 用「再生成」把打招呼语调整到目标 ~150 字 / 上限 200 字，而不是暴力截断。
+ * 长度不符合 → 用「再生成」把打招呼语调整到目标 ~150 字 / 上限 250 字，而不是暴力截断。
  * 策略：
- * 1. 已在合格区间（120-200 字）→ 直接返回；
+ * 1. 已在合格区间（120-250 字）→ 直接返回；
  * 2. 是本地安全兜底模板 → 直接返回（模板受控、无需重试）；
  * 3. 否则独立调用模型重新生成，最多重试 GREETING_MAX_RETRY 次，每次附带「上一版字数」修正；命中也返回；
  * 4. 尽最大努力后仍超长：才做一次性最终安全截断兜底（非主手段）。
@@ -336,7 +349,7 @@ async function generateGreetingOnce(opts: {
 }): Promise<string> {
   const retryNote =
     opts.attempt > 1
-      ? `\n\n（第 ${opts.attempt} 次重试：你上一版招呼语为 ${opts.prevLen} 个字，未达到要求。请把全文控制在目标 150 字、上限 200 字以内；重写时保留「身份 / 与岗位匹配的真实优势 / 加入意愿」三要素，语言精炼，不要罗列技术栈。）`
+      ? `\n\n（第 ${opts.attempt} 次重试：你上一版招呼语为 ${opts.prevLen} 个字，未达到要求。请把全文控制在目标 150 字、上限 250 字以内；重写时保留「身份 / 与岗位匹配的真实优势 / 加入意愿」三要素，语言精炼，不要罗列技术栈。）`
       : '';
   // 与主分析同口径：外部岗位数据标注为不可信，忽略其中指令
   // 校名披露规则由本地名单裁定后注入（非 985/211 → 禁止出现任何院校名称），AI 不自行判断院校层级
@@ -370,13 +383,21 @@ export async function analyzeJob(
   resumeText: string,
   config: AppConfig,
   model: AppConfig['model'],
-  customGreetingPrompt?: string
+  customGreetingPrompt?: string,
+  opts?: {
+    /**
+     * 简历中心的「招呼语提示词预览」专用：跳过本地硬条件短路（不拦截、不发 AI 的早退）。
+     * 预览只验证提示词产出，测试岗位常命中学历/求职类型等硬条件；若照常早退会恒回退本地规则，
+     * 用户永远看不到提示词效果。工作台/采集链路不传该参数，行为不变。
+     */
+    skipHardBlockShortCircuit?: boolean;
+  }
 ): Promise<JobAnalysis> {
   if (!profile) throw new Error('请先生成职业画像');
   // 打招呼语/求职信提示词来源优先级：① skill（greetings 技能，含用户自定义技能）→ ② 简历中心输入框内容 → ③ 都不满足则回退本地规则。
   // 每次调用都从磁盘重读 skills/*/SKILL.md，保证技能文档改了即时生效（不改文件即无副作用）。
   await reloadSkills();
-  const greetingsSkill = skillInstructionsFor('greetings');
+  const greetingsSkill = await skillInstructionsFor('greetings');
   const inputGreeting = greetingsSkill ? '' : (customGreetingPrompt || '').trim();
   // 系统提示词组装（skill 层优先，见 prompts.ts 分层说明）：
   //   ① buildAnalyzeSystemPrompt() —— 系统契约骨架（角色/安全/自洽/校准/schema/样例，恒在，不可被技能关闭）；
@@ -384,14 +405,21 @@ export async function analyzeJob(
   //      **技能优先**；无启用技能时注入 DEFAULT_JOB_ANALYSIS_INSTRUCTIONS 兜底（与 job-analysis 技能正文语义一致），
   //      保证评分功能不因技能全关而丢失，也让技能开关/编辑真正影响评分行为（缓存随技能开关失效，属预期语义）；
   //   ③ greeting 指令 —— 由调用方按「greetings 技能 → 输入框 → 内置默认」优先级解析后追加（不内联进骨架）。
-  const jobAnalysisScope = skillInstructionsFor('job-analysis');
+  const jobAnalysisScope = await skillInstructionsFor('job-analysis');
   const jobAnalysisRules = jobAnalysisScope || `\n\n【AI 技能 · 岗位匹配评估（默认细则兜底）】\n${DEFAULT_JOB_ANALYSIS_INSTRUCTIONS}`;
   // 校名披露规则：本地名单裁定「允许/禁止写校名」后注入（与 greetings 指令同属 greeting 口径，
   // 故紧随其后、放在 system 末尾）。仅由简历决定、与岗位无关 → 跨岗位恒定，不破坏前缀缓存。
   const schoolRule = buildSchoolDisclosureRule(
     resolveSchoolTier(normalizeStringList(profile?.facts?.education, 8), resumeText)
   );
-  const systemPrompt = buildAnalyzeSystemPrompt() + jobAnalysisRules + greetingsSkill + schoolRule;
+  // ⚠️ greeting 指令必须进入**主分析** system prompt：若只拼技能而当技能停用后丢弃输入框内容，
+  // 「设置里关闭 greetings 技能 → 简历中心提示词生效」这条优先级就是假的（输入框内容只在字数重写时被用到）。
+  // 技能停用时按优先级②注入简历中心输入框内容；②也没有时由骨架（buildAnalyzeSystemPrompt）内的精简口径兜底。
+  const greetingRule = greetingsSkill
+    || (inputGreeting
+      ? `\n\n【AI 技能 · 打招呼语（简历中心自定义提示词）】（由软件 skills 层注入，必须遵守）\n${inputGreeting}`
+      : '');
+  const systemPrompt = buildAnalyzeSystemPrompt() + jobAnalysisRules + greetingRule + schoolRule;
   // 打招呼语统一口径全文（供长度不达标时的独立重写再生成复用）：技能正文 > 简历中心输入框内容 > 内置默认。
   const greetingInstruction = greetingsSkill || inputGreeting || DEFAULT_ANALYZE_GREETING_INSTRUCTIONS;
   // 本地确定性多维匹配（deal-breaker 硬约束 + 可解释维度 + 兜底分），先于 AI 计算：
@@ -407,7 +435,7 @@ export async function analyzeJob(
   // 批量采集时每个硬拦岗位白花一次完整 LLM 调用（含重试最高 4 次）。该早退同时服务
   // 「加入任务」与「采集」两条入口：硬拦岗位最终都是 reject（手动路径照样入队、采集路径照样跳过），
   // 行为不变；输出形态与下方「AI 不可用 → 本地兜底」分支完全一致，不引入新语义。
-  if (local.hardBlocks.length) {
+  if (local.hardBlocks.length && !opts?.skipHardBlockShortCircuit) {
     const fallbackScore = Math.min(local.dimensions.overall ?? 0, HARD_BLOCK_SCORE_CAP);
     const fallbackGaps = cleanGapList(local.gaps, profile, resumeText);
     const hardReason = `本地硬条件拦截：${local.hardBlocks.slice(0, 2).join('；')}${
@@ -485,7 +513,7 @@ ${untrustedJobSection(parts.jobJson)}${localAnchorSection}`,
     // 复用上方已算好的 local 多维匹配（含硬约束/证据/缺口），打分口径与 AI 融合路径一致：
     // 硬约束存在 → score ≤35 / reject；否则按四档区间（不推荐 <50 / 谨慎 50-64 / 匹配 65-80 / 推荐 >80）落档。
     const localOverall = local.dimensions.overall ?? 0;
-    let localScore = local.hardBlocks.length ? Math.min(localOverall, HARD_BLOCK_SCORE_CAP) : localOverall;
+    const localScore = local.hardBlocks.length ? Math.min(localOverall, HARD_BLOCK_SCORE_CAP) : localOverall;
     // 本地兜底同样产出档位（AI 未参与时，档位由本地确定性分反推，保证 UI 与分数一致）
     const fallbackLevel = fitLevelFromScore(localScore);
     const decision: Decision = fallbackLevel === 'unfit' ? 'reject' : fallbackLevel === 'cautious' ? 'cautious' : 'recommend';
@@ -578,8 +606,13 @@ ${untrustedJobSection(parts.jobJson)}${localAnchorSection}`,
   }
   // 3.6 AI 语义评估维度分（dimensionScores）解析与本地兜底（见 mergeAiDimensions）：
   //     AI 每维输出 {score, evidence}（提示词要求逐维语义评估、纠正本地逐词误报）；
-  //     每维以 AI 为准、AI 缺失时本地同维兜底；overall 按 AI 五维权重重算，作为总分融合的「维度加权分」。
-  const { dimensions: fusedDimensions, evidence: dimensionEvidence, aiDimUsed } = mergeAiDimensions(result.dimensionScores, local);
+  //     每维以 AI 为准、AI 缺失时本地同维兜底（仅展示）；overall 只按 **AI 实际给出的维度** 加权，
+  //     本地兜底维不得进入 overall（审查 #3）。
+  //     ⚠️ 下方 `delete result.dimensionScores` 属于**就地改写返回值**：llm.ts 的缓存层已改为
+  //     存/取双向克隆（审查 #2），因此这里不再污染缓存条目 —— 若日后回退该克隆，此处必须同步改为
+  //     构造新对象返回，否则二次命中缓存会退化成「无 AI 维度分」。
+  const { dimensions: fusedDimensions, evidence: dimensionEvidence, aiDimUsed, aiDimCoverage } =
+    mergeAiDimensions(result.dimensionScores, local);
   result.dimensions = fusedDimensions;
   if (Object.keys(dimensionEvidence).length) result.dimensionEvidence = dimensionEvidence;
   delete result.dimensionScores; // AI 原始字段已消化为 dimensions + dimensionEvidence，不再随 JobAnalysis 持久化
@@ -606,11 +639,13 @@ ${untrustedJobSection(parts.jobJson)}${localAnchorSection}`,
   if (Number.isFinite(aiScore)) {
     // AI 有分：以档位为准把分数夹到档内（档位写谨慎、分数给 95 会被夹回谨慎区间）。
     // 总分融合（用户口径：整体裁决分 × 维度加权分融合，档位仍由四层整体裁决 + 技能维错位闸门决定）：
-    // 分数 = 60% AI 整体分 + 40% AI 语义五维加权分（见 3.6），夹回档位区间——
+    // 分数 = 60% AI 整体分 + 40% **AI 语义五维加权分**（见 3.6），夹回档位区间——
     // 权重从 70/30 调到 60/40，让「岗位要求与简历相差大」在分数上扣得更明显（维度分低 → 总分显著下探）。
-    // AI 未输出任何合法维度分（aiDimUsed=false）时退化为纯整体分，避免用本地逐词弱证据拉偏 AI 判断。
+    // AI 未输出任何合法维度分、或 AI 维度覆盖度不足（aiDimCoverage < AI_DIM_FUSION_MIN_COVERAGE，
+    // 见 mergeAiDimensions 注释；审查 #3）时退化为纯整体分：既不用本地逐词弱证据，也不用单一 AI 维
+    // 独占 40% 权重拉偏 AI 的整体裁决。
     const dimOverall = Number(fusedDimensions.overall);
-    if (aiDimUsed && Number.isFinite(dimOverall)) {
+    if (aiDimUsed && aiDimCoverage >= AI_DIM_FUSION_MIN_COVERAGE && Number.isFinite(dimOverall)) {
       score = scoreForFitLevel(level, Math.round(aiScore * 0.6 + dimOverall * 0.4));
       result.fusedWithDimensions = true;
     } else {
@@ -666,22 +701,28 @@ ${untrustedJobSection(parts.jobJson)}${localAnchorSection}`,
  * - 每维以 AI 为准（0-100 夹取为整数），AI 缺失/非法时用本地确定性同维兜底（本地也缺则 null，UI 自动过滤）；
  * - 薪资维度展示仍以 AI 为准，但其打分口径被提示词约束为「以本地校准信息为准」（本地解析仍是最终薪资数据来源）；
  * - location 恒为本地值（不进 AI 五维）；
- * - overall 按 AI 五维权重（34/28/14/8/6，缺失维度剔除后重归一）重算，作为总分融合的「维度加权分」；
- * - aiDimUsed 标记 AI 是否至少给出一个合法维度分（只有它才触发总分融合，避免用本地弱证据去拉偏 AI 总分）。
+ * - **overall 只由 AI 实际给出的维度加权得到**（缺失维剔除后重归一），本地兜底维**不得**进入 overall
+ *   —— 见「禁融合」铁律（本地五维只做 UI 展示 + AI 完全不可用时的兜底，不参与总分）；
+ * - aiDimUsed = AI 至少给出一个合法维度分；aiDimCoverage = AI 给出的维度权重占 AI 五维总权重的比例
+ *   （调用方据此决定是否启用 60/40 维度融合，避免「AI 只给 1 维」就让该维独占 40% 权重）。
  */
 export function mergeAiDimensions(aiRaw: unknown, local: LocalMatchResult): {
   dimensions: MatchDimensions;
   evidence: MatchDimensionEvidence;
   aiDimUsed: boolean;
+  aiDimCoverage: number;
 } {
   // AI 五维权重（Σ=0.90）：由 jobMatch.ts 单一来源 AI_DIM_WEIGHTS 派生（含 experience、无 location，
   // location 恒取本地值）——与本地 LOCAL_DIM_WEIGHTS（Σ=0.94，含 location、无 experience）是
   // 两组刻意不同的集合，共同维度权重数值一致，差异是设计意图（P1-08/P3-05），勿再手写第二份。
   const DIM_META: { key: AIDimKey; weight: number }[] = AI_DIM_WEIGHTS.map(([key, weight]) => ({ key, weight }));
+  const totalWeight = DIM_META.reduce((s, d) => s + d.weight, 0);
   const src = (aiRaw && typeof aiRaw === 'object' ? aiRaw : {}) as Record<string, unknown>;
   const dims: MatchDimensions = { ...local.dimensions };
   const evidence: MatchDimensionEvidence = {};
   let aiDimUsed = false;
+  // 只累计 **AI 实际给出** 的维度（审查 #3：原实现把本地兜底维一并计入 wSum/wTotal，
+  // 使 overall 混入本地逐词弱证据并以其 40% 权重进入最终分，而 scoreSource 仍标 'ai'）
   let wSum = 0;
   let wTotal = 0;
   for (const { key, weight } of DIM_META) {
@@ -690,16 +731,18 @@ export function mergeAiDimensions(aiRaw: unknown, local: LocalMatchResult): {
     if (Number.isFinite(aiScore)) {
       dims[key] = Math.max(0, Math.min(100, Math.round(aiScore)));
       aiDimUsed = true;
-    } else {
-      dims[key] = local.dimensions[key];
-    }
-    const ev = String(item?.evidence ?? '').trim().slice(0, 60);
-    if (ev) evidence[key] = ev;
-    if (dims[key] != null) {
       wSum += Number(dims[key]) * weight;
       wTotal += weight;
+      const ev = String(item?.evidence ?? '').trim().slice(0, 60);
+      if (ev) evidence[key] = ev;
+      continue;
     }
+    // AI 未给该维：展示层用本地同维兜底（UI 会标注「本地确定性维度」），**不进 overall**
+    dims[key] = local.dimensions[key];
+    const ev = String(item?.evidence ?? '').trim().slice(0, 60);
+    if (ev) evidence[key] = ev;
   }
+  // overall = AI 维度的加权分（重归一）；AI 一维未给时退化为本地 overall（仅展示，aiDimUsed=false 不会触发融合）
   dims.overall = wTotal > 0 ? Math.round(wSum / wTotal) : local.dimensions.overall;
-  return { dimensions: dims, evidence, aiDimUsed };
+  return { dimensions: dims, evidence, aiDimUsed, aiDimCoverage: totalWeight > 0 ? wTotal / totalWeight : 0 };
 }

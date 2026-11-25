@@ -16,7 +16,8 @@ import { useAutoChatStore } from '@/store/useAutoChatStore';
 import { writeLocalBackup, restoreFromLocalBackup } from '@/lib/localBackup';
 import { electronApi } from '@/lib/electronApi';
 import { PLATFORM_IDS, platformEnabled, type JobPlatform } from '@/lib/bossclaw/platforms';
-import { SAFETY_LIMITS, isLockedOut, effectiveDailyCap, dailySentCount, cooldownRemaining } from '@/lib/bossclaw/safety';
+import { isWhitelistedUrl, whitelistHostOf } from '@/lib/bossclaw/browserWhitelist';
+import { SAFETY_LIMITS, isLockedOut, effectiveDailyCap, enabledSentCount, cooldownRemaining } from '@/lib/bossclaw/safety';
 import { analyzeJob } from '@/lib/bossclaw/matching';
 import { tailorForJob } from '@/lib/bossclaw/jobAssistant';
 import { buildProfile } from '@/lib/bossclaw/profile';
@@ -45,6 +46,8 @@ import {
   scrollElement,
   waitFor,
   waitForSelector,
+  isDangerousAppControl,
+  describeControlText,
 } from '@/lib/uiOps';
 import type { JobMeta, Profile, PendingItem, TaskRun, TaskStage, PendingStatus, DirectionPlan } from '@/lib/bossclaw/types';
 import type { ScheduleEntry } from '@/store/useScheduleStore';
@@ -56,14 +59,33 @@ interface ControlOp {
 
 interface ControlResult {
   applied: boolean;
+  accepted?: boolean;
+  sent?: boolean | null;
   message?: string;
   previous?: unknown;
   next?: unknown;
   [key: string]: unknown;
 }
 
-/** 禁止通过 patchConfig 直接改写的字段（走专用动作或会破坏安全语义） */
-const CONFIG_DENY = new Set(['model', 'pausedUntil', 'platforms']);
+/** 禁止通过 patchConfig 直接改写的字段（走专用动作或会破坏安全语义）。
+ *  `executionMode` 列入的原因：`deliverySendNow` 以「用户已开启全自动」为护栏判据，
+ *  任何能改写该字段的控制桥动作都会使护栏被自证绕过（见审查 #21）。
+ *  审查 H-1 补充：安全侧配置（活跃时段 / 批次休息 / 首条验收）原本不在 DENY 内，
+ *  agent 可关掉活跃时段转 24 小时作业、取消批次休息，或预置 singleJobValidationCompletedAt
+ *  绕过「首次投递后暂停验收」——均属「不得修改安全上限」。故一并列入 DENY。 */
+const CONFIG_DENY = new Set([
+  'model',
+  'pausedUntil',
+  'platforms',
+  'executionMode',
+  // 安全侧配置（H-1）：只能由用户在设置页手动修改
+  'activeHours',
+  'batchRest',
+  'requireSingleJobValidation',
+  'singleJobValidationCompletedAt',
+  'maxDailySent',
+  'dailyTarget',
+]);
 
 /** agent 代答长轮询上限：agent 一次调用最多等这么久（避免客户端工具超时） */
 const AGENT_TASKS_MAX_WAIT_MS = 55_000;
@@ -456,6 +478,11 @@ const handlers: Record<string, Handler> = {
     const u = String(url ?? '');
     if (!b) return { applied: false, message: '浏览器控制不可用（需 webview 引擎运行）' };
     if (!/^https?:\/\//.test(u)) return { applied: false, message: `URL 必须是 http(s) 绝对地址` };
+    // 审查 M-35：仅校验协议会让 agent 把已登录的 webview 导航到任意站点（钓鱼/外泄登录态）。
+    // 复用内置浏览器导航白名单（唯一权威 browserWhitelist.ts，招聘平台 + 背调核查站点）。
+    if (!isWhitelistedUrl(u)) {
+      return { applied: false, message: `拒绝导航：${whitelistHostOf(u) || u} 不在内置浏览器招聘平台白名单内` };
+    }
     b.loadURL(u, tabId !== undefined ? String(tabId) : undefined);
     return { applied: true, message: '已在浏览器打开岗位详情', next: { url: u, mode: b.mode } };
   },
@@ -482,12 +509,18 @@ const handlers: Record<string, Handler> = {
   },
 
   // ---- 投递（半自动 / 全自动，跟随 executionMode）----
-  deliverySetMode: ({ mode }) => {
-    if (mode !== 'auto' && mode !== 'review') return { applied: false, message: 'mode 必须是 auto 或 review' };
-    const prev = useSettingsStore.getState().config.executionMode;
-    useSettingsStore.getState().setConfig({ executionMode: mode } as never);
-    return { applied: true, message: `投递模式已切换为 ${mode === 'auto' ? '全自动' : '人工确认(半自动)'}`, previous: prev, next: mode };
-  },
+  deliverySetMode: ({ mode }) => ({
+    // 安全护栏：执行模式**不允许经控制桥切换**（动作保留仅为兼容旧调用，行为已改为拒绝）。
+    // 原因：`deliverySendNow` 用 `executionMode === 'auto'` 判定「用户已开启全自动」；
+    // 若同一白名单里还存在能改该字段的动作，护栏的开关就由被护栏约束的一方自己掌握
+    // —— agent 可先 deliverySetMode(auto) 再 deliverySendNow，护栏被自证绕过（见审查 #21）。
+    // 该字段已列入 CONFIG_DENY，只能由用户在应用设置页手动切换。
+    applied: false,
+    message:
+      `执行模式（全自动/人工确认）不允许经控制桥切换（收到 ${String(mode)}）；` +
+      '该字段受保护，请在应用「设置页」手动切换。半自动场景请用 deliveryDraft 预填后由用户发送。',
+    previous: useSettingsStore.getState().config.executionMode,
+  }),
   deliveryDraft: async ({ greeting }) => {
     const g = String(greeting ?? '');
     if (!g.trim()) return { applied: false, message: '缺少招呼语 greeting' };
@@ -500,12 +533,22 @@ const handlers: Record<string, Handler> = {
     // 安全护栏：仅当用户已开启「全自动」（executionMode==='auto'）时，agent 才能触发自动投递
     const mode = useSettingsStore.getState().config.executionMode;
     if (mode !== 'auto') {
-      return { applied: false, message: '全自动未开启（executionMode 为 review），自动投递已被拒绝；请先在应用内开启全自动，或用 delivery.draft 草拟后由用户发送' };
+      return { applied: false, accepted: false, sent: false, message: '全自动未开启（executionMode 为 review），自动投递已被拒绝；请先在应用内开启全自动，或用 delivery.draft 草拟后由用户发送' };
     }
     const b = getBrowser();
-    if (!b) return { applied: false, message: '浏览器控制不可用（需 webview 引擎运行）' };
-    const out = await b.sendApply(greeting !== undefined ? { greeting: String(greeting) } : {});
-    return { applied: out.ok, message: out.ok ? (out.hint || '已触发自动投递') : (out.reason || '触发失败'), next: out };
+    if (!b) return { applied: false, accepted: false, sent: false, message: '浏览器控制不可用（需 webview 引擎运行）' };
+    try {
+      const out = await b.sendApply(greeting !== undefined ? { greeting: String(greeting) } : {});
+      return {
+        applied: out.ok,
+        accepted: out.accepted,
+        sent: out.sent,
+        message: out.ok ? (out.hint || '已派发自动投递请求；发送结果尚未确认') : (out.reason || '触发失败'),
+        next: out,
+      };
+    } catch (e) {
+      return { applied: false, accepted: false, sent: false, message: `投递请求未能派发：${(e as Error)?.message || e}` };
+    }
   },
 
   // ===== A. 通用 UI 接管（scope: app → document；webview → browser.uiExec）=====
@@ -523,6 +566,12 @@ const handlers: Record<string, Handler> = {
   },
 
   uiClick: async ({ scope, selector, label, index }) => {
+    // 审查 H-2：uiClick/uiType/uiSubmit 会改变状态，必须显式声明作用域（缺省不再默认 app）；
+    // 且 app 作用域下禁止命中「投递/发送/批量/清空」等高危控件——否则 agent 可合成点击
+    // 「一键投递」「开始批量沟通」，绕过动作白名单与 executionMode 护栏。
+    if (scope !== 'webview' && scope !== 'app') {
+      return { applied: false, message: `必须显式指定 scope（'app' 或 'webview'）；收到 ${scope === undefined ? '（缺省）' : String(scope)}。app 界面高危操作请由用户在应用内手动执行` };
+    }
     if (scope === 'webview') {
       const b = getBrowser();
       if (!b) return { applied: false, message: 'webview 引擎不可用' };
@@ -532,11 +581,17 @@ const handlers: Record<string, Handler> = {
     }
     const el = queryInteractive(selector ? String(selector) : undefined, label ? String(label) : undefined, Number(index) || 0);
     if (!el) return { applied: false, message: `未命中可见元素${selector ? `：${selector}` : '（无候选）'}` };
+    if (isDangerousAppControl(el)) {
+      return { applied: false, message: `拒绝点击应用界面高危控件（文本含投递/发送/批量/清空等语义）：${describeControlText(el).slice(0, 60)}；请在应用内手动操作` };
+    }
     clickElement(el);
     return { applied: true, message: '已点击元素', previous: { selector: selector || null }, next: { clicked: true } };
   },
 
   uiType: async ({ scope, selector, into, label, index, value, clear }) => {
+    if (scope !== 'webview' && scope !== 'app') {
+      return { applied: false, message: `必须显式指定 scope（'app' 或 'webview'）；收到 ${scope === undefined ? '（缺省）' : String(scope)}` };
+    }
     const targetSel = String(into || selector || '');
     const v = String(value ?? '');
     if (!targetSel) return { applied: false, message: '需要 selector/into 指定输入框' };
@@ -549,6 +604,9 @@ const handlers: Record<string, Handler> = {
     }
     const el = queryInteractive(targetSel, label ? String(label) : undefined, Number(index) || 0);
     if (!el) return { applied: false, message: `未命中输入框：${targetSel}` };
+    if (isDangerousAppControl(el)) {
+      return { applied: false, message: `拒绝写入应用界面高危输入框：${describeControlText(el).slice(0, 60)}` };
+    }
     if (el.matches('[contenteditable]')) return { applied: false, message: 'contenteditable 聊天框请用 deliveryDraft' };
     const ok = typeInto(el, v);
     if (!ok) return { applied: false, message: '目标不是可输入的 input/textarea' };
@@ -556,6 +614,9 @@ const handlers: Record<string, Handler> = {
   },
 
   uiSubmit: async ({ scope, selector }) => {
+    if (scope !== 'webview' && scope !== 'app') {
+      return { applied: false, message: `必须显式指定 scope（'app' 或 'webview'）；收到 ${scope === undefined ? '（缺省）' : String(scope)}` };
+    }
     if (scope === 'webview') {
       const b = getBrowser();
       if (!b) return { applied: false, message: 'webview 引擎不可用' };
@@ -565,6 +626,9 @@ const handlers: Record<string, Handler> = {
     }
     const el = selector ? queryInteractive(String(selector)) : (document.activeElement as HTMLElement);
     if (!el) return { applied: false, message: '未命中可提交元素' };
+    if (isDangerousAppControl(el)) {
+      return { applied: false, message: `拒绝提交应用界面高危控件：${describeControlText(el).slice(0, 60)}` };
+    }
     const ok = submitBy(el);
     return { applied: ok, message: ok ? '已提交表单' : '该元素不是可提交目标', next: { submitted: ok } };
   },
@@ -600,6 +664,12 @@ const handlers: Record<string, Handler> = {
     const auto = useAutoChatStore.getState();
     if (auto.chatRunning) return { applied: false, message: '后台沟通已在运行' };
     const cfg = useSettingsStore.getState().config;
+    // 安全护栏（审查 C-1）：自动沟通经 camoufoxChat 真实发送招呼语，与 deliverySendNow 同等副作用，
+    // 必须同样以「用户已开启全自动」为前置条件；否则 agent 可改调本动作实现真实批量发送，
+    // 使 deliverySendNow 的 executionMode 护栏被自证绕过。executionMode 只能由用户在设置页切换。
+    if (cfg.executionMode !== 'auto') {
+      return { applied: false, message: '全自动未开启（executionMode 为 review），自动沟通（真实发送招呼语）已被拒绝；请由用户在应用内开启全自动，或使用 deliveryDraft 草拟后由用户发送' };
+    }
     if (isLockedOut(cfg)) return { applied: false, message: `冷却期内不可启动（剩余约 ${Math.ceil(cooldownRemaining(cfg) / 60000)} 分钟）` };
     auto.start({
       platforms: Array.isArray(platforms) ? (platforms.map(String) as JobPlatform[]) : undefined,
@@ -618,8 +688,14 @@ const handlers: Record<string, Handler> = {
     if (auto.chatRunning) return { applied: false, message: '后台沟通运行中，请先 autochatStop 再单步' };
     const cfg = useSettingsStore.getState().config;
     const data = useDataStore.getState();
+    // 安全护栏（审查 C-1）：单步沟通同样会真实发送招呼语，与 autochatStart 同源，须校验全自动。
+    if (cfg.executionMode !== 'auto') {
+      return { applied: false, message: '全自动未开启（executionMode 为 review），单步沟通（真实发送招呼语）已被拒绝；请由用户在应用内开启全自动，或使用 deliveryDraft 草拟后由用户发送' };
+    }
     if (isLockedOut(cfg)) return { applied: false, message: `冷却期内不可投递（剩余约 ${Math.ceil(cooldownRemaining(cfg) / 60000)} 分钟）` };
-    if (dailySentCount(data.pending) >= effectiveDailyCap(cfg)) return { applied: false, message: `今日已达上限 ${effectiveDailyCap(cfg)} 条` };
+    // 审查 #23 后续 · 批次 13：账号级「已用」必须与额度（effectiveDailyCap，只累加**已启用**平台）
+    // 同源 —— 用 enabledSentCount 而非 dailySentCount（后者含已关闭平台的历史投递，会把账号误判为已满）。
+    if (enabledSentCount(cfg, data.pending) >= effectiveDailyCap(cfg)) return { applied: false, message: `今日已达上限 ${effectiveDailyCap(cfg)} 条` };
     let item: PendingItem | undefined;
     if (id) {
       item = data.pending.find((p) => p.id === String(id));

@@ -23,12 +23,12 @@ BossClaw 隐身引擎 —— 多平台采集/投递统一骨架
 4. 平台侧每日上限提示（智联）→ 立即停止交人工。
 5. 外部网申岗位 → 跳过（不投递第三方）。
 
-断点续采（对齐 BossHunter 的词级 / 页级断点）
+断点续采（对齐 BossHunter 的词级断点口径）
 --------------------------------------------
-- `completed_combo` → 整词跳过（TTL 内已采完）；
-- `resume_page` → 从上次**完整成功**的页的下一页继续；
-- 只有「本页全部处理完 + 无保存缺口」才 `mark_page` 推进断点；
-- 列表未就绪 / 详情页临时失败 → `completed_with_shortage` 并保留上一完整页断点。
+- `completed_combo` → 整词跳过（TTL 内已采完**且**采完页数 ≥ 本次要求页数）；
+- 只有「整轮全部页处理完、无采集缺口」才 `mark_combo_done` 推进断点；
+- 列表未就绪 / 详情页临时失败 / 风控 → `clear_combo`（下次重头采，宁重复不遗漏）；
+- **不做页级断点**：采集是整批返回架构，页级推进会在崩溃时静默丢数据（见 progress.py 头注）。
 """
 from __future__ import annotations
 
@@ -120,9 +120,38 @@ class CollectorBase:
         raise NotImplementedError
 
     # ---------- 可选钩子 ----------
-    def after_navigate(self, page, query: str, page_num: int) -> None:
-        """导航完成后的平台专属动作（如智联的页内搜索框输入关键词）。"""
+    def after_navigate(self, page, query: str, page_num: int) -> bool | None:
+        """导航完成后的平台专属动作（如智联的页内搜索框输入关键词、51Job 页内跳页）。
+
+        返回值语义：返回**真值**表示「已切换到另一个视图」（如点页内跳页控件）——
+        骨架会随即丢弃本次导航后已捕获的接口响应，避免把上一页的列表混进本页
+        （宁少采不重复）。默认 / 未切换视图时返回 None。
+        """
         return None
+
+    def match_api_url(self, url: str) -> bool:
+        """响应 URL 是否属于本平台搜索接口（默认：包含 `api_hint` 子串）。
+
+        子类可覆盖以排除「同前缀的其它接口」：如猎聘 `pc-search-job-cond-init` 是筛选字典
+        接口而非岗位列表接口（get_jobs 侧同样显式排除），不排除会做无效拦截。
+        """
+        return bool(self.api_hint) and self.api_hint in (url or '')
+
+    def empty_list_hit(self, page) -> bool:
+        """列表页是否呈现「暂无职位 / 无符合条件职位」空态（默认不识别）。
+
+        命中 → 本关键词已采完，骨架提前结束翻页（**不推进词级断点**，避免把
+        「暂时为空」固化成 TTL 内整词跳过）。
+        """
+        return False
+
+    def is_logged_out(self, page) -> bool:
+        """平台特有的未登录判定（默认只看 URL）。
+
+        部分平台未登录**不跳转** `/login`，只在页头把用户名换成「登录」（如 51Job 的
+        `a.uname`）——只看 URL 会把「未登录」误判成「找不到投递按钮」。
+        """
+        return False
 
     def find_action_button(self, page):
         """定位投递动作按钮 → `(state, locator | None)`。
@@ -135,6 +164,14 @@ class CollectorBase:
     def confirm_sent(self, page) -> bool:
         """确认「已建立沟通 / 投递成功」——未确认一律不计成功。"""
         raise NotImplementedError
+
+    def before_action(self, page):
+        """需要发送消息的平台记录点击前的会话；默认不改变简历投递流程。"""
+        return None
+
+    def finish_action(self, page, greeting: str, before=None) -> dict | None:
+        """平台额外发送与确认；返回 None 时继续通用的投递按钮确认。"""
+        return None
 
     # ============================================================
     # 骨架 1：隐身搜索（含断点续采）
@@ -152,15 +189,28 @@ class CollectorBase:
         store = progress_store(self.config, self.platform)
         store.prune([query])
 
-        # 词级断点：TTL 内已整轮采完 → 直接跳过（不打开搜索页）
+        # 词级断点：TTL 内已整轮采完 → 直接跳过（不打开搜索页）。
+        # issue #7：断点键不含页数，必须比对「已采页数 vs 本次要求页数」——
+        # 否则用户把页数调大后仍会被整词跳过，看起来像调参没生效。
         if force:
             store.clear_combo(self.platform, city, query)
-        elif store.completed_combo(self.platform, city, query):
-            log('⏭️', f'[{self.platform}] {query} / {city}：{store.ttl_hours}h 内已采完，整词跳过（断点续采）')
-            return {
-                'ok': True, 'code': 0, 'jobs': [], 'skipped': True,
-                'message': f'{store.ttl_hours} 小时内已采集过「{query}·{city}」，本次跳过重复采集',
-            }
+        else:
+            prev = store.combo_entry(self.platform, city, query)
+            if prev and prev.get('done'):
+                try:
+                    prev_pages = int(prev.get('pages') or 0)
+                except (TypeError, ValueError):
+                    prev_pages = 0
+                if prev_pages >= pages:
+                    log('⏭️', f'[{self.platform}] {query} / {city}：{store.ttl_hours}h 内已采完 '
+                             f'{prev_pages} 页（本次要求 {pages} 页），整词跳过（断点续采）')
+                    return {
+                        'ok': True, 'code': 0, 'jobs': [], 'skipped': True,
+                        'message': (f'{store.ttl_hours} 小时内已采集过「{query}·{city}」'
+                                    f'（{prev_pages} 页，覆盖本次要求的 {pages} 页），本次跳过重复采集'),
+                    }
+                log('🔄', f'[{self.platform}] {query} / {city}：上次仅采 {prev_pages} 页，'
+                         f'本次要求 {pages} 页 → 断点不跳过，重新采集')
 
         c = normalize_criteria(criteria)
         applied = summarize_applied(self.platform, build_filter_params(self.platform, criteria))
@@ -173,7 +223,7 @@ class CollectorBase:
         collected_pages = 0
         captured: list = []
 
-        with open_browser(os_name=os_name) as page:
+        with open_browser(os_name=os_name, platform=self.platform) as page:
             cookies = load_cookies(self.platform)
             if cookies:
                 try:
@@ -181,11 +231,13 @@ class CollectorBase:
                 except Exception as e:
                     log('⚠️', f'[{self.platform}] 注入 Cookie 失败：{e}')
 
+            parse_error = {'hit': False}  # H-8：本页接口解析是否异常（供断点推进判据）
+
             def on_response(response):
                 try:
                     if response.status != 200:
                         return
-                    if self.api_hint and self.api_hint not in (response.url or ''):
+                    if not self.match_api_url(response.url or ''):
                         return
                     ctype = (response.headers.get('content-type') or '')
                     if 'json' not in ctype and ctype:
@@ -196,9 +248,11 @@ class CollectorBase:
                     items = self.parse_api_payload(json.loads(text))
                     if isinstance(items, list) and items:
                         captured.extend(items)
-                except Exception:
-                    # 接口拦截是「尽力而为」通道，解析失败静默交给 DOM 兜底
-                    pass
+                except Exception as e:
+                    # 接口拦截是「尽力而为」通道，解析失败交给 DOM 兜底；
+                    # H-8：但必须**标记**（原来完全静默 pass），否则接口结构变更时会「0 采集却标记采完」。
+                    parse_error['hit'] = True
+                    log('⚠️', f'[{self.platform}] 接口解析异常（结构可能变更）：{str(e)[:60]}')
 
             page.on('response', on_response)
 
@@ -212,7 +266,10 @@ class CollectorBase:
                 if risk:
                     last_code, last_msg = 35, f'风控：{risk}'
                     break
-                self.after_navigate(page, query, page_num)
+                if self.after_navigate(page, query, page_num):
+                    # 钩子已切换到另一个视图（如 51Job 页内跳页）：丢弃切换前捕获的响应，
+                    # 否则会把上一页的列表混进本页（宁少采不重复）
+                    captured.clear()
                 for _ in range(self.capture_wait_attempts):
                     if captured:
                         break
@@ -222,6 +279,17 @@ class CollectorBase:
                     all_jobs.extend(self.format_jobs(captured, query, page_num))
                 elif dom_jobs:
                     all_jobs.extend(dom_jobs)
+                elif self.empty_list_hit(page):
+                    log('ℹ️', f'[{self.platform}] Page {page_num}: 页面提示无符合条件岗位，提前结束「{query}」')
+                    break
+                else:
+                    # H-8：接口与 DOM 两个通道皆空、又非「页面明确显示无岗位」→ 视为采集缺口。
+                    # 不推进词级断点（宁可下次重复采，也不整词静默漏采）；命中解析异常时给出更明确的日志。
+                    if parse_error['hit']:
+                        log('⚠️', f'[{self.platform}] Page {page_num}: 接口解析失败且 DOM 兜底为空，判定为采集缺口，不推进断点')
+                    else:
+                        log('⚠️', f'[{self.platform}] Page {page_num}: 未采到岗位且未见空态标记，判定为缺口，不推进断点')
+                    break
                 captured = []
                 collected_pages = page_num
                 log('✅', f'[{self.platform}] Page {page_num}: {len(all_jobs)} 个岗位')
@@ -269,6 +337,15 @@ class CollectorBase:
         url = str(job.get('url') or '').strip()
         if not job_id and not url:
             return {'ok': False, 'code': 400, 'message': '缺少岗位 jobId/url', 'sent': False}
+        # 安全不变量（审查 C-3）：投递只能落到**明确的岗位详情页**。
+        # 历史缺陷：url 为空时回退到 `build_search_url('Python', ...)` 的**搜索结果列表页**，
+        # 随后在列表页上定位并点击「投递」→ 可能对用户**未选择的任意岗位**发起不可逆投递。
+        # 现在：无 url 直接拒绝（保留 job_id 仅用于提示），绝不回退列表页。
+        if not url:
+            return {
+                'ok': False, 'code': 400, 'sent': False,
+                'message': f'缺少岗位 url（job={job_id or "?"}），拒绝投递；请回列表重新进入该岗位详情页后再投递',
+            }
         # 安全不变量：招呼语为空拒绝投递（所有平台一致，不可放宽）
         if not str(greeting or '').strip():
             return {'ok': False, 'code': 400, 'message': '招呼语为空，拒绝投递', 'sent': False}
@@ -277,7 +354,7 @@ class CollectorBase:
 
         log('💬', f'[{self.platform}] 投递 → job={job_id}（{self.label}）')
 
-        with open_browser(os_name=os_name, headless=False) as page:
+        with open_browser(os_name=os_name, headless=False, platform=self.platform) as page:
             cookies = load_cookies(self.platform)
             if cookies:
                 try:
@@ -285,18 +362,23 @@ class CollectorBase:
                 except Exception as e:
                     log('⚠️', f'[{self.platform}] 注入 Cookie 失败：{e}')
 
-            target = url or self.build_search_url('Python', '', '', 1)
+            target = url
             if not goto_stable(page, target, wait=2.5):
                 return self._fail(35, f'{self.label}页面未加载（可能被反爬拦截）', page)
             risk = risk_text_hit(page)
             if risk:
                 return self._fail(35, f'检测到安全验证/访问受限（{risk}），已暂停', page)
             current = (page.url or '').lower()
-            if 'login' in current or 'passport' in current:
+            if 'login' in current or 'passport' in current or self.is_logged_out(page):
                 return self._fail(31, f'未登录{self.label}，请先扫码登录', page)
 
             if url and self.detail_markers and any(m in url for m in self.detail_markers):
-                page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                try:
+                    page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                except Exception as e:
+                    # 导航失败不再让异常逃逸（原先会跳过 cookie 落盘与 _fail，HTTP 层只回 500）：
+                    # 按既有「页面加载失败」口径返回 37（环境/页面异常），由 _fail 统一落 cookie。
+                    return self._fail(37, f'详情页加载失败：{str(e)[:60]}', page)
                 human_sleep(DETAIL_SETTLE_SECONDS, 0.35, 2.0)
             risk = risk_text_hit(page)
             if risk:
@@ -314,6 +396,7 @@ class CollectorBase:
                     'message': self.missing_button_message(),
                 }
 
+            before_action = self.before_action(page)
             try:
                 btn.click(timeout=8000)
             except Exception as e:
@@ -321,19 +404,29 @@ class CollectorBase:
                 return {'ok': False, 'code': 500, 'sent': False,
                         'message': f'点击「{self.action_label()}」失败：{e}'}
 
-            human_sleep(2.0, 0.4, 1.0)
-            # 平台侧每日上限 / 操作受限提示 → 立即停止交人工
-            if self.limit_re is not None:
-                try:
-                    body = page.evaluate("() => (document.body ? document.body.innerText.slice(0, 4000) : '')") or ''
-                    if self.limit_re.search(body):
-                        save_cookies(page.context, self.platform)
-                        return {
-                            'ok': False, 'code': 32, 'sent': False,
-                            'message': self.limit_message(),
-                        }
-                except Exception:
-                    pass
+            # 平台侧每日上限 / 操作受限提示 → 立即停止交人工。
+            # 该提示是**瞬态 toast**（约 2s 后自行消失），点击后只检测一次极易漏检
+            # （会继续投递直到风控）→ 对齐 get_jobs 的「点击后 10×200ms 轮询」；
+            # 轮询总时长与原有 2s 停顿一致，不引入额外空等。
+            hit_limit = False
+            for _ in range(10):
+                if self._limit_hit(page):
+                    hit_limit = True
+                    break
+                human_sleep(0.2, 0.3, 0.15)
+            if hit_limit:
+                save_cookies(page.context, self.platform)
+                return {
+                    'ok': False, 'code': 32, 'sent': False,
+                    'message': self.limit_message(),
+                }
+
+            finished = self.finish_action(page, greeting, before_action)
+            if finished is not None:
+                if finished.get('ok') and finished.get('sent'):
+                    self.after_sent(page)
+                save_cookies(page.context, self.platform)
+                return finished
 
             confirmed = False
             deadline = time.time() + self.confirm_timeout_seconds
@@ -365,6 +458,16 @@ class CollectorBase:
             except Exception:
                 pass
         return {'ok': False, 'code': code, 'message': message, 'sent': False}
+
+    def _limit_hit(self, page) -> bool:
+        """平台侧限流 / 每日上限提示是否出现在页面正文（瞬态 toast，需轮询检测）。"""
+        if self.limit_re is None:
+            return False
+        try:
+            body = page.evaluate("() => (document.body ? document.body.innerText.slice(0, 4000) : '')") or ''
+            return bool(self.limit_re.search(body))
+        except Exception:
+            return False
 
     # ---------- 投递相关：子类可覆盖的提示 / 后置动作 ----------
     def missing_button_message(self) -> str:
@@ -402,7 +505,7 @@ class CollectorBase:
     def do_login(self, timeout: int = 180, os_name: str | None = None) -> dict:
         """打开可见窗口扫码登录，Cookie 按平台持久化。"""
         log('🔐', f'[{self.platform}] 打开登录窗口，请用{self.label}扫码')
-        with open_browser(os_name=os_name, headless=False) as page:
+        with open_browser(os_name=os_name, headless=False, platform=self.platform) as page:
             cookies = load_cookies(self.platform)
             if cookies:
                 try:

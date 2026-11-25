@@ -1,4 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { Button, notification } from 'antd';
 import { useAppStore } from './store/useAppStore';
 import { cssVars } from './theme';
 import { useTheme } from './context/ThemeContext';
@@ -6,10 +7,11 @@ import { bridgeStatus } from './lib/bridgeClient';
 import { checkAllPlatformsLogin } from './lib/bossLogin';
 import { clearAllData } from './lib/storage';
 import { ensureSkillsLoaded } from './lib/bossclaw/skills';
+import { checkForUpdatesDaily, openReleasesPage } from './lib/bossclaw/updateCheck';
 import { useInterval } from './lib/hooks';
 import { startScheduler } from './lib/scheduler';
 import { useScheduleStore } from './store/useScheduleStore';
-import { consumeLegacyBatchDelivery } from './store/useSettingsStore';
+import { consumeLegacyBatchDelivery, useSettingsStore } from './store/useSettingsStore';
 import { restoreFromLocalBackup, startLocalBackup } from './lib/localBackup';
 import { syncTargetLocationsOnStart } from './lib/bossclaw/targetLocationSync';
 import Sidebar from './components/Sidebar';
@@ -32,13 +34,14 @@ const Stats = lazy(() => import('./pages/Stats'));
 const OpenClaw = lazy(() => import('./pages/OpenClaw'));
 const AutoChat = lazy(() => import('./pages/AutoChat'));
 const JobAssistant = lazy(() => import('./pages/JobAssistant'));
+const MockInterview = lazy(() => import('./pages/MockInterview'));
 const Settings = lazy(() => import('./pages/Settings'));
 
 // 非工作台功能页的路由 key（顺序即侧栏展示顺序；工作台单独常驻处理）。
 // 用于「首进常驻」：切到已访问页面不重挂载，仅切换显隐，消除来回切换的挂载卡顿。
-const NAV_PAGES: Array<'home' | 'resume' | 'directions' | 'tasks' | 'schedule' | 'stats' | 'openclaw' | 'autochat' | 'assistant' | 'settings'> = [
+const NAV_PAGES: Array<'home' | 'resume' | 'directions' | 'tasks' | 'schedule' | 'stats' | 'openclaw' | 'autochat' | 'assistant' | 'mockInterview' | 'settings'> = [
   'home', 'resume', 'directions', 'tasks',
-  'schedule', 'stats', 'openclaw', 'autochat', 'assistant', 'settings',
+  'schedule', 'stats', 'openclaw', 'autochat', 'assistant', 'mockInterview', 'settings',
 ];
 
 // 页面分块预加载：空闲期预取全部功能页 chunk，使首次切换无需等待懒加载请求/编译，
@@ -54,6 +57,7 @@ const PRELOAD_PAGES: Array<() => Promise<unknown>> = [
   () => import('./pages/OpenClaw'),
   () => import('./pages/AutoChat'),
   () => import('./pages/JobAssistant'),
+  () => import('./pages/MockInterview'),
   () => import('./pages/Settings'),
 ];
 
@@ -68,6 +72,29 @@ export default function App() {
     Object.entries(vars).forEach(([k, v]) => root.style.setProperty(k, v));
     root.setAttribute('data-theme', effective);
   }, [effective]);
+
+  // 托盘常驻 / 系统通知偏好同步到主进程（权威值在 AppConfig，主进程只做镜像）。
+  // 主进程的关窗拦截与通知发送都读这份镜像，因此这里必须「一变更就推」：
+  // 用户刚在设置页关掉常驻、立刻点关闭窗口，不能还按旧值把窗口收进托盘。
+  const closeToTray = useSettingsStore((s) => s.config.closeToTray);
+  const systemNotify = useSettingsStore((s) => s.config.systemNotify);
+  useEffect(() => {
+    window.electron?.setTrayPrefs?.({
+      closeToTray: closeToTray !== false,
+      notify: systemNotify !== false,
+    });
+  }, [closeToTray, systemNotify]);
+
+  // 通知点击回传的动作（P1-4「HR 回复提醒」）：主进程只负责唤回窗口并原样转发 clickAction，
+  // 跳哪个页面、高亮哪条会话都由渲染层解释 —— 这里只认已知 kind，未知 kind 一律忽略（不做兜底跳转）。
+  useEffect(() => {
+    const off = window.electron?.onNotifyAction?.((action) => {
+      if (!action || action.kind !== 'open-autochat') return;
+      useAutoChatStore.getState().focusConversation(String(action.conversation || ''));
+      useAppStore.getState().setRoute('autochat');
+    });
+    return () => { off?.(); };
+  }, []);
 
   // 侧边栏按窗口宽度自适应：窗口窄于断点（主窗口 minWidth 960）自动收起为图标栏，
   // 恢复宽度自动展开。跨断点翻转时才改状态，避免覆盖用户在同一侧的手动切换。
@@ -102,16 +129,21 @@ export default function App() {
   // 数据版本检测：v3 重建后首次启动清空旧 localStorage 数据（任务/岗位/会话/设置），
   // 与主进程 resetDataForVersion（清 BOSS 登录态）配套，实现「数据也重置」。
   useEffect(() => {
-    try {
-      const cur = localStorage.getItem('bossclaw-data-version');
-      if (cur !== DATA_VERSION) {
-        clearAllData();
-        localStorage.setItem('bossclaw-data-version', DATA_VERSION);
-        window.location.reload();
+    const run = async () => {
+      try {
+        const cur = localStorage.getItem('bossclaw-data-version');
+        if (cur !== DATA_VERSION) {
+          // issue #10：clearAllData 现在还要删 <userData>/queue/ 的队列文件（异步），
+          // 必须等它完成再 reload，否则新进程可能从旧文件里把队列读回来
+          await clearAllData();
+          localStorage.setItem('bossclaw-data-version', DATA_VERSION);
+          window.location.reload();
+        }
+      } catch (e) {
+        console.warn('[App] 数据版本重置失败（可能导致旧数据残留）: ' + String((e && (e as Error).message) || e));
       }
-    } catch (e) {
-      console.warn('[App] 数据版本重置失败（可能导致旧数据残留）: ' + String((e && (e as Error).message) || e));
-    }
+    };
+    void run();
   }, []);
 
   // 启动即实时探测本地桥接状态（不依赖持久化、不依赖进入 OpenClaw 页），
@@ -138,6 +170,44 @@ export default function App() {
   // 启动即预热 AI Skills 层：从 skills/*/SKILL.md 加载技能定义（调用 AI 时按作用域启用注入）
   useEffect(() => {
     ensureSkillsLoaded().catch(() => {});
+  }, []);
+
+  // 每日自动检查更新：进入应用后延迟 2 秒跑一次（避开首屏水合/资源竞争），
+  // 同一自然日只查一次（见 checkForUpdatesDaily），有新版本才用右上角通知提示。
+  // 只提示 + 给下载入口，不自动下载 / 替换程序文件（未签名 + asar:false，替换易被拦截且无法回退）。
+  useEffect(() => {
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void checkForUpdatesDaily()
+        .then((r) => {
+          if (cancelled || !r?.ok || !r.hasUpdate) return;
+          const key = 'bossclaw-update-available';
+          notification.info({
+            key,
+            message: `发现新版本 v${r.latest}`,
+            description: `当前版本 v${r.current}。可前往发布页下载安装包，应用不会自动替换程序。`,
+            placement: 'topRight',
+            duration: 0,
+            btn: (
+              <Button
+                type="primary"
+                size="small"
+                onClick={() => {
+                  openReleasesPage(r.url);
+                  notification.destroy(key);
+                }}
+              >
+                前往下载
+              </Button>
+            ),
+          });
+        })
+        .catch(() => {});
+    }, 2000);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, []);
 
   // 目标城市同源（设置页「基础求职条件」⇄ 职业画像）：启动时对存量数据做一次并集补齐。
@@ -244,7 +314,10 @@ export default function App() {
               </Suspense>
             </ErrorBoundary>
           </div>
-          {!isWorkbench && (
+          {/* M-41：原为 `{!isWorkbench && (...)}` —— 一旦进入工作台就整体卸载所有已访问页面，
+              与下方「首进常驻 / 保持挂载」的注释自相矛盾（来回切页会整页重挂载）。
+              现始终渲染，仅由 .is-show / .is-background / .workbench-host 控制显隐。 */}
+          {(
             /* 非工作台页「首进常驻」：已访问页保持挂载，仅切换 .is-show 显隐（display 控制），
                避免来回切换时整页卸载/重挂载的卡顿；未访问页展示 Suspense 骨架（lazy 分块已预取）。
                每个页面使用稳定 key（路由名），ErrorBoundary/key 不再随 activeRoute 变化，
@@ -260,7 +333,8 @@ export default function App() {
                           directions(投递方向)→Directions / tasks(任务进度)→Tasks /
                           schedule(定时任务)→ScheduleTasks / stats(数据统计)→Stats /
                           openclaw(OpenClaw)→OpenClaw / autochat(自动沟通)→AutoChat /
-                          assistant(定制简历)→JobAssistant / settings(设置)→Settings；
+                          assistant(定制简历)→JobAssistant / mockInterview(模拟面试)→MockInterview /
+                          settings(设置)→Settings；
                           workbench(工作台) 在「工作台常驻宿主」处单独挂载。新增模块需同步此处分支。 */}
                       {key === 'home' && <Home />}
                       {key === 'resume' && <Resume />}
@@ -271,6 +345,7 @@ export default function App() {
                       {key === 'openclaw' && <OpenClaw />}
                       {key === 'autochat' && <AutoChat />}
                       {key === 'assistant' && <JobAssistant />}
+                      {key === 'mockInterview' && <MockInterview isVisible={activeRoute === 'mockInterview'} />}
                       {key === 'settings' && <Settings isVisible={activeRoute === 'settings'} />}
                     </Suspense>
                   </ErrorBoundary>

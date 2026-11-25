@@ -6,6 +6,8 @@ import { electronApi } from '@/lib/electronApi';
 import { useRuntimeLogsStore } from '@/store/useRuntimeLogsStore';
 import { AgentAnswerError, requestAgentAnswer, AGENT_ANSWER_MIN_WAIT_MS } from './agentAnswer';
 import { resolveThinkingProfile, isThinkingActive } from './thinkingCapability';
+import { getCachedCapability } from './capabilitiesStore'; // 已探测的网关能力（上下文/思考等级/模态）
+import { adaptPayloadToError, modelParamKey, resolveModelParamPlan, type OutputTokenField } from './modelParams';
 import { DEFAULT_MODEL_NAME } from './providerPresets'; // P1-10：兜底模型名单源
 import { contextBudgetSignature } from './contextBudget'; // 缓存 key 需含上下文预算口径（见 cachedCallModel）
 
@@ -132,25 +134,42 @@ function escapeControlCharsInStrings(text: string): string {
   return out;
 }
 
-/** 单次修复尝试：对候选文本依次套用各确定性修复变体并解析。 */
-function tryParseVariants(raw: string): { ok: boolean; value?: any } {
-  const variants = [
+/**
+ * 单次修复尝试：对候选文本依次套用各确定性修复变体并解析。
+ * `completed` = 命中的变体**补过右括号**，即原文括号未闭合（多为被截断）——这类结果可能字段缺失，
+ * 调用方不得当完整 JSON 使用（见 extractJsonWithMeta）。**截断被静默接受的真正入口就在这里**：
+ * 原实现把「补括号」变体混在普通变体里，命中也返回成功，导致 step 3 的截尾标记永远不会触发。
+ */
+function tryParseVariants(raw: string): { ok: boolean; value?: any; completed: boolean } {
+  // 前 4 个变体不改结构（只做尾逗号 / 裸控制字符清理）：命中等价于「原文基本完整」
+  const plain = [
     raw,
     stripTrailingCommas(raw),
     escapeControlCharsInStrings(raw),
     stripTrailingCommas(escapeControlCharsInStrings(raw)),
-    closeBrackets(stripTrailingCommas(escapeControlCharsInStrings(raw))),
   ];
-  for (const variant of variants) {
-    try { return { ok: true, value: JSON.parse(variant) }; } catch { /* next */ }
+  for (const variant of plain) {
+    try { return { ok: true, value: JSON.parse(variant), completed: false }; } catch { /* next */ }
   }
-  return { ok: false };
+  // 最后一个变体补右括号：命中即说明原文括号未闭合 → 标 completed（可疑截断）
+  try {
+    const filled = closeBrackets(stripTrailingCommas(escapeControlCharsInStrings(raw)));
+    return { ok: true, value: JSON.parse(filled), completed: true };
+  } catch { /* next */ }
+  return { ok: false, completed: false };
 }
 
 // 从模型返回文本中提取 JSON（兼容 ```json 代码块或前缀噪声），
 // 并对常见 malformed / 截断 JSON 做有界自动修复
 // （不可见字符 / 尾逗号 / 字符串内裸控制字符 / 缺右括号 / 尾随说明文字 / 尾部残留垃圾）。
-export function extractJson(text: string): any {
+/**
+ * 同 extractJson，但额外回报「是否走了渐进截尾兜底」（`tailCut`）。
+ *
+ * 走到第 3 步（补括号 / 截尾）说明 JSON **无法完整直接解析**（多为被截断或括号未闭合），
+ * 此时补出来的对象**可能字段缺失**。调用方必须把 `tailCut === true` 当作可疑截断处理
+ * ——不得仅凭 `finish_reason` 判定（第三方网关可能把截断响应标成 `stop` 或省略该字段）。
+ */
+export function extractJsonWithMeta(text: string): { value: any; tailCut: boolean } {
   const cleaned = stripInvisible(String(text || '')).trim();
   const fence = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const base = (fence ? fence[1].trim() : cleaned).replace(/^json\s*\n/i, '');
@@ -163,7 +182,7 @@ export function extractJson(text: string): any {
   for (const raw of candidates) {
     // 1) 直接解析 + 确定性修复变体
     const direct = tryParseVariants(raw);
-    if (direct.ok) return direct.value;
+    if (direct.ok) return { value: direct.value, tailCut: direct.completed };
 
     // 2) 定位完整 JSON 值末端（去掉尾随说明文字），再尝试修复变体
     const end = balancedJsonEnd(raw);
@@ -171,29 +190,40 @@ export function extractJson(text: string): any {
       const trimmed = raw.slice(0, end + 1);
       if (trimmed !== raw) {
         const cut = tryParseVariants(trimmed);
-        if (cut.ok) return cut.value;
+        if (cut.ok) return { value: cut.value, tailCut: cut.completed };
       }
     }
 
     // 3) 渐进截尾兜底：先从「未补括号」的原文取真实结构边界（} / ]，最多 8 个从后往前），
     //    截断后补括号再解析 —— 注意 closeBrackets 会把缺失括号全补到串尾，若在其结果上找边界
-    //    边界会全部汇聚在末尾导致截尾失效（P1-05）
+    //    边界会全部汇聚在末尾导致截尾失效（P1-05）。此路径产出一律标 tailCut=true。
     const base2 = stripTrailingCommas(escapeControlCharsInStrings(raw));
     const tryClosed = (s: string) => {
       try { return JSON.parse(closeBrackets(s)); } catch { return undefined; }
     };
     const whole = tryClosed(closeBrackets(base2));
-    if (whole !== undefined) return whole;
+    if (whole !== undefined) return { value: whole, tailCut: true };
     const positions: number[] = [];
     const boundary = /[}\]]/g;
     let bm: RegExpExecArray | null;
     while ((bm = boundary.exec(base2))) positions.push(bm.index + 1);
     for (const end of positions.slice(-8).reverse()) {
       const v = tryClosed(base2.slice(0, end));
-      if (v !== undefined) return v;
+      if (v !== undefined) return { value: v, tailCut: true };
     }
   }
-  throw new Error('无法解析 JSON');
+  throw new AIError('AI_INVALID_JSON', '无法解析 JSON（自动修复未能成功）', { partial: text });
+}
+
+/** 兼容包装：只取解析结果（不关心是否走了截尾兜底）。 */
+export function extractJson(text: string): any {
+  const value = extractJsonWithMeta(text).value;
+  // M-18：出口必须是**普通对象**。旧实现会把顶层为 number / string / null 的合法 JSON 也判为成功，
+  // 上层按对象取值时全部落空（表现为「AI 返回空字段」），同时掩盖了「模型没按对象输出」这一真实失败。
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new AIError('AI_INVALID_JSON', 'AI 返回的 JSON 顶层不是对象', { partial: text });
+  }
+  return value;
 }
 
 /** 在结果对象上挂非枚举 _repaired 标记（供消费方区分「AI 修复过」与「原生输出」）；失败不影响主流程 */
@@ -364,17 +394,27 @@ async function repairJsonViaModel(
   const content = String(brokenContent || '').trim();
   if (content.length < 12 || !/[[{]/.test(content)) return null; // 太短/不像 JSON，不值得二次调用
   const schemaHint = String(opts.systemPrompt || '').trim();
-  const requested = Number(opts.maxTokens ?? originalPayload.max_tokens ?? 600);
-  const payload = {
+  // 输出长度字段名沿用「刚刚成功/正在使用」的那个请求体的口径（issue #28）：
+  // gpt-5.x 起只认 max_completion_tokens，这里若写死 max_tokens，补齐调用必然 400 →
+  // repairJsonViaModel 按约定返回 null，整条 AI 结果就此静默作废。
+  const tokenField: OutputTokenField = Object.prototype.hasOwnProperty.call(originalPayload || {}, 'max_completion_tokens')
+    ? 'max_completion_tokens'
+    : 'max_tokens';
+  const requested = Number(opts.maxTokens ?? originalPayload?.[tokenField] ?? 600);
+  const payload: any = {
     ...originalPayload,
     messages: [
       { role: 'system', content: schemaHint ? `${schemaHint}\n\n${REPAIR_JSON_SYSTEM}` : REPAIR_JSON_SYSTEM },
       { role: 'user', content: content.slice(0, 8000) },
     ],
-    temperature: 0,
-    max_tokens: Math.min(Math.max(600, requested), MODEL_MAX_OUTPUT_TOKENS),
     response_format: { type: 'json_object' },
   };
+  // temperature 同理：上一次请求体里带着才发（推理模型不接受自定义温度，纠偏时已被剔除）
+  if (Object.prototype.hasOwnProperty.call(originalPayload || {}, 'temperature')) payload.temperature = 0;
+  else delete payload.temperature;
+  delete payload.max_tokens;
+  delete payload.max_completion_tokens;
+  payload[tokenField] = Math.min(Math.max(600, requested), MODEL_MAX_OUTPUT_TOKENS);
   delete payload.thinking; // 修复不需要思考模式
   try {
     const r = await requestModel(url, payload, apiKey, timeoutMs);
@@ -458,11 +498,16 @@ export async function callModel(messages: ChatMessage[], config: AppConfig['mode
   //   · unsupported（未验证支持的模型）→ 不发送任何思考参数（用户开着开关也不发，fail-safe）；
   //   · toggleable → 按 config.thinking.enabled 发开启/关闭片段；
   //   · always-on（如 glm-5.3 / GPT-6 Astra）→ 只发开启片段，且不发关闭片段（传 disabled 会 400）。
-  const thinkingProfile = resolveThinkingProfile(config.provider, config.model, config.baseUrl);
+  // 思考能力：先按服务商+模型名前缀（thinkingCapability.ts），前缀未命中且已探测到网关能力时
+  // 用 /v1/models 声明的能力判定（见 capabilitiesStore.ts），否则 fail-safe 判 unsupported。
+  const discoveredCapability = getCachedCapability(config.baseUrl, config.model);
+  const thinkingProfile = resolveThinkingProfile(config.provider, config.model, config.baseUrl, discoveredCapability ?? undefined);
   const thinkingActive = isThinkingActive(thinkingProfile, config.thinking);
   const thinkingEffort = String(config.thinking?.effort || thinkingProfile.defaultEffort || '');
   const timeoutMs = Number(options.timeoutMs || 90000);
   const temperature = Number(options.temperature ?? config.temperature ?? 0.1);
+  // 参数口径的会话记忆键（见 modelParams.ts）：纠偏结论按「服务商|模型|端点」记住
+  const paramKey = modelParamKey(config.provider, config.model, config.baseUrl);
 
   // 服务端提示词缓存（DeepSeek 等 provider 的 context caching）用量：命中时输入价约为未命中的 1/10。
   // 多轮尝试（重试/补齐）时逐次累计到会话统计（设置页可见）。
@@ -481,14 +526,18 @@ export async function callModel(messages: ChatMessage[], config: AppConfig['mode
     llmUsageSession.cacheMissTokens += miss;
   };
 
-  /** 单次往返：发请求 → 网关不支持 response_format 时降级重发 → 取出 content / finish_reason。 */
+  /** 单次往返：发请求 → 4xx 参数/格式不兼容时按服务端提示改写请求体重发 → 取出 content / finish_reason。 */
   const requestOnce = async (over: { maxTokens?: number; nudge?: string } = {}) => {
-    const payload: any = {
+    // 参数口径（输出长度字段名 / 能否发 temperature）每次重建：上一轮纠偏学到的结论要立刻生效。
+    const plan = resolveModelParamPlan(config.provider, config.model, config.baseUrl);
+    const tokenField: OutputTokenField = plan.tokenField;
+    let payload: any = {
       model: config.model || DEFAULT_MODEL_NAME, // P1-10：兜底模型名引用 providerPresets 单源
       messages: over.nudge ? withNudge(effectiveMessages, over.nudge) : effectiveMessages,
-      temperature,
-      max_tokens: over.maxTokens ?? baseMaxTokens,
     };
+    // issue #28：gpt-5.x 起输出长度字段改名为 max_completion_tokens；推理模型也不接受自定义 temperature
+    if (plan.supportsTemperature) payload.temperature = temperature;
+    payload[tokenField] = over.maxTokens ?? baseMaxTokens;
     if (jsonMode) payload.response_format = { type: 'json_object' };
     // 思考参数：仅当模型被判定为支持思考时才附加；开启思考时同时带上强度档位。
     if (thinkingProfile.mode !== 'unsupported') {
@@ -506,10 +555,21 @@ export async function callModel(messages: ChatMessage[], config: AppConfig['mode
 
     let response = await requestModel(url, payload, apiKey, timeoutMs);
     let bodyText = await response.text();
-    if (!response.ok && jsonMode && [400, 404, 422].includes(response.status) && /response[_ -]?format|json_object|unsupported/i.test(bodyText)) {
-      const retryPayload = { ...payload };
-      delete retryPayload.response_format;
-      response = await requestModel(url, retryPayload, apiKey, timeoutMs);
+    // 4xx 的两条自适应重试（每次只改一处、总次数有界，避免反复改写把请求刷成死循环）：
+    //   ① 参数口径不符 → 按服务端点名的字段改写（issue #28：max_tokens ⇄ max_completion_tokens、
+    //      省略推理模型不接受的 temperature）；结论由 modelParams.ts 在会话内记住；
+    //   ② 网关不支持 response_format → 去掉该字段重发（既有降级路径）。
+    for (let round = 0; round < 2 && !response.ok; round++) {
+      let next: Record<string, any> | null = adaptPayloadToError(payload, response.status, bodyText, paramKey);
+      // 参数纠偏已处理过的报错不会再走到这里（next 非空），故保留原有的宽松匹配不影响新路径
+      if (!next && jsonMode && [400, 404, 422].includes(response.status) && /response[_ -]?format|json_object|unsupported/i.test(bodyText)) {
+        const withoutFormat: Record<string, any> = { ...payload };
+        delete withoutFormat.response_format;
+        next = withoutFormat;
+      }
+      if (!next) break;
+      payload = next; // 记下「真正成功的那份请求体」，供 JSON 补齐调用沿用同一参数口径
+      response = await requestModel(url, next, apiKey, timeoutMs);
       bodyText = await response.text();
     }
     if (!response.ok) {
@@ -538,7 +598,7 @@ export async function callModel(messages: ChatMessage[], config: AppConfig['mode
   };
 
   // ---- 第 1 次调用 ----
-  let attempt = await requestOnce();
+  const attempt = await requestOnce();
   let content = attempt.content;
   let finishReason = attempt.finishReason;
   let payload = attempt.payload;
@@ -580,16 +640,29 @@ export async function callModel(messages: ChatMessage[], config: AppConfig['mode
   // ---- JSON 模式：确定性解析修复 → 二次 AI 补齐 ----
   // 截断场景不做「宽松截尾修复」：那会拿到字段缺失的半截对象（静默错值比报错更危险），
   // 直接交二次补齐（带原始 schema 重问）或抛 AI_TRUNCATED 让上层走既定降级（如画像的精简重试）。
-  const truncatedFinal = finishReason === 'length';
+  // ⚠️ 「是否截断」不能只看 finish_reason：第三方网关可能把截断响应标成 `stop` 或省略该字段。
+  // 因此把「只能经渐进截尾兜底才解析出对象」（tailCut）也视为可疑截断 —— 同样走二次补齐 / 抛错。
+  const truncatedByFinish = finishReason === 'length';
   let parsed: any;
   let repaired = false;
-  if (!truncatedFinal) {
+  let tailCut = false;
+  if (!truncatedByFinish) {
     try {
-      parsed = extractJson(content);
+      const ex = extractJsonWithMeta(content);
+      // 与 extractJson 同口径（审查 #7）：顶层必须是普通对象。数组/标量属于「模型没按对象输出」，
+      // 不能当成功结果返回 —— 上层按对象取值会全部落空，且后续给结果挂 _usage 也会失败。
+      const v = ex.value;
+      if (v === null || typeof v !== 'object' || Array.isArray(v)) {
+        throw new AIError('AI_INVALID_JSON', 'AI 返回的 JSON 顶层不是对象', { partial: content });
+      }
+      parsed = v;
+      tailCut = ex.tailCut;
     } catch {
       parsed = undefined;
     }
   }
+  const truncatedFinal = truncatedByFinish || tailCut;
+  if (tailCut) parsed = undefined; // 半截对象不作数：交二次补齐，禁止当成功返回
   if (parsed === undefined) {
     const viaModel = await repairJsonViaModel(url, content, payload, apiKey, timeoutMs, {
       maxTokens: truncatedFinal ? Math.min(baseMaxTokens * 2, MODEL_MAX_OUTPUT_TOKENS) : baseMaxTokens,
@@ -720,7 +793,7 @@ export function resetLLMUsageStats(): void {
 // 不再重复计费。任何输入变化（简历/画像/岗位描述/自定义提示词/模型/温度）都会自然产生新 key。
 // 缓存只存成功结果；失败与测试连接（ping）一律不缓存。
 
-export type AICacheScope = 'profile' | 'job-analysis' | 'greetings' | 'assistant';
+export type AICacheScope = 'profile' | 'job-analysis' | 'greetings' | 'assistant' | 'mock-interview';
 
 export interface AICacheMeta {
   /** 缓存作用域：画像 / 岗位分析 / 打招呼语 / 求职助手（用于分类管理与清空） */
@@ -747,7 +820,9 @@ interface AICacheEntry {
 const AI_CACHE_KEY = 'bossclaw-ai-cache-v1';
 const AI_CACHE_STATS_KEY = 'bossclaw-ai-cache-stats';
 const AI_CACHE_MAX_ENTRIES = 300;
-const AI_CACHE_MAX_BYTES = 2_500_000; // localStorage 建议上限 5MB，缓存控制在 2.5MB 内
+// 单键体积自设上限：与 localStorage 配额无关（实测配额 52,428,800 码元，见 lib/storage.ts），
+// 只为压低每次缓存刷新时对整键 JSON.stringify 的主线程开销
+const AI_CACHE_MAX_BYTES = 2_500_000;
 
 const AI_CACHE_DEFAULT_TTL: Record<AICacheScope, number> = {  // 画像 / 打招呼语：key 已含简历与画像全文哈希，内容不变结果必然有效，仅设长 TTL 防陈旧
   profile: 90 * 24 * 3600 * 1000,
@@ -756,6 +831,8 @@ const AI_CACHE_DEFAULT_TTL: Record<AICacheScope, number> = {  // 画像 / 打招
   'job-analysis': 7 * 24 * 3600 * 1000,
   // 求职助手（定制简历/求职信、评估报告）：key 含简历/画像/岗位全文，内容变化自动失效
   assistant: 7 * 24 * 3600 * 1000,
+  // 模拟面试：每问都依赖前文，缓存永远不会命中，**实际不启用**；这里仅为类型齐备
+  'mock-interview': 0,
 };
 
 /** 缓存作用域 → 中文用途标签（作为 callModel 的 purpose，用于调用日志与缓存命中统计展示） */
@@ -764,6 +841,7 @@ const AI_SCOPE_LABELS: Record<AICacheScope, string> = {
   greetings: '打招呼语',
   'job-analysis': '岗位分析',
   assistant: '定制简历 / 求职助手',
+  'mock-interview': '模拟面试',
 };
 
 // djb2 双哈希（碰撞概率足够低），渲染进程无 node crypto，用稳定字符串哈希
@@ -856,7 +934,7 @@ function flushCacheNow(): void {
 }
 
 // 命中统计内存累加 + 定期落盘：hits/misses 不再每次 bump 都同步读写 stats key
-let statsAccum: {
+const statsAccum: {
   hits: number;
   misses: number;
   loaded: boolean;
@@ -967,6 +1045,35 @@ export function getAICacheStats(): { entries: number; totalBytes: number; hits: 
 const aiCacheInFlight = new Map<string, Promise<any>>();
 
 /**
+ * 结构克隆一次模型返回值（缓存存/取两侧都必须过它）——审查 #2。
+ *
+ * 背景：缓存条目按**引用**保存、命中时又返回**同一引用**，而消费方（`matching.ts::analyzeJob`）
+ * 会就地对返回值改写：
+ *   `result.greeting = …`、`result.dimensions = fusedDimensions`、`delete result.dimensionScores`。
+ * 于是**首次分析就把缓存条目改坏**（`dimensionScores` 被删、`dimensions` 被覆写）：
+ * 第二次相同输入命中缓存时 AI 维度分已不存在 → `mergeAiDimensions` 全量回退本地 →
+ * 走「纯整体分」而非 60/40 维度融合 → 同岗位两次分析可能落在不同档位/分数，
+ * 违背「同岗位重复分析落同一档」的产品承诺。
+ *
+ * 处置：生产者写入缓存前克隆一份（缓存不再被调用方改写），命中/返回时再克隆一份
+ * （调用方拿到的永远是自己的副本）。`_repaired` 是**非枚举**属性、克隆会丢，故单独还原。
+ */
+function cloneCallResult<T>(value: T): T {
+  if (value == null || typeof value !== 'object') return value;
+  let out: T;
+  try {
+    out = typeof structuredClone === 'function'
+      ? structuredClone(value)
+      : (JSON.parse(JSON.stringify(value)) as T);
+  } catch {
+    // 含不可克隆值（函数 / DOM 节点等）时退回原引用——AI JSON 结果恒为纯数据，正常不会走到这里
+    out = value;
+  }
+  if ((value as { _repaired?: boolean })._repaired) markRepaired(out);
+  return out;
+}
+
+/**
  * 带缓存的模型调用：相同输入命中本地缓存直接返回（不重复计费）。
  * 缓存 key = scope + provider + model + temperature + maxTokens + jsonMode + 完整 messages。
  * 任何输入（简历/画像/岗位/提示词/模型参数）变化都会产生新 key，保证命中结果与当前输入严格一致。
@@ -1011,20 +1118,24 @@ export async function cachedCallModel(
     // 高频命中会造成渲染主线程阻塞、卡顿）。实际缓存条目仍在其写入时持久化，不受影响。
     bumpCacheStats(1, 0);
     // P1-06：命中时把「曾修复」标记挂回结果（非枚举 _repaired 过不了 JSON.stringify，须由 entry 字段承载）
-    if (hit.repaired) markRepaired(hit.value);
-    return hit.value;
+    // 审查 #2：返回**克隆**而非缓存引用——调用方会就地改写返回值（见 cloneCallResult 注释）。
+    const value = cloneCallResult(hit.value);
+    if (hit.repaired) markRepaired(value);
+    return value;
   }
   if (map[key]) delete map[key]; // 已过期：清理
 
   const inFlight = aiCacheInFlight.get(key);
-  if (inFlight) return inFlight;
+  // 并发等待同一在飞请求时同样返回克隆：否则多个调用方共用同一个对象、互相改写（审查 #2）
+  if (inFlight) return inFlight.then((v) => cloneCallResult(v));
 
   const task = (async () => {
     const result = await callModel(messages, config, { ...options, purpose: options.purpose ?? AI_SCOPE_LABELS[scope] });
     // P1-06：把「是否经二次补齐修复」落进缓存 entry（_repaired 非枚举属性会丢，须显式字段）
     map[key] = {
       key,
-      value: result,
+      // 审查 #2：写入缓存的是**克隆**，调用方后续对返回值的就地改写不会污染缓存条目
+      value: cloneCallResult(result),
       ts: Date.now(),
       ttlMs,
       hits: 0,
@@ -1049,7 +1160,8 @@ export async function cachedCallModel(
   });
   aiCacheInFlight.set(key, guarded);
   try {
-    return await guarded;
+    // 审查 #2：调用方拿到的永远是副本，缓存条目/生产者对象都不可被外部改写
+    return cloneCallResult(await guarded);
   } finally {
     if (aiCacheInFlight.get(key) === guarded) aiCacheInFlight.delete(key);
   }

@@ -8,16 +8,27 @@
 //      - 投递  : POST /wapi/zpgeek/friend/add.json { encryptJobId, encryptBossId, greeting }
 //   2. 页面信息回传（nav / login-state）供地址栏、标签页、登录态显示。
 //   3. 真实输入通道（jc:webview-input）——BOSS 受控 contenteditable 只认真实输入（isTrusted:true）。
+//      · 2026-10-03 收口第一期：**BOSS 聊天链路**（立即沟通 / 发送按钮 / 弹窗确认 / 输入前悬停）
+//        已改为真实事件优先（humanClickElement：真实优先、合成兜底，带重复点击去重）。
+//      · 采集用的卡片点击**必须保持合成**（依赖 cancelable 事件阻止默认导航），见 clickElement 注释。
+//      · 非 BOSS 平台按钮（智联 / 猎聘 / 前程无忧）**本期未收口**：那些平台的合成点击已验证可用，
+//        无证据支持下改动属盲改。收口前置条件 = 先在真机确认其同样校验 isTrusted。
 //   4. DOM 兜底投递（start-apply 简化版）——仅当 API 返回未知码 / 网络异常时使用。
 //
 // 安全不变量（AGENTS.md 2.1）：未确认文字气泡不计成功；招呼语非空；验证码/风控立即停止交人工；
 // 不绕过平台安全措施。code 36/32/35/37/38 统一映射风控码，由上层（Workbench + safety.ts）处理。
 'use strict';
 
-const { ipcRenderer } = require('electron');
+const { ipcRenderer, webFrame } = require('electron');
 // 多平台 DOM 适配表（webview 侧唯一权威：列表选择器 / 链接形态 / 页面形态判定）。
 // 纯数据 + 纯函数、零 DOM 依赖 → 可直接单测（见 desktop-app/tmp/probe-webview-platforms.cjs）。
 const ADAPTERS = require('./platform-adapters.cjs');
+// 猎聘 IM 状态读取（纯 DOM 读取，零 Electron 依赖 → 可离线回归）。
+// 「会话窗口打开」不等于「招呼语已发送」，故发送与确认都以此模块的状态快照为准。
+const { readLiepinImState, findNewLiepinConversation, normalizeLiepinText, readLiepinDeliveryState } = require('./liepin-im.cjs');
+// 人类化输入计划（纯函数，零 DOM 依赖 → 单测见 desktop-app/scripts/humanize-regression.mjs）。
+// 只负责「怎么动」，不发事件；真实点击/输入仍走 jc:webview-input 主进程通道。
+const humanize = require('./humanize.cjs');
 // ===== 防重复注入保护（session.setPreloads 与元素 preload 属性双路径可能重复注入同一脚本）=====
 (function () {
   if (typeof window !== 'undefined' && window.__bossclawWebviewPreload) return;
@@ -41,6 +52,15 @@ try { notify('preload-alive', { url: location.href, time: Date.now() }); } catch
 // ===== preload 注入标记（供主进程 dom-ready 后 executeJavaScript 检查，写入 diag 文件）=====
 // sandboxed preload 与页面共享 window，此标记在页面上下文可见；无此标记 = preload 未注入
 try { window.__bossclawPreload = Date.now(); } catch {}
+
+// 注：主世界反检测补丁**不在 preload 注入**，原因（2026-10-02 实测，见
+// docs/内置浏览器反检测评估报告-2026-10-02.md §5 与 tmp/stealth-probe/out/verify-inject-timing-*.json）：
+//   本 preload 运行在隔离世界，改不了主世界 navigator；改用 webFrame.executeJavaScript 送主世界
+//   虽然可行，但实测其执行时机**仍晚于页面第一段内联脚本**（head 采样时补丁标记为 null），
+//   与主进程 did-start-loading 通道等价、却多一层依赖 —— 故不做。
+//   另实测：preload 内 require 向上跳出目录会 module not found（仅同目录相对路径可用）。
+//   补丁注入统一由 main.cjs 的 injectStealth 负责（did-start-loading + dom-ready 双时机）。
+//   唯一能抢在文档创建前注入主世界的是 CDP Page.addScriptToEvaluateOnNewDocument（路线 B，见报告 §6）。
 
 function visible(el) {
   if (!el) return false;
@@ -167,17 +187,8 @@ function platformListPage() {
 // 非 BOSS 平台详情页岗位提取（URL jobId + 通用文本字段）
 function platformExtractJob() {
   const url = location.href;
-  let jobId = '';
-  if (PLATFORM === 'liepin') {
-    const m = url.match(/\/job\/(\d+)/i) || url.match(/jobId=(\d+)/i);
-    if (m) jobId = m[1];
-  } else if (PLATFORM === 'zhaopin') {
-    const m = url.match(/jobdetail\/([^/?]+)/i);
-    if (m) jobId = m[1];
-  } else if (PLATFORM === 'job51') {
-    const m = url.match(/jobId=(\d+)/i) || url.match(/jobs\.51job\.com\/([^/]+)/i);
-    if (m) jobId = m[1];
-  }
+  // jobId 统一走适配表唯一权威（覆盖猎聘 /job/ 与 SEO /a/ 两种形态，见 jobIdFromUrl 注释）
+  const jobId = ADAPTERS.jobIdFromUrl(url);
   const title = pickText(['h1', '[class*="job-title"]', '[class*="job-name"]', '[class*="position"] h3', 'title']) || document.title;
   // 公司名：窄选择器优先，避免 [class*="company"] 命中地点容器；cleanCompanyName 兜底
   const company = cleanCompanyName(pickText(['[class*="company-name"] .name', '[class*="company-name"]', '[class*="companyName"]', '[class*="comp-name"]', '.cname', 'a[href*="gongsi"]', 'a[href*="company"]']));
@@ -714,7 +725,7 @@ function extractJobFromDom() {
   // 薪资：选择器优先；兜底正则在还原后的整段文本上跑（与采集 cardFields 同口径，
   // 新版页面/选择器不命中时也能从正文拿到薪资）
   const salary = decodeSalaryDigits(pick(['.job-banner .salary', '.salary', '.job-salary', '[class*="job-salary"]', '[class*="salary"]']))
-    || scopeText.match(/\d+(?:\.\d+)?[-–~]\d+(?:\.\d+)?[Kk万]|\d+[Kk]以上|\d+[-–~]\d+元/)?.[0]
+    || matchSalaryText(scopeText)
     || '';
   // 地点：选择器优先（含新版 a.text-city 城市链接）；兜底城市关键字正则（与采集 cardFields 同口径），
   // 之后 applyEmbeddedOverlay 还会用 meta「地点：」权威覆盖。
@@ -1000,29 +1011,93 @@ function isDisabledish(el) {
     || /(^|\s)disable(d)?(\s|$)/i.test(String(el?.className || ''));
 }
 
-function sendButton(input, opts = {}) {
-  const allowDisabled = Boolean(opts && opts.allowDisabled);
-  if (!input) return null;
-  // 「立即沟通」弹窗的发送是 <div class="send-message disable">发送</div>（非 button），
-  // 初始带 disable 类、由页面框架在输入内容后移除；allowDisabled=true 时也返回该元素，
-  // 由调用方 waitFor 其启用后再点击（默认 false 保持原有语义：只认已启用按钮）。
-  const usable = (el) => visible(el) && (allowDisabled || !isDisabledish(el));
-  const sels = '.send-message, [class*="send-message"], [class*="sendMessage"], .send-btn, .btn-send, [class*="sendBtn"], [class*="btn-send"], [class*="chatSend"], [class*="chat-send"]';
-  // 优先输入框所属编辑区/弹窗内的按钮（避免被页面底部全局的「发送」误命中）
-  const scope = input.closest('[class*="edit-area"], [class*="editArea"], .startchat-content, [class*="startchat"], [class*="chat-input"], [class*="input-box"], [class*="editor"]');
-  const scoped = scope ? all(sels).filter((el) => scope.contains(el)).find(usable) : null;
-  const labelMatch = scoped || all(sels).find(usable);
-  if (labelMatch) {
-    const label = textOf(labelMatch);
-    if (!/发送简历|发送附件|发送在线简历|发简历|图片/.test(label) && (/^发送$/.test(label) || /send/i.test(String(labelMatch.className || '')))) return labelMatch;
+function chatSendVisible(el) {
+  return Boolean(el?.isConnected && visible(el) && !el.closest('[hidden],[aria-hidden="true"]'));
+}
+
+function chatSendEditors(root) {
+  const excluded = '[class*="user-list"],[class*="friend-list"],[class*="contact-list"],[class*="conversation-list"],[class*="recommend"],[class*="similar-job"]';
+  return all('input,textarea,[contenteditable="true"],[contenteditable="plaintext-only"]', root).filter(el => {
+    if (!chatSendVisible(el) || isDisabledish(el) || el.readOnly || el.closest(excluded + ',[aria-readonly="true"],[aria-disabled="true"]')) return false;
+    if (el.parentElement?.closest('[contenteditable="true"],[contenteditable="plaintext-only"]')) return false;
+    const hints = ['placeholder', 'aria-label', 'title', 'name'].map(attr => el.getAttribute(attr) || '').join(' ');
+    const semantics = hints + ' ' + el.id + ' ' + String(el.className || '');
+    if (el.type === 'search' || /search|filter|搜索|查找|筛选|关键词/i.test(semantics) || el.closest('[role="search"]')) return false;
+    if (el.matches('input') && !el.matches('input[type="text"],input:not([type])')) return false;
+    return el.id === 'chat-input' || /chat-input|input-area/.test(String(el.className || ''))
+      || /消息|回复|打招呼|沟通/.test(hints) || Boolean(el.isContentEditable && el.closest('.chat-editor'));
+  });
+}
+
+function chatSendPanel(input) {
+  // 面板形态只放宽「容器叫什么」，不放宽确认口径：
+  // 「立即沟通」弹窗（.startchat-content）、岗位页右侧会话（.chat-conversation）与
+  // 完整聊天页（/web/geek/chat，主区常命名为 chat-content / chat-main）都要能命中；
+  // 会话列表侧栏不是发送面板（它没有消息列表 + 头部的成对结构）。
+  const panels = '.chat-conversation,[class*="chat-conversation"],[class*="chatConversation"],'
+    + '[class*="chat-panel"],[class*="chatPanel"],[class*="chat-window"],[class*="chatWindow"],'
+    + '[class*="chat-content"],[class*="chatContent"],[class*="chat-main"],[class*="chatMain"],.startchat-content';
+  for (let panel = input?.parentElement; panel && !panel.matches('body,html'); panel = panel.parentElement) {
+    if (!panel.matches(panels) || !chatSendVisible(panel)) continue;
+    const messages = all('.im-list,.message-list,[class*="message-list"],[class*="messageList"],[class*="msg-list"],[class*="msgList"]', panel).filter(chatSendVisible);
+    const headers = all('.chat-header,[class*="chatHeader"],.conversation-header,[class*="chat-title"]', panel)
+      .filter(el => chatSendVisible(el) && !el.querySelector('input,textarea,[contenteditable],.im-list,.message-list'));
+    // 当前 BOSS 的 .chat-conversation 首个直接子节点是收件人/岗位头部。
+    // 只在已确认的聊天面板内使用该结构，不能读取页面正文或会话列表。
+    const first = panel.firstElementChild;
+    const header = headers.length === 1 ? headers[0] : headers.length === 0 && panel.matches('.chat-conversation')
+      && chatSendVisible(first) && !first.matches('input,textarea,[contenteditable],.im-list,.message-list')
+      && !first.querySelector('input,textarea,[contenteditable],.im-list,.message-list') ? first : null;
+    if (messages.length === 1 && header && normalizeChatText(textOf(header))) return { panel, header, messages: messages[0] };
   }
-  // 兜底：输入框右下方最近的「发送」按钮
-  const inputRect = input.getBoundingClientRect();
-  return all('button,[role="button"],[class*="send"]').find((el) => {
-    if (!usable(el)) return false;
-    const rect = el.getBoundingClientRect();
-    return /^发送$/.test(textOf(el)) && Math.abs(rect.top - inputRect.bottom) < 200 && rect.left > inputRect.left - 60;
-  }) || null;
+  return null;
+}
+
+function createChatSendContext(input) {
+  const editors = chatSendEditors(document);
+  if (editors.length !== 1 || editors[0] !== input) return null;
+  const scopes = editors.map(editor => ({ editor, scope: chatSendPanel(editor) })).filter(item => item.scope);
+  if (scopes.length !== 1 || scopes[0].editor !== input) return null;
+  const scope = scopes[0].scope;
+  return { ...scope, input, identity: normalizeChatText(textOf(scope.header)), url: location.href };
+}
+
+function currentChatSendInput(context) {
+  if (!context || location.href !== context.url || !chatSendVisible(context.panel) || !chatSendVisible(context.header)
+    || !context.panel.contains(context.header) || !context.panel.contains(context.messages)
+    || !chatSendVisible(context.messages) || normalizeChatText(textOf(context.header)) !== context.identity) return null;
+  const editors = chatSendEditors(document);
+  if (editors.length !== 1) return null;
+  const scope = chatSendPanel(editors[0]);
+  return scope?.panel === context.panel && scope.header === context.header && scope.messages === context.messages ? editors[0] : null;
+}
+
+// 发送按钮候选：只认「指定面板内、语义唯一」的文字发送控件。
+// 安全口径：找不到唯一目标就返回空数组（上层转 failed），绝不退回到页面全局按钮。
+function textSendCandidates(root, input, header, messages) {
+  const selector = 'button,[role="button"],.send-message,[class*="send-message"],[class*="sendMessage"],.send-btn,.btn-send,[class*="sendBtn"],[class*="chat-send"],[aria-label],[title]';
+  const matches = all(selector, root).filter(el => {
+    if (!chatSendVisible(el) || el === input || input.contains(el) || el.closest('[contenteditable],textarea,input')) return false;
+    if ((header && header.contains(el)) || (messages && messages.contains(el))
+      || !el.matches('button,[role="button"],[class*="send"],[class*="Send"]')) return false;
+    const labels = [textOf(el), el.getAttribute('aria-label') || '', el.getAttribute('title') || ''].map(normalizeChatText);
+    if (labels.some(label => /图片|图像|附件|简历|电话|微信|image|photo|attach|resume|phone|wechat/i.test(label))) return false;
+    return labels.some(label => /^(发送|发送消息|发送文字|发送文本|发送招呼语|send|send message|send text)$/i.test(label));
+  });
+  // 内层有相同语义的 span 时只保留其真实 button/role=button，避免祖先重复。
+  return matches.filter(el => !matches.some(other => other !== el && other.contains(el)
+    && other.matches('button,[role="button"]')));
+}
+
+// 发送按钮定位：只认「当前聊天面板内、语义唯一」的文字发送控件。
+// 「立即沟通」弹窗的发送是 <div class="send-message disable">发送</div>（非 button），
+// allowDisabled=true 时也返回该元素，由调用方 waitFor 其启用后再点击。
+function sendButton(input, opts = {}) {
+  const context = opts.context || createChatSendContext(input);
+  if (!context || currentChatSendInput(context) !== input) return null;
+  const candidates = textSendCandidates(context.panel, input, context.header, context.messages);
+  if (candidates.length !== 1 || (!opts.allowDisabled && isDisabledish(candidates[0]))) return null;
+  return candidates[0];
 }
 
 // 文本归一化：去掉零宽字符/统一空白，用于气泡级匹配招呼文案
@@ -1065,54 +1140,365 @@ function focusEditableScoped(input) {
   } catch {}
   return editor;
 }
-// 文字气泡确认：发送后聊天记录里出现刚发送的文字（安全不变量：未确认不计成功）。
-// BOSS 聊天 DOM 屡次改版，气泡节点语义类各不相同：按「气泡级选择器 + 文本归一化」匹配，
-// 避免只按固定的容器选择器整段判断而漏掉（导致已成功发送却被误判失败、未写入已投递）。
-function confirmOwnMessage(greeting) {
-  const needle = normalizeChatText(greeting).slice(0, 30);
-  if (!needle || needle.length < 12) return false;
-  // 聊天气泡节点语义类（对齐 job-claw-main chatMessageNodes 的选择器集）
-  const bubbleSelectors = [
-    '.message-content', '.chat-message', '.message-item', '.message-text',
-    '[class*="message-content"]', '[class*="messageContent"]',
-    '[class*="chat-message"]', '[class*="chatMessage"]',
-    '[class*="message-item"]', '[class*="messageItem"]',
-    '[class*="message-text"]', '[class*="messageText"]',
-    '[class*="bubble"]', '[class*="chat-record"]', '[class*="chatRecord"]',
-    '[class*="item-myself"]', '[class*="itemMyself"]',
-    '[class*="msg-item"]', '[class*="msgItem"]', '[data-message-id]',
-    '[class*="conversation"] .msg', '[class*="chat-list"] [class*="item"]',
-  ];
-  // 1) 气泡级精确匹配：某个消息节点正文等于招呼语或其前 30 字
-  const nodes = new Set();
-  for (const sel of bubbleSelectors) { for (const el of all(sel)) nodes.add(el); }
-  for (const el of nodes) {
-    if (!visible(el)) continue;
-    const t = normalizeChatText(el.innerText || el.textContent || '');
-    if (t && t.includes(needle)) return true;
+const OWN_MESSAGE_SELECTOR = '.item-myself,.item-self,.item-own,.message-self,[data-direction="outgoing"],[data-from="self"]';
+
+function ownMessageEntriesIn(root) {
+  const own = OWN_MESSAGE_SELECTOR;
+  return all(own, root).filter(node => chatSendVisible(node)
+    && !node.parentElement?.closest(own) && !node.closest('[contenteditable],textarea,input')
+    && !node.matches('.failed,.sending,[data-status="failed"],[data-status="sending"]')).flatMap(node => {
+      const texts = all('.text,.message-content,.message-text,.text-content,[data-message-text],.bubble-text', node)
+        .filter(el => chatSendVisible(el) && !el.closest('[contenteditable],textarea,input'));
+      const leaves = texts.filter(el => !texts.some(other => other !== el && el.contains(other)));
+      // 气泡内可能同时有正文与状态/时间（「已发送」等）两个叶子节点：
+      // 逐叶子返回并按全文精确匹配，避免整条气泡因叶子数 != 1 被丢弃（有气泡却判失败）。
+      return leaves.flatMap(el => {
+        const text = normalizeChatText(textOf(el));
+        return text ? [{ node, text, id: node.getAttribute('data-message-id') || node.getAttribute('data-mid') || '' }] : [];
+      });
+    });
+}
+
+function ownMessageEntries(context) {
+  if (!currentChatSendInput(context)) return [];
+  return ownMessageEntriesIn(context.messages);
+}
+
+function captureOwnMessages(context) {
+  if (!currentChatSendInput(context)) return null;
+  const entries = ownMessageEntries(context);
+  return { entries, nodes: new Set(entries.map(entry => entry.node)), ids: new Set(entries.map(entry => entry.id).filter(Boolean)),
+    messages: context.messages, tail: context.messages.lastElementChild };
+}
+
+// 文字气泡确认：只认「本次新增的完整己方气泡」（安全不变量：未确认不计成功）。
+// 判据必须同时满足：
+//   ① 编辑器已清空（草稿留在输入框 ≠ 已发送，issue #22 的假成功就出在这里）；
+//   ② 目标面板与会话身份未变（currentChatSendInput 复核）；
+//   ③ 气泡是基线之后新增的节点（节点身份 + 消息 ID + DOCUMENT_POSITION_FOLLOWING）；
+//   ④ 正文与招呼语全文精确相等（不设长度阈值，也不做前缀截断）。
+// 明确禁止：整页 innerText 兜底、按钮状态推断、长度阈值 —— 它们都会把「写进编辑框」
+// 或「页面上任意位置出现过这句话」误判成发送成功。
+function confirmOwnMessage(greeting, context, before) {
+  const input = currentChatSendInput(context);
+  const needle = normalizeChatText(greeting);
+  if (!input || !needle || !before || before.messages !== context.messages
+    || normalizeChatText(input.value || input.innerText || '') || before.entries.some(entry => entry.text === needle)) return false;
+  // 历史列表整段重建/虚拟滚动不能证明本次新增；证据不足时交人工核对。
+  if (before.tail && (!before.tail.isConnected || before.tail.parentElement !== context.messages)) return false;
+  return ownMessageEntries(context).some(entry => entry.text === needle && !before.nodes.has(entry.node)
+    && !(entry.id && before.ids.has(entry.id))
+    && (!before.tail || Boolean(before.tail.compareDocumentPosition(entry.node) & Node.DOCUMENT_POSITION_FOLLOWING)));
+}
+
+// ===== 首次沟通弹窗通道（issue #6 / #22）=====
+// 弹窗（.startchat-content）只有 editor + 发送按钮，没有消息列表，无法建立 chatSendPanel 上下文。
+// 但不能因此退回 2.5.5 的「整页正文包含招呼语」兜底 —— 那正是 #22 把「写进编辑框」误判成功的成因。
+// 弹窗通道的确认口径与主通道一致：编辑器必须清空 + 页面出现「本次新增的完整己方气泡」。
+// 聊天页 URL（BOSS 桌面站 /web/geek/chat，移动站 app.zhipin.com）。
+// 只有这类页面才要求「新增己方气泡」级确认；岗位详情页的首次沟通弹窗没有稳定的
+// 己方气泡语义（实测有气泡但不带 item-myself 等类），按编辑框是否清空收口。
+function isChatPageUrl(url = location.href) {
+  const href = String(url || '');
+  return /app\.zhipin\.com/i.test(href) || /(\/web\/geek\/chat|\/chat(?:\/|\?|#|$))/i.test(href);
+}
+
+function startChatDialog(input) {
+  for (let panel = input?.parentElement; panel && !panel.matches('body,html'); panel = panel.parentElement) {
+    if (!chatSendVisible(panel) || !panel.matches('.startchat-content, [class*="startchat"]')) continue;
+    if (!panel.querySelector('textarea,[contenteditable="true"],[contenteditable="plaintext-only"]')) continue;
+    return panel;
   }
-  // 2) 兜底：整篇页面正文包含招呼语（发送成功后输入框已清空，正文仅剩发出的气泡；覆盖选择器未命中的改版 DOM）
-  return normalizeChatText(document.body?.innerText).includes(needle);
+  return null;
+}
+
+function ownMessageNodes() {
+  return ownMessageEntriesIn(document).map(entry => entry.node);
+}
+
+function confirmDialogGreeting(greeting, input, beforeNodes) {
+  if (!input || !input.isConnected) return false;
+  // 草稿留在编辑框 ≠ 已发送（#22 的假成功就出在这里）。
+  if (normalizeChatText(input.value || input.innerText || '')) return false;
+  const needle = normalizeChatText(greeting);
+  if (!needle) return false;
+  return ownMessageEntriesIn(document).some(entry => !beforeNodes.has(entry.node) && entry.text === needle);
+}
+
+// 非聊天页（岗位详情 + 首次沟通弹窗）：按产品口径不启用气泡确认。
+// 仍需「可信点击回执 + 编辑器已清空」——「文字已输入但未发送」时编辑器不会被清空，
+// 这条判据正是 #22 的假成功特征，比整页正文匹配更可靠。
+function confirmDialogAccepted(input) {
+  if (!input || !input.isConnected) return false;
+  return !normalizeChatText(input.value || input.innerText || '');
+}
+
+async function sendDialogGreeting(input, dialog, greeting) {
+  const fail = (reason, clicked = false, sent = clicked ? null : false) => {
+    notify('apply-stage', { stage: 'log', message: `弹窗文字发送停止：${reason}`, sent });
+    return { ok: false, reason, clicked, sent };
+  };
+  const expected = normalizeChatText(greeting);
+  if (!expected || !dialog || !input?.isConnected) return fail('沟通弹窗已变化');
+  const beforeNodes = new Set(ownMessageNodes());
+  if (ownMessageEntriesIn(document).some(entry => entry.text === expected)) {
+    return fail('历史消息已包含相同文字，请人工核对避免重复发送');
+  }
+  notify('apply-stage', { stage: 'fill_message', label: '填写招呼语' });
+  input.scrollIntoView?.({ block: 'center' });
+  await trustedHoverElement(input);
+  if (!dialog.isConnected || !chatSendVisible(dialog) || !input.isConnected) return fail('输入前沟通弹窗已关闭');
+  const editor = focusEditableScoped(input);
+  const needle20 = expected.slice(0, 20);
+  let ins = { ok: false };
+  for (let i = 0; i < 3 && !ins.ok; i++) {
+    if (i > 0) { focusEditableScoped(editor); await jitterDelay(400); }
+    ins = await trustedInput('insertText', greeting);
+    if (ins.ok) {
+      const got = normalizeChatText(editor?.innerText || editor?.value || '');
+      if (got && got.includes(needle20)) break;
+      ins = { ok: false };
+      await jitterDelay(300);
+    }
+  }
+  if (!ins.ok) {
+    notify('apply-stage', { stage: 'failed', error: '真实输入写入失败，已暂停' });
+    return fail('真实输入写入失败');
+  }
+  notify('apply-stage', { stage: 'send_message', label: '发送招呼语' });
+  // 弹窗发送按钮是 <div class="send-message disable">发送</div>，由页面按输入值切掉 disable。
+  const candidates = textSendCandidates(dialog, input, null, null);
+  if (candidates.length !== 1) return fail('未找到唯一的弹窗发送按钮，已停止');
+  const btn = candidates[0];
+  try { btn.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch {}
+  await waitFor(() => !isDisabledish(btn), 4000, '发送按钮启用');
+  if (isDisabledish(btn)) return fail('弹窗发送按钮未启用，已停止');
+  const clicked = await trustedClickElement(btn, { guard: () => {
+    if (!dialog.isConnected || !chatSendVisible(dialog) || !input.isConnected) return false;
+    const current = textSendCandidates(dialog, input, null, null);
+    return current.length === 1 && current[0] === btn
+      && normalizeChatText(input.value || input.innerText || '') === expected;
+  } });
+  if (!clicked) return fail('弹窗文字发送可信点击失败，已停止；请人工核对消息状态', false, null);
+  // 气泡确认只在聊天页启用；岗位详情弹窗按「编辑框已清空」收口（见 confirmDialogAccepted）。
+  const requireBubble = isChatPageUrl();
+  notify('apply-stage', { stage: 'verify_message', label: requireBubble ? '确认新增完整己方文字气泡' : '确认点击后编辑框已清空', sent: null });
+  const confirmed = await waitFor(
+    () => (requireBubble ? confirmDialogGreeting(greeting, input, beforeNodes) : confirmDialogAccepted(input)),
+    8000,
+    requireBubble ? '新增完整文字气泡确认' : '编辑框已清空确认'
+  );
+  if (!confirmed) {
+    return fail(requireBubble
+      ? '未能确认新增完整己方文字气泡，请人工核对，禁止自动重发'
+      : '发送后编辑框未清空，无法确认已发送，请人工核对', true);
+  }
+  return { ok: true, clicked: true, sent: true };
+}
+
+function confirmEditorCleared(context) {
+  const input = currentChatSendInput(context);
+  if (!input) return false;
+  return !normalizeChatText(input.value || input.innerText || '');
+}
+
+// 队列岗位进入的必须是「对应会话」：会话头文本要能对上岗位的 HR 名或公司。
+// 产品口径：只做判定，不点击左侧会话列表、不自行切换会话；对不上就停发（可重试，不转人工）。
+const GENERIC_RECRUITER_NAME = /^(hr|hrbp|boss|招聘者|招聘专员|人事|人事专员|先生|女士)$/i;
+function contextMatchesJob(context, job) {
+  const header = normalizeChatText(textOf(context?.header));
+  if (!header) return false;
+  const name = normalizeChatText(job?.recruiterName);
+  const company = normalizeChatText(job?.company);
+  const usableName = name && !GENERIC_RECRUITER_NAME.test(name) ? name : '';
+  // 没有任何可用于判定的身份字段时保持原行为（不额外拦截）。
+  if (!usableName && !company) return true;
+  return Boolean((company && header.includes(company)) || (usableName && header.includes(usableName)));
+}
+
+async function sendChatMessage(context, greeting, before) {
+  const fail = (reason, clicked = false, sent = clicked ? null : false) => {
+    // 直接触发发送时可能没有活跃队列任务；log 阶段仍会保留这条脱敏终态。
+    notify('apply-stage', { stage: 'log', message: `文字发送停止：${reason}`, sent });
+    return { ok: false, reason, clicked, sent };
+  };
+  const expected = normalizeChatText(greeting);
+  if (!expected || !before || !currentChatSendInput(context)) return fail('聊天面板或会话已变化');
+  if (before.entries.some(entry => entry.text === expected)) return fail('历史消息已包含相同文字，请人工核对避免重复发送');
+  const btn = await waitFor(() => {
+    const input = currentChatSendInput(context);
+    if (!input || normalizeChatText(input.value || input.innerText || '') !== expected) return null;
+    return sendButton(input, { context });
+  }, 4000, '文字发送按钮启用');
+  if (!btn) {
+    notify('apply-stage', { stage: 'log', message: '文字发送前置检查失败：会话变化、按钮不唯一或启用超时', sent: false });
+    return fail('未找到唯一且已启用的文字发送按钮，已停止');
+  }
+  notify('apply-stage', { stage: 'log', message: '文字发送按钮已启用', button: { tag: btn.tagName.toLowerCase(),
+    label: '文字发送', enabled: true }, sent: null });
+  const guard = () => {
+    const input = currentChatSendInput(context);
+    return Boolean(input && normalizeChatText(input.value || input.innerText || '') === expected
+      && sendButton(input, { context }) === btn && !ownMessageEntries(context).some(entry => entry.text === expected));
+  };
+  // 不走 humanClickElement 的去重/合成兜底：仅一次可信文字发送，失败后不能再回车或重发。
+  const clicked = await trustedClickElement(btn, { guard, report: (step, ok) => {
+    // Workbench 只持久化 message；不能把回执状态只放在会被丢弃的元数据中。
+    notify('apply-stage', { stage: 'log', message: `文字发送点击检查：${step}=${ok ? '通过' : '失败'}`, sent: null });
+  } });
+  notify('apply-stage', { stage: 'log', message: `文字发送可信点击回执：${clicked ? '成功' : '失败'}`, trustedClick: clicked, sent: null });
+  if (!clicked) return fail('文字发送可信点击失败，已停止；请人工核对消息状态', false, null);
+  // 气泡确认只在聊天页启用；非聊天页（岗位详情右侧会话等）按「编辑框已清空」或
+  // 「新增己方气泡」任一证据收口 —— 两者都比整页正文匹配强，且不会把草稿当成功。
+  const requireBubble = isChatPageUrl();
+  notify('apply-stage', { stage: 'verify_message', label: requireBubble ? '确认新增完整己方文字气泡' : '确认点击后编辑框已清空', sent: null });
+  const confirmed = await waitFor(
+    () => (requireBubble
+      ? confirmOwnMessage(greeting, context, before)
+      : (confirmEditorCleared(context) || confirmOwnMessage(greeting, context, before))),
+    8000,
+    requireBubble ? '新增完整文字气泡确认' : '编辑框已清空确认'
+  );
+  if (!confirmed) {
+    return fail(requireBubble
+      ? '未能确认新增完整己方文字气泡，请人工核对，禁止自动重发'
+      : '发送后编辑框未清空，无法确认已发送，请人工核对', true);
+  }
+  return { ok: true, clicked: true, sent: true };
 }
 
 // 真实鼠标点击（isTrusted:true，经主进程 sendInputEvent 产生）。
 // 为什么必须有它：BOSS「立即沟通」是 <a href="javascript:;">，页面处理器**只认可信输入**——
 // dispatchEvent 的合成点击会被完全忽略（线上实测：点击后按钮仍在、无弹窗、无输入框、无导航、无风控），
 // 这与 BOSS 聊天输入框「只认真实输入」是同一套加固。坐标用视口坐标（getBoundingClientRect 即视口系）。
-async function trustedClickElement(el) {
+//
+// 人类化轨迹：真人不「瞬移光标 + 立即点击」。这里先沿弧线走一小段（humanize.buildMousePath），
+// 再落点按下抬起——整条轨迹仍只占 1 条信道消息（主进程 walkPathThen），不吃频率预算。
+// 光标起点用上一次落点推算（lastCursor），避免每次都从固定坐标出发这一可统计特征。
+let lastCursor = null;
+
+function elementCenter(el) {
+  try {
+    const rect = el.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    const x = Math.round(rect.left + rect.width / 2);
+    const y = Math.round(rect.top + rect.height / 2);
+    // 视口外坐标不会命中目标（也会误伤页面其它元素）→ 直接放弃，交上层按失败处理
+    if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) return null;
+    return { x, y };
+  } catch { return null; }
+}
+
+function visibleClickPoint(el) {
+  if (!el?.isConnected) return null;
+  const rect = el.getBoundingClientRect();
+  const left = Math.max(0, rect.left), top = Math.max(0, rect.top);
+  const right = Math.min(innerWidth, rect.right), bottom = Math.min(innerHeight, rect.bottom);
+  if (right - left < 4 || bottom - top < 4) return null;
+  // 小尺寸内嵌视口会裁切页面，固定浮层也可能仅遮住按钮中心。
+  // 只在此按钮与视口的交集中找点，并逐点检查真实顶层命中；不点击浮层或相邻控件。
+  for (const fy of [0.5, 0.25, 0.75, 0.1, 0.9]) {
+    for (const fx of [0.5, 0.25, 0.75, 0.1, 0.9]) {
+      const x = Math.round(left + (right - left) * fx), y = Math.round(top + (bottom - top) * fy);
+      const hit = document.elementFromPoint(x, y);
+      if (hit === el || (hit && el.contains(hit))) return { x, y };
+    }
+  }
+  return null;
+}
+
+function observeTrustedClick(el) {
+  let finish;
+  let timer;
+  const receipt = new Promise(resolve => { finish = resolve; });
+  const done = (ok) => {
+    clearTimeout(timer);
+    document.removeEventListener('click', onClick, true);
+    finish(ok);
+  };
+  const onClick = (event) => {
+    // 派发 IPC 成功并不等于按钮收到点击。只接受此按钮/其子节点的原生 click。
+    if (!event.isTrusted) return;
+    done(Boolean(el.isConnected && (event.target === el || el.contains(event.target))));
+  };
+  document.addEventListener('click', onClick, true);
+  timer = setTimeout(() => done(false), 1200);
+  return { receipt, cancel: () => done(false) };
+}
+
+async function trustedClickElement(el, opts = {}) {
   if (!el) return false;
   try { el.scrollIntoView?.({ block: 'center', behavior: 'instant' }); } catch {}
   await jitterDelay(200);
-  let rect = null;
-  try { rect = el.getBoundingClientRect(); } catch {}
-  if (!rect || rect.width <= 0 || rect.height <= 0) return false;
-  const x = Math.round(rect.left + rect.width / 2);
-  const y = Math.round(rect.top + rect.height / 2);
-  // 视口外坐标不会命中目标（也会误伤页面其它元素）→ 直接放弃，交上层按失败处理
-  if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) return false;
-  const r = await trustedInput('clickAt', '', { x, y });
-  await jitterDelay(160);
+  const to = opts.guard ? visibleClickPoint(el) : elementCenter(el);
+  opts.report?.('按钮坐标', Boolean(to));
+  if (!to) return false;
+  const from = lastCursor || { x: Math.max(0, to.x - 70 - Math.round(Math.random() * 40)), y: Math.max(0, to.y - 50 - Math.round(Math.random() * 30)) };
+  const path = humanize.buildMousePath(from, to);
+  if (opts.settle !== false) await sleep(humanize.settleDelayMs());
+  let click = { x: to.x, y: to.y, path };
+  if (opts.guard) {
+    // 受保护的文字发送先完成轨迹，再复核。最终 clickAt 不带异步轨迹，
+    // 防止检查后等待鼠标移动期间切换会话，或等待前的坐标变成其他控件。
+    const hovered = await trustedInput('hoverAt', '', { path });
+    opts.report?.('悬停回执', Boolean(hovered?.ok));
+    if (!hovered?.ok) return false;
+    const guarded = Boolean(opts.guard());
+    opts.report?.('会话与草稿守卫', guarded);
+    if (!guarded) return false;
+    const current = visibleClickPoint(el);
+    const hit = current && document.elementFromPoint(current.x, current.y);
+    const hitTarget = Boolean(current && (hit === el || el.contains(hit)));
+    opts.report?.('按钮命中', hitTarget);
+    if (!hitTarget) return false;
+    click = { x: current.x, y: current.y };
+  }
+  const observed = opts.guard ? observeTrustedClick(el) : null;
+  const r = await trustedInput('clickAt', '', click);
+  opts.report?.('输入事件派发', Boolean(r?.ok));
+  if (!r?.ok) observed?.cancel();
+  const received = observed ? await observed.receipt : Boolean(r?.ok);
+  if (observed) opts.report?.('按钮原生点击回执', received);
+  if (r?.ok && received) lastCursor = { x: click.x, y: click.y };
+  await jitterDelay(opts.afterMs || 160);
+  return Boolean(r?.ok && received);
+}
+
+// 纯悬停：只移动光标到元素（可带轨迹），不按键。用于「输入前先把鼠标移过去」。
+async function trustedHoverElement(el) {
+  if (!el) return false;
+  const to = elementCenter(el);
+  if (!to) return false;
+  const from = lastCursor || { x: Math.max(0, to.x - 60), y: Math.max(0, to.y - 40) };
+  const path = humanize.buildMousePath(from, to);
+  const r = await trustedInput('hoverAt', '', { path });
+  if (r && r.ok) lastCursor = { x: to.x, y: to.y };
   return Boolean(r && r.ok);
+}
+
+// 同一元素短时间内的重复点击去重。
+// 为什么需要：轮询等待（如等弹窗消失）里每 300ms 就点一次同一按钮——真人不会，
+// 而且每次点都消耗一次信道频率预算。去重后只点一次，之后再等。
+const recentClickAt = new WeakMap();
+
+function clickedRecently(el, windowMs) {
+  const t = recentClickAt.get(el);
+  return Boolean(t) && (Date.now() - t) < windowMs;
+}
+
+// 统一点击入口：**真实点击优先，合成点击兜底**。
+// 优先级依据：BOSS 交互按钮与受控输入框有线上实测证明只认 isTrusted；
+// 兜底依据：真实点击要求元素在视口内且主进程通道可用，任一不满足时不能让业务空转。
+// 注意：采集用的「卡片点击」**不能**走这里——它依赖 sanitizeUnsafeActivation +
+// cancelable 合成事件阻止默认导航（真实点击无法 preventDefault），详见 clickElement 注释。
+async function humanClickElement(el, opts = {}) {
+  if (!el) return false;
+  const dedupeMs = Number(opts.dedupeMs) || 1500;
+  if (clickedRecently(el, dedupeMs)) return true; // 已处理过，视为成功，避免轮询里反复点
+  recentClickAt.set(el, Date.now());
+  const okTrusted = await trustedClickElement(el, opts);
+  if (okTrusted) return true;
+  try { await clickElement(el); return false; } catch { return false; }
 }
 
 async function enterChat() {
@@ -1131,17 +1517,26 @@ async function enterChat() {
     location.href = href; // 跨域导航到 app.zhipin.com，preload 会重新注入
     return null;
   }
-  await clickElement(button);
-  // 先用合成点击（与参考实现一致）；3s 内没出现输入框就判定合成点击未被页面接受，
-  // 改用**真实鼠标点击**重试——BOSS 的交互按钮只认 isTrusted 事件（实测合成点击零反应）。
-  let input = await waitFor(() => chatInput(), 3000, '聊天输入框(合成点击)');
-  if (!input) {
-    const clicked = await trustedClickElement(button);
+  // 顺序说明（2026-10-03 调整）：**真实点击优先**，不再是「先合成、失败再真实」。
+  // 依据：BOSS 的交互按钮有线上实测证明只认 isTrusted（合成点击零反应），
+  // 先合成等于必然多花一次 3s 等待 + 一次无效点击（无效点击本身也是行为层噪声）。
+  // 合成点击保留为兜底：真实点击要求元素在视口内，滚出视口时有兜底才不会整链路空转。
+  const clicked = await humanClickElement(button);
+  if (!clicked) {
     notify('apply-stage', {
       stage: 'log',
-      message: clicked
-        ? '合成点击未生效，已改用真实鼠标点击（isTrusted）重试：' + diagChatButton(button)
-        : '合成点击未生效，且真实点击不可用（元素不在视口内），现场诊断：' + diagChatButton(button),
+      message: '真实鼠标点击不可用（元素不在视口内或通道受限），已回退合成点击，现场诊断：' + diagChatButton(button),
+    });
+  }
+  let input = await waitFor(() => chatInput(), 3000, '聊天输入框(真实点击)');
+  if (!input) {
+    // 兜底路径下再给真实点击一次机会（元素可能刚刚滚入视口）
+    const retried = await trustedClickElement(button);
+    notify('apply-stage', {
+      stage: 'log',
+      message: retried
+        ? '首次点击未生效，已改用真实鼠标点击（isTrusted）重试：' + diagChatButton(button)
+        : '点击未生效且真实点击不可用，现场诊断：' + diagChatButton(button),
     });
   }
   // 点击后 BOSS 对新会话岗位常弹确认框（「继续沟通 / 确认沟通 / 留在此页 / 我知道了」等），
@@ -1152,7 +1547,9 @@ async function enterChat() {
   const deadline = Date.now() + 12000;
   while (Date.now() < deadline) {
     const dlg = dialogConfirmButton();
-    if (dlg) { try { dlg.click(); } catch {} }
+    // 弹窗确认同样走真实点击（BOSS 弹窗按钮与主按钮同一套加固）；
+    // dedupe 必须给足：轮询 300ms 一轮，不去重会每轮点一次同一按钮（真人不会，且吃频率预算）。
+    if (dlg) await humanClickElement(dlg, { dedupeMs: 2500 });
     input = chatInput();
     if (input) break;
     await jitterDelay(300);
@@ -1261,7 +1658,8 @@ async function domApplyOnce({ job = {}, greeting = '' } = {}) {
     }
     notify('apply-stage', { stage: 'open_chat', label: '打开沟通窗口' });
     let input = chatInput();
-    // 已进入聊天页但输入框未就绪（渲染慢）：给足等待，不立即失败
+    // 已进入聊天页但输入框未就绪（渲染慢 / 正在进入对应会话）：给足等待，不立即失败。
+    // 产品口径：不自行点击左侧会话列表切换会话，只等岗位自己的会话加载出来。
     if (!input && /(\/web\/geek\/chat|\/chat(?:\/|\?|$))/i.test(location.href)) {
       input = await waitFor(() => chatInput(), 30000, '聊天输入框就绪');
     }
@@ -1277,19 +1675,63 @@ async function domApplyOnce({ job = {}, greeting = '' } = {}) {
       return;
     }
 
+    // 首次沟通弹窗（.startchat-content）没有消息列表，走独立的弹窗通道；
+    // 它的确认口径同样是「编辑器清空 + 新增完整己方气泡」，不退回整页正文兜底。
+    const dialog = startChatDialog(input);
+    if (dialog) {
+      const result = await sendDialogGreeting(input, dialog, safeGreeting);
+      if (!result.ok) {
+        const needsReview = result.clicked === true && result.sent !== true;
+        notify('apply-stage', { stage: 'failed', error: result.reason, sent: result.sent, needsReview });
+        return;
+      }
+      notify('apply-stage', { stage: 'verify_result', label: '确认投递结果', ok: true, sent: true });
+      return;
+    }
+
+    // 聊天面板/消息区可能比输入框晚挂载（issue #6）：这里等「唯一面板 + 基线快照」同时就绪，
+    // 而不是看到输入框就立刻判失败；等不到唯一面板才 failed。
+    const preflight = await waitFor(() => {
+      const context = createChatSendContext(input);
+      const before = context ? captureOwnMessages(context) : null;
+      return context && before ? { context, before } : null;
+    }, 10000, '聊天面板与消息基线就绪');
+    if (!preflight) {
+      notify('apply-stage', { stage: 'failed', error: '无法确定唯一的当前聊天面板，已停止输入和发送', sent: false });
+      return;
+    }
+    const { context, before } = preflight;
+    // 只判定、不自行点击/切换会话：当前面板对不上岗位的 HR 或公司时停发。
+    if (!contextMatchesJob(context, job)) {
+      notify('apply-stage', { stage: 'failed', error: '当前会话与岗位不匹配（未能对上 HR 或公司），已停止输入和发送', sent: false });
+      return;
+    }
+    if (before.entries.some(entry => entry.text === normalizeChatText(safeGreeting))) {
+      notify('apply-stage', { stage: 'failed', error: '历史消息已包含相同招呼语，请人工核对避免重复发送', sent: false });
+      return;
+    }
     notify('apply-stage', { stage: 'fill_message', label: '填写招呼语' });
     // 仅编辑区内清空/聚焦（严禁整页 selectAll）；随后可信 insertText 插入。
     input.scrollIntoView({ block: 'center' });
+    // 先把光标真实移过去再输入：否则序列是「点按钮 → 鼠标不动 → 文字凭空出现」，
+    // 这是行为层很显眼的一条（真人必然先移动鼠标）。纯移动、不按键，失败也不影响后续写入。
+    await trustedHoverElement(input);
+    if (currentChatSendInput(context) !== input) {
+      notify('apply-stage', { stage: 'failed', error: '输入前聊天会话或输入框发生变化，已停止', sent: false });
+      return;
+    }
     const editor = focusEditableScoped(input);
     // 沟通窗口渲染慢时 Slate 编辑器可能未完全就绪，单次 insertText 易失权：带重试 + 落盘文本校验。
     const needle20 = normalizeChatText(safeGreeting).slice(0, 20);
     let ins = { ok: false };
     for (let i = 0; i < 3 && !ins.ok; i++) {
+      if (currentChatSendInput(context) !== input) break;
       if (i > 0) { focusEditableScoped(editor); await jitterDelay(400); }
+      if (currentChatSendInput(context) !== input) break;
       ins = await trustedInput('insertText', safeGreeting);
       if (ins.ok) {
         const got = normalizeChatText(editor?.innerText || editor?.value || '');
-        if (got && got.includes(needle20)) break; // 已落盘 → 成功
+        if (got && got.includes(needle20)) break; // 已落盘 → 成功（发送前还会复核全文精确相等）
         ins = { ok: false }; // 被 Slate 渲染清掉 → 重试
         await jitterDelay(300);
       }
@@ -1313,36 +1755,16 @@ async function domApplyOnce({ job = {}, greeting = '' } = {}) {
       fire();
       setTimeout(fire, 200);
     } catch {}
-    // 找发送按钮（含 disable 态），等待框架把按钮切为可用后点击；点击后仍以文字气泡确认兜底。
-    const btn = sendButton(input, { allowDisabled: true });
-    if (btn) {
-      try { btn.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch {}
-      await waitFor(() => !isDisabledish(btn), 4000, '发送按钮启用');
-      btn.click();
-    } else {
-      // 未找到按钮：弹窗 textarea 内回车是换行、不会发送，直接交人工；
-      // 其余输入（contenteditable 聊天页等）仍退回回车发送兜底。
-      const isDialogTextarea = input.matches('textarea');
-      if (!isDialogTextarea) {
-        const enter = await trustedInput('pressEnter');
-        if (!enter.ok) {
-          notify('apply-stage', { stage: 'failed', error: '未找到发送按钮且回车发送失败，已暂停' });
-          return;
-        }
-      } else {
-        notify('apply-stage', { stage: 'failed', error: '未找到可用的发送按钮（发送按钮可能未随输入内容启用），已暂停请人工发送' });
-        return;
-      }
-    }
-
-    // 文字气泡确认（安全不变量）
-    notify('apply-stage', { stage: 'verify_message', label: '确认文字已发送' });
-    const confirmed = await waitFor(() => confirmOwnMessage(safeGreeting), 8000, '文字气泡确认');
-    if (!confirmed) {
-      notify('apply-stage', { stage: 'failed', error: '未能确认文字气泡已发送，请人工核对后重试' });
+    // 唯一发送通道：可信点击 + 新增完整己方气泡确认；失败不再回车/重发。
+    const result = await sendChatMessage(context, safeGreeting, before);
+    if (!result.ok) {
+      // 已点击但未能确认新增己方气泡：证据不足（不是确定的失败），保留页面交人工核对，
+      // 由上层标记 needsReview 并暂停引擎；绝不自动重发。
+      const needsReview = result.clicked === true && result.sent !== true;
+      notify('apply-stage', { stage: 'failed', error: result.reason, sent: result.sent, needsReview });
       return;
     }
-    notify('apply-stage', { stage: 'verify_result', label: '确认投递结果', ok: true });
+    notify('apply-stage', { stage: 'verify_result', label: '确认投递结果', ok: true, sent: true });
   } catch (error) {
     const errorText = String(error?.message || error);
     if (/安全验证|验证码|频繁|限速|登录|封禁|异常/.test(errorText)) {
@@ -1387,7 +1809,8 @@ async function openChatOnly() {
       try { location.href = href; } catch {}
       return;
     }
-    await clickElement(button);
+    // 真实点击优先（同 enterChat：BOSS 交互按钮只认 isTrusted）
+    await humanClickElement(button);
     // 等待聊天输入框出现；期间自动点确认弹窗、检测安全验证
     const deadline = Date.now() + 12000;
     let riskHit = false;
@@ -1397,7 +1820,7 @@ async function openChatOnly() {
         break;
       }
       const dlg = dialogConfirmButton();
-      if (dlg) { try { dlg.click(); } catch {} }
+      if (dlg) await humanClickElement(dlg, { dedupeMs: 2500 });
       input = chatInput();
       if (input) break;
       await jitterDelay(300); // 轮询等待聊天输入框出现（节奏人肉化）
@@ -1451,6 +1874,14 @@ async function smoothScrollIntoView(el) {
 // 关键：点击岗位卡片 / 立即沟通按钮时，临时移除 javascript: href 和内联 onclick，
 // 派发可取消的 click 事件，让 BOSS 的 React/Vue 监听器收到事件但默认导航被阻止，
 // 从而「内联更新详情面板」而不是「跳转页面」，实现连续采集多个岗位。
+//
+// ⚠️ 为什么这里**不能**改用真实点击（humanClickElement / sendInputEvent）：
+//   本函数的核心不是「让页面收到事件」，而是「让页面收到事件但**阻止默认导航**」。
+//   阻止导航靠的是 cancelable 合成事件 + capture 阶段 preventDefault —— 真实鼠标事件由浏览器
+//   在页面外产生，preload 无法 preventDefault。而岗位卡片本身是 <a href="/job_detail/...">
+//   （sanitizeUnsafeActivation 只摘 javascript: 形式，正常的相对/绝对 href 会保留），
+//   真实点击会直接把列表页导航走 → 采集串台、断链。
+//   **需要真事件的场景请走 humanClickElement（真实优先、合成兜底），不要改这里。**
 const UNSAFE_NAV_ATTRS = ['href', 'xlink:href', 'formaction', 'action'];
 const INLINE_ACT_ATTRS = ['onclick', 'onmousedown', 'onmouseup', 'onpointerdown', 'onpointerup', 'ontouchstart', 'ontouchend'];
 const normalize = (value) => String(value || '').replace(/\s+/g, '').replace(/[·•｜|]/g, '').trim().toLowerCase();
@@ -1561,7 +1992,7 @@ function collectCards(quiet = false) {
     // 或薪资文本（含「元」后缀，如智联「9000-10000元」——排除筛选栏 / 无关 li）
     return Boolean(el.querySelector?.(LINK_SELECTOR))
       || Boolean(el.getAttribute?.('data-bossclaw-jobdetail'))
-      || /\d+(?:\.\d+)?[-–~]\d+(?:\.\d+)?[Kk万]|\d+[Kk]以上|\d+[-–~]\d+元/.test(content);
+      || SALARY_TEXT_RE.test(content);
   });
   // 「像列表容器」的候选：内部装着 **≥2 个互不包含**的有效候选（即两张以上真卡）→ 它是列表/包装容器。
   // 这类元素**不允许吸收内层**，否则会把内层真卡并成一条、静默丢岗位（宁重复不遗漏）。
@@ -1603,12 +2034,9 @@ function cardJobTokens(el) {
   const push = (raw) => {
     const s = String(raw || '').trim();
     if (!s) return;
-    const m = s.match(/jobdetail\/([^/?#]+)/i)
-      || s.match(/job_detail\/([^/?#]+)/i)
-      || s.match(/jobId=([^&#]+)/i)
-      || s.match(/\/job\/(\d+)/i)
-      || s.match(/jobs\.51job\.com\/([^/?#]+)/i);
-    out.add(m ? m[1] : s.split('?')[0]);
+    // 岗位号提取统一走适配表（新增链接形态只需改 jobIdFromUrl）
+    const id = ADAPTERS.jobIdFromUrl(s);
+    out.add(id || s.split('?')[0]);
   };
   if (el.matches?.(LINK_SELECTOR)) push(el.getAttribute('href'));
   push(el.getAttribute?.('data-bossclaw-jobdetail'));
@@ -1621,6 +2049,48 @@ function cardJobTokens(el) {
 const CARD_LINE_NOISE = /立即沟通|继续沟通|打招呼|在线|刚刚活跃|今日活跃|昨日活跃|日内活跃|周内活跃|月内活跃|\d+\s*(?:分钟|小时|天|周|月)前?(?:活跃)?|[Kk]薪|薪[Kk]|元\/月|.BO.|应届|经验|学历|大专|本科|硕士|博士|全职|兼职|实习|招聘|急聘|猎头/i;
 // 薪资形（行兜底排除用）：区间薪（15-25K / 6000-8000元 / 1.2-1.3万）、「20K以上」、日薪（140-150元/天）
 const SALARY_LINE_RE = /\d+(?:\.\d+)?\s*[-–~]\s*\d+(?:\.\d+)?\s*[Kk万]|\d+\s*[Kk]\s*以上|\d+\s*[-–~]\s*\d+\s*元/;
+
+/**
+ * 卡片文本里的薪资兜底提取正则（**浏览期唯一权威**，全部薪资兜底一律引用本常量）。
+ *
+ * 2026-10-01 收口：这条正则在改造前被**内联复制 5 处**（详情页 scopeText 兜底 / 列表有效性
+ * 判定 `hasSalaryText` / `cardFields` / `extractJobFromCardOnly` / 详情页 `salaryMatch`）。
+ * 修复猎聘「薪资解析错误」时只改了其中一处，其余三处继续用旧形态 → 静默不一致。
+ * 现集中为单一常量，新增薪资形态只改这里。
+ *
+ * 关键修复点（旧形态的两个缺陷，均已在真机 DOM 取证）：
+ *   ① **`元` 分支缺少「/天·/月·/时·/年」单位后缀** —— 旧写法 `\d+[-–~]\d+元` 是**贪婪截断**，
+ *      猎聘卡片「200-300元/天」被截成 `200-300元`。日期口径标签（`/天`）就此丢失，
+ *      下游 `parseSalaryRange` 判不出 daily → 按月薪 K 值处理 200-300 → 触发 `high > 200`
+ *      → ÷1000 → 月薪 0.2K → 等效日薪 9.1 元/天 → 被「最低日薪 100 元/天」硬拦截。
+ *      界面表现为「页面上明明是 200-300 元/天，日志却报日薪约 9.1 元/天」。
+ *   ② **不支持单值**（`500元/天` / `250元/天` / `20K以上` 的 `元` 形态）—— 旧写法要求
+ *      必须有区间连字符，猎聘大量单值日薪卡因此完全取不到薪资。
+ *   ③ **不支持「高段带单位、低段无单位」的混合单位区间**（`8千-1.2万` 旧写法只吃到 `8千`）——
+ *      改为区间两段各自独立带单位（单位可选），与 jobMatch 的单位继承口径解耦。
+ *   保留 K/k/万 两分支的原有形态（BOSS/智联/51job 既有行为，不得回归）。
+ *
+ * 设计约束：
+ *   - 两个分支：**区间分支**（低段[单位可选] - 高段[单位必填]）优先，**单值分支**兜底。
+ *     单位放在**区间之后**是关键 —— 若让单位先于区间（`数值 单位 [- 数值 单位]`），
+ *     正则回溯时会从低段单位处收尾，把 `200-300元/天` 截成 `300元/天`（实测踩过）。
+ *     区间分支要求高段**必须**带单位，低段单位可省，故 `8千-1.2万`、`200-300元/天`
+ *     均整段命中，而 `1-49人`（高段无单位）不会误命中。
+ *   - 单值分支同样要求带单位 —— 纯数字（`5000`）不视为薪资，避免「1-49人」类噪声。
+ *   - `元` 单位后缀限定 天/日/月/时/年，避免「5000人」被截成「5000元」。
+ *   - 单位后加 `(?![人项岁个年月日天款次])` 负向断言 —— 拦住「6千以下（筛选栏）」这类
+ *     带比较词的数量描述；真实薪资串后面不会紧跟这些量词，故该断言只减噪声、不减能力。
+ */
+const SALARY_TEXT_RE = /(\d+(?:\.\d+)?)(?:\s*([Kk]|万|千|元(?:\s*\/\s*(?:天|日|月|时|年))?))?\s*[-–~至到]\s*(\d+(?:\.\d+)?)\s*([Kk]|万|千|元(?:\s*\/\s*(?:天|日|月|时|年))?)\s*(以上|以下)?(?![人项岁个款次])|(\d+(?:\.\d+)?)\s*([Kk]|万|千|元(?:\s*\/\s*(?:天|日|月|时|年))?)\s*(以上|以下)?(?![人项岁个款次])/;
+
+/**
+ * 从任意文本里提取薪资串（引用 {@link SALARY_TEXT_RE}）。取不到返回 ''。
+ * @param {string} text
+ * @returns {string}
+ */
+function matchSalaryText(text) {
+  return String(text == null ? '' : text).match(SALARY_TEXT_RE)?.[0] || '';
+}
 
 // 地名识别（修复「公司 Top」把地点误当公司名）：
 // BOSS 卡片地点字段形如「城市·区·街道」（如「深圳·南山区·科技园」），与部分公司名容器
@@ -1703,13 +2173,49 @@ function cardIdentity(card) {
   return { title: title.slice(0, 80), company: cleanCompanyName(company), href, raw: textOf(card).slice(0, 500) };
 }
 
+// ===== 平台专属「结构型」字段提取 =====
+// 为什么不能只靠 CSS 选择器：猎聘薪资节点的类名是 CSS Modules 哈希（如 `_40108qjbMk`，每次发布都变），
+// 而它与标题容器 `jobTitleBox` 是**兄弟关系**（没有语义类名可供 `[class*=...]` 命中）。
+// 真机取证（2026-10-01，用户提供的 /zhaopin/ 搜索页源码）：
+//   <div class="_40108bQFNb">                     ← 行容器
+//     <div class="_40108ZRrnt jobTitleBox">…</div> ← 标题+【城市】
+//     <span class="_40108qjbMk">200-300元/天</span> ← 薪资（哈希类名，无稳定钩子）
+//   </div>
+// 因此猎聘的薪资只能按**结构**取：定位 `jobTitleBox` → 在其父节点下找首个
+// 「非标题容器且文本整体符合薪资形态」的兄弟元素。该口径在真机 29/29 全命中。
+// 注意：**不要**改用 `[class*="ellipsis-1"]` 兜底 —— 它在本卡内会先命中**标题**（同为 ellipsis-1），
+// 把岗位名当成薪资返回（同卡片内已有 3 个 ellipsis-1：标题 / 城市 / 公司名）。
+/**
+ * 薪资串整体形态（用于兄弟节点筛选，必须整串匹配，避免把「16-20万」筛选栏等噪声纳入）。
+ * 允许尾部「·13薪 / ×15薪 / 15薪」年终奖月数（猎聘常见「8-15k·15薪」）——
+ * 下游 `parseSalaryRange` 会先剥掉 `1[2-8]薪` 再解析，故这里放行不会污染数字。
+ */
+const SALARY_WHOLE_RE = /^\s*\d+(?:\.\d+)?(?:\s*[-–~至到]\s*\d+(?:\.\d+)?)?\s*(?:[Kk]|万|千|元(?:\s*\/\s*(?:天|日|月|时|年))?)\s*(?:以上|以下)?\s*(?:[·*＊xX×]\s*1[2-8]\s*薪)?\s*$/;
+
+/** 平台专属结构型薪资提取（当前仅猎聘需要；其余平台走选择器 + 文本兜底） */
+function platformSalaryFromCard(card) {
+  if (PLATFORM !== 'liepin') return '';
+  const titleBox = card.querySelector('[class*="jobTitleBox"]');
+  const row = titleBox?.parentElement;
+  if (!row) return '';
+  for (const child of Array.from(row.children)) {
+    if (child === titleBox) continue;
+    if (child.querySelector?.('[class*="jobTitleBox"]')) continue;
+    const t = textOf(child);
+    if (t && SALARY_WHOLE_RE.test(t)) return decodeSalaryDigits(t);
+  }
+  return '';
+}
+
 // 卡片结构化字段（对齐 AI-BossJob-plus recordApplication 的多选择器候选）：
 // 薪资 / 地区 / 经验学历 / HR 职位 / HR 活跃度 / 猎头标记
 function cardFields(card) {
   const cardText = textOf(card);
-  // 薪资：选择器命中值优先；兜底正则在「还原混淆后的文本」上跑，否则 PUA 数字永远匹配不到
-  const salary = decodeSalaryDigits(pickFromCard(card, FIELD_SELECTORS.salary))
-    || decodeSalaryDigits(cardText).match(/\d+(?:\.\d+)?[-–~]\d+(?:\.\d+)?[Kk万]|\d+[Kk]以上|\d+[-–~]\d+元/)?.[0]
+  // 薪资：① 平台专属结构提取（猎聘）→ ② 选择器命中值 → ③ 整卡文本正则兜底
+  // 兜底正则在「还原混淆后的文本」上跑，否则 PUA 数字永远匹配不到
+  const salary = platformSalaryFromCard(card)
+    || decodeSalaryDigits(pickFromCard(card, FIELD_SELECTORS.salary))
+    || matchSalaryText(decodeSalaryDigits(cardText))
     || '';
   // 地点：选择器 → 平台特有形态（猎聘卡片把城市写成「【北京】」）→ 城市名正则
   const location = pickFromCard(card, FIELD_SELECTORS.location)
@@ -1885,7 +2391,7 @@ function extractJobDetail(card) {
   const recruiterName = textOf(root?.querySelector('[class*="boss-name"],[class*="bossName"],[class*="recruiter-name"],[class*="job-boss"] [class*="name"],[class*="boss-info"] [class*="name"]'))
     || '';
   // 薪资兜底正则同样跑在「还原混淆后」的文本上；title/company 亦做还原，避免把 PUA 写进库
-  const salaryMatch = decodeSalaryDigits(`${cardText} ${detailText}`).match(/\d+(?:\.\d+)?[-–~]\d+(?:\.\d+)?[Kk万]|\d+[Kk]以上|\d+[-–~]\d+元/);
+  const salaryMatch = matchSalaryText(decodeSalaryDigits(`${cardText} ${detailText}`));
   const token = jobUrlToken(anchor?.href || '');
   const jobId = token || dataJobId || '';
   const realUrl = anchor?.href
@@ -1897,7 +2403,7 @@ function extractJobDetail(card) {
   return {
     title: decodeSalaryDigits(title),
     company,
-    salary: fields.salary || salaryMatch?.[0] || '',
+    salary: fields.salary || salaryMatch || '',
     location: fields.location,
     description: cleanJobDescription(decodeSalaryDigits(detailText)).slice(0, 9000),
     cardText: decodeSalaryDigits(cardText).slice(0, 1000),
@@ -2015,7 +2521,11 @@ async function visualCollect(opts = {}) {
   collectCtl.paused = false;
   collectCtl.stopped = false;
   collectCtl.settleMs = Math.max(400, Number(opts.settleMs) || 1200);
-  const settleMs = collectCtl.settleMs;
+  // 审查 #10：采集节奏（ms/步）必须**每步实时读取** —— collect-control 的 speed（加速/减速）
+  // 写的是 collectCtl.settleMs，而原实现把它在采集开始时捕获为函数内局部常量，
+  // 运行期没有任何读者改读 collectCtl.settleMs → 用户点「加速/减速」是**死控制**。
+  // 现改为每次使用都取当前值（保留 400ms 下限，与 collect-control 的写入口径一致）。
+  const settleMsNow = () => Math.max(400, Number(collectCtl.settleMs) || 1200);
   // 单次采集兜底上限（对齐 job-claw-main discoveryLimit:0 软上限；本机 1000 兜底防止失控）
   const maxJobs = Math.max(1, Number(opts.maxJobs) || 1000);
   // 设置约束（由宿主 Workbench 传入，见 Settings → 搜索采集范围控制）：
@@ -2060,7 +2570,7 @@ async function visualCollect(opts = {}) {
       }
     } catch (e) {
       notify('collect-progress', { phase: 'collect-error', index: 0, total: 0, processed: 0, maxJobs, status: `列表查询异常：${String(e?.message || e).slice(0, 80)}` });
-      await sleep(settleMs);
+      await sleep(settleMsNow());
     }
     // 登录墙优先于「选择器失效」判定：页面已加载完、等了足够久仍一张岗位卡都没有，
     // 且命中登录特征（URL 命中登录页 或「页面无任何岗位链接 + 正文命中登录文案」）
@@ -2101,7 +2611,7 @@ async function visualCollect(opts = {}) {
       const state = String(document.readyState);
       notify('collect-progress', { phase: 'waiting-list', index: 0, total: 0, processed: 0, maxJobs, status: `等待列表渲染（已 ${waitedSec}s / 上限 ${Math.round(listTimeoutMs / 1000)}s，页面 ${state}）` });
     }
-    await sleep(settleMs * 0.6);
+    await sleep(settleMsNow() * 0.6);
   }
 
     while (!collectCtl.stopped) {
@@ -2111,13 +2621,13 @@ async function visualCollect(opts = {}) {
     let cards = [];
     try { cards = collectCards(); } catch (e) {
       notify('collect-progress', { phase: 'collect-error', index, total: 0, processed: processedCount, maxJobs, status: `卡片查询异常：${String(e?.message || e).slice(0, 80)}` });
-      await sleep(settleMs);
+      await sleep(settleMsNow());
       continue;
     }
     if (cards.length === 0 && processedCount === 0 && emptyRounds === 0) {
       // 首轮 cards 仍为空（列表还没出来）— 主动滚一次促加载（关闭自动下拉时仅等待列表渲染，不滚动）
-      if (autoScroll) await scrollJobListLoadMore(processed, { settleMs });
-      await sleep(settleMs * 1.5);
+      if (autoScroll) await scrollJobListLoadMore(processed, { settleMs: settleMsNow() });
+      await sleep(settleMsNow() * 1.5);
       emptyRounds += 1;
       continue;
     }
@@ -2147,7 +2657,7 @@ async function visualCollect(opts = {}) {
         break;
       }
       scrollRoundsUsed += 1;
-      const { grew, atBottom } = await scrollJobListLoadMore(processed, { settleMs });
+      const { grew, atBottom } = await scrollJobListLoadMore(processed, { settleMs: settleMsNow() });
       if (atBottom) {
         // 已滚到列表物理底部且无新卡 → 本搜索组合加载完毕，直接停止
         notify('collect-progress', { phase: 'list-bottom', index, total: cards.length, processed: processedCount, maxJobs, status: '已滚动到列表底部，加载完毕' });
@@ -2176,16 +2686,16 @@ async function visualCollect(opts = {}) {
     }
     // 1) 平滑滚动到卡片并高亮（可视化动画）
     await smoothScrollIntoView(card);
-    highlightElement(card, settleMs);
+    highlightElement(card, settleMsNow());
     notify('collect-progress', { phase: 'scroll', index, total: cards.length, processed: processedCount, maxJobs, title: identity.title, company: identity.company, status: '滚动中' });
-    await sleep(settleMs);
+    await sleep(settleMsNow());
     if (collectCtl.stopped) break;
     await waitWhilePaused();
     if (processedCount >= maxJobs) break;
     // 2) 点击展开详情
     notify('collect-progress', { phase: 'click', index, total: cards.length, processed: processedCount, maxJobs, title: identity.title, company: identity.company, status: '点击中' });
     await openCardDetail(card);
-    await sleep(Math.max(500, Math.round(settleMs * 0.6)));
+    await sleep(Math.max(500, Math.round(settleMsNow() * 0.6)));
     if (collectCtl.stopped) break;
     // 3) 提取岗位信息并回传
     const job = extractJobDetail(card);
@@ -2222,7 +2732,7 @@ async function visualCollect(opts = {}) {
     } catch (e) {}
     processedCount += 1;
     notify('collect-progress', { phase: 'done', index, total: cards.length, processed: processedCount, maxJobs, title: job.title, company: job.company, status: '完成', job });
-    await sleep(settleMs);
+    await sleep(settleMsNow());
   }
   notify('collect-done', { listUrl: location.href, processed: processedCount, total: processedCount, maxJobs });
 }
@@ -2232,6 +2742,24 @@ async function visualCollect(opts = {}) {
 // 输出当前页面：元素统计 / 列表容器候选 / li·a 样本 / 详情面板 / 「查看更多信息」按钮候选，
 // 供上层（Workbench 日志区）复制给开发者对齐新版选择器。
 function domDump() {
+  // 聊天诊断只报告布尔值/计数/缩放，不输出收件人、消息正文或账号信息。
+  // 此检查不聚焦、不输入、不点击，便于真实页面验收前定位发送前置条件。
+  try {
+    const input = chatInput();
+    const context = input && createChatSendContext(input);
+    const button = context && sendButton(input, { context, allowDisabled: true });
+    const center = button && elementCenter(button);
+    const hit = center && document.elementFromPoint(center.x, center.y);
+    const clickPoint = button && visibleClickPoint(button);
+    notify('apply-stage', { stage: 'log', message: '文字发送只读检查：' + JSON.stringify({
+      input: Boolean(input), panel: Boolean(context), session: Boolean(context && currentChatSendInput(context)),
+      button: Boolean(button), enabled: Boolean(button && !isDisabledish(button)),
+      hit: Boolean(button && hit && (hit === button || button.contains(hit))),
+      clickablePoint: Boolean(clickPoint),
+      zoom: webFrame.getZoomFactor(), focus: document.hasFocus(),
+      ownMessages: context ? ownMessageEntries(context).length : 0,
+    }) });
+  } catch { notify('apply-stage', { stage: 'log', message: '文字发送只读检查失败（未执行任何输入或点击）' }); }
   const clamp = (v, n) => String(v || '').slice(0, n);
   const out = {
     time: Date.now(),
@@ -2325,13 +2853,17 @@ function pageStatusData() {
     counts,
     listRootCls: listRoot ? String(listRoot.className || '').slice(0, 120) : '',
     skeleton: all('[class*="skeleton"], [class*="loading"], [class*="spinner"], [class*="placeholder"]').length,
-    // 登录墙 = 原文案命中（含安全验证/验证码等风控文案）或「平台登录墙特征 且 无任何岗位链接」
-    loginWall: /请登录|扫码登录|安全验证|验证码/.test(bodyText.slice(0, 500)) || loginWallDetected(),
+    // L-8：登录墙判定统一走 loginWallDetected()（URL 特征 或「正文命中登录文案 且 一条岗位链接都没有」）。
+    // 原实现额外用「正文前 500 字含 请登录/扫码登录/安全验证/验证码」直接置位 ——
+    // 风控类岗位 JD 里出现「验证码/安全验证」字样会被误报为登录墙。
+    loginWall: loginWallDetected(),
   };
 }
 
 // ===== 只读页面抽取（page-read）：供外部 agent 探索当前页面 =====
-// 返回 URL/标题/正文文本（截断）+ 列表卡摘要（仅当前页面，不滚动、不点击）。
+// 返回 URL/标题/正文文本（截断）+ 列表卡摘要 + 正文链接（仅当前页面，不滚动、不点击）。
+// links（2026-11-16 新增，企业背调 B 层用）：搜索结果页的「来源」要靠锚文本与 href 对上，
+// 正文文本里没有 href。只取可见锚点、限长、去重，且**不请求**任何地址 —— 纯 DOM 读。
 function pageReadData() {
   let cards = [];
   let count = 0;
@@ -2354,6 +2886,24 @@ function pageReadData() {
     bodyText: (() => { try { return String(document.body?.innerText || document.body?.textContent || '').slice(0, 12000); } catch { return ''; } })(),
     listCards: cards,
     listCount: count,
+    links: (() => {
+      try {
+        const out = [];
+        const seen = new Set();
+        for (const a of document.querySelectorAll('a[href]')) {
+          const href = String(a.href || '');
+          if (!/^https?:\/\//i.test(href) || href.length > 400) continue;
+          const text = String(a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+          // 短文本（「更多」「首页」）与重复链接对「结果来源」没有价值，直接丢掉
+          if (text.length < 6) continue;
+          if (seen.has(href)) continue;
+          seen.add(href);
+          out.push({ text, href });
+          if (out.length >= 80) break;
+        }
+        return out;
+      } catch { return []; }
+    })(),
   };
 }
 
@@ -2371,6 +2921,7 @@ async function prefillGreetingText(rawText) {
       return { ok: false, reason: btn ? '沟通入口需要跳转页面，请在新页面重试' : '未找到聊天输入框，且无「立即沟通」入口（岗位可能已下架）' };
     }
     input.scrollIntoView({ block: 'center' });
+    await trustedHoverElement(input); // 同 domApply：先真实移动光标再输入
     focusEditableScoped(input);
     const ins = await trustedInput('insertText', greeting);
     if (!ins.ok) return { ok: false, reason: '真实输入写入失败（无权限/输入框失焦），请人工发送' };
@@ -2396,11 +2947,16 @@ async function prefillGreetingText(rawText) {
 //
 // 详情 JD 的来源（2026-09 更正，原注释称「由 Camoufox 补齐」不准确：camoufox/platforms/
 // {liepin,zhaopin,job51}.py 只做列表级，无详情段）：
-//   · 智联 zhaopin → **本文件 `enrichZhaopinJobDetail()`**：按卡片链接里的 number 调平台自己的
+//   · 智联 zhaopin → **本文件 `enrichJobDetail()`**：按卡片链接里的 number 调平台自己的
 //     职位详情接口（`platform-adapters.cjs` 的 zhaopinJobDetailUrl，口径与出处见该处注释），
 //     取回完整 JD / 技能 / 福利 / HR → 覆盖「整卡文本」兜底。接口不可用或熔断时保留卡片文本兜底，
 //     **绝不因为补 JD 失败而丢岗位**。
-//   · 猎聘 / 前程无忧 → 目前只有列表字段（各自详情接口需另行实测，勿照抄智联参数）。
+//   · 猎聘 liepin → **本文件 `enrichJobDetail()`**：猎聘详情页是**服务端渲染**（JD 直接写在 HTML 里），
+//     按卡片链接的 jobId 取同源详情页 `/job/<id>.shtml` 的 HTML，交给
+//     `platform-adapters.cjs::parseLiepinJobDetailHtml()` 解析（口径与真机证据见该处注释）。
+//     为什么不用 JSON 接口：猎聘详情页本身就是 SSR，JD/HR/薪资/属性全在同一份 HTML 里，
+//     没有独立的匿名详情 JSON 接口可用（2026-10-01 真机取证）；同源 fetch 与页面自身导航同权限。
+//   · 前程无忧 → 目前只有列表字段（详情页形态需另行实测，勿照抄猎聘/智联参数）。
 // 复用件：collectCtl（暂停/继续/停止/调速）/ smoothScrollIntoView / highlightElement /
 //         scrollJobListLoadMore / collectCards / cardIdentity / cardFields / collectCardKey。
 
@@ -2434,14 +2990,8 @@ function extractJobFromCardOnly(card) {
   const identity = cardIdentity(card);
   const fields = cardFields(card);
   const url = String(identity.href || '');
-  let jobId = '';
-  try {
-    const m = url.match(/jobId=(\d+)/i)
-      || url.match(/jobdetail\/([^/?#]+)/i)
-      || url.match(/\/job\/(\d+)/i)
-      || url.match(/jobs\.51job\.com\/([^/?#]+)/i);
-    if (m) jobId = m[1];
-  } catch {}
+  // jobId 统一走适配表唯一权威（猎聘 /job/xxx.shtml 与 SEO /a/xxx.shtml 都能取到并去后缀）
+  let jobId = ADAPTERS.jobIdFromUrl(url);
   // 无真实 URL 也无平台 jobId（仅智联新增会出现）→ 用稳定哈希兜底，保证入库去重不失效
   if (!jobId && !url) jobId = stableFallbackJobId(fields, identity);
   return {
@@ -2453,7 +3003,8 @@ function extractJobFromCardOnly(card) {
     hrActive: fields.hrActive || '',
     isHeadhunter: Boolean(fields.isHeadhunter),
     // 列表级采集拿不到详情 JD：先用卡片文本占位（AI 评分至少不吃空），
-    // 随后由 enrichZhaopinJobDetail() 按平台详情接口覆盖为真实 JD（智联）。
+    // 随后由 enrichJobDetail() 按平台详情通道覆盖为真实 JD
+    // （智联 → JSON 详情接口；猎聘 → 同源详情页 HTML）。
     description: textOf(card).slice(0, 800),
     // 列表级采集拿不到真实详情 URL 时（智联无 jobdetail 锚点变体且主进程注解未命中），
     // 落空字符串、不回退搜索页 URL：搜索页 URL 会让同批不同岗位折叠成同一链接
@@ -2467,43 +3018,60 @@ function extractJobFromCardOnly(card) {
   };
 }
 
-// ===== 智联 JD 补齐：列表卡不带 JD，按 number 调平台自身职位详情接口（口径见 platform-adapters.cjs）=====
+// ===== 非 BOSS 平台 JD 补齐：列表卡不带 JD，按卡片链接取平台自己的详情（口径见 platform-adapters.cjs）=====
+// 两档获取策略（`PLATFORM_DETAIL_API_FILL` 声明哪些平台走本通道）：
+//   智联 zhaopin → 同源**JSON 详情接口**（跨域，需接口自身 CORS 放行）；
+//   猎聘 liepin  → 同源**详情页 HTML**（SSR，无跨域问题，由 parseLiepinJobDetailHtml 解析）。
 // 三档护栏（缺一不可）：
 //   ① 单次采集总量上限 —— 防 maxJobsPerRun=1000 时打出上千请求；
-//   ② 连续失败熔断 —— 接口变更 / 需登录 / 被限流时立即停手并回传诊断，避免「每卡等满超时」把采集拖成假死；
+//   ② 连续失败熔断 —— 接口/页面变更、需登录、被限流时立即停手并回传诊断，避免「每卡等满超时」把采集拖成假死；
 //   ③ 单请求超时 + 请求间隔抖动 —— 不并发打接口、不瞬间连发。
 // 失败一律**不改 job**：保留卡片文本兜底，岗位照常入库（宁缺 JD 不丢岗位）。
-const ZP_JD_MAX_PER_RUN = 300;
-const ZP_JD_TIMEOUT_MS = 12000;
-const ZP_JD_FAIL_STREAK_LIMIT = 4;
-const ZP_JD_GAP_MS = 180; // 请求间隔基准（另加 0~220ms 抖动）
+const JD_FILL_MAX_PER_RUN = 300;
+const JD_FILL_TIMEOUT_MS = 12000;
+const JD_FILL_FAIL_STREAK_LIMIT = 4;
+const JD_FILL_GAP_MS = 180; // 请求间隔基准（另加 0~220ms 抖动）
 // JD 入库长度上限：与 BOSS 详情级采集同量级（本文件详情提取 slice(0, 9000)），
 // 避免长 JD × 大量岗位把 bossclaw-data 的 localStorage 配额撑爆（persistSafe 会降级丢写）。
-const ZP_JD_DESCRIPTION_MAX = 9000;
-const zpJdState = { attempted: 0, filled: 0, failed: 0, skipped: 0, streak: 0, stopped: '', lastError: '' };
+const JD_FILL_DESCRIPTION_MAX = 9000;
+const jdFillState = { attempted: 0, filled: 0, failed: 0, skipped: 0, streak: 0, stopped: '', lastError: '' };
+/** 当前平台的补 JD 通道（'zhaopin-json' | 'liepin-html'）；能力表未声明的平台为 '' */
+const JD_FILL_CHANNEL = PLATFORM === 'zhaopin' ? 'zhaopin-json' : (PLATFORM === 'liepin' ? 'liepin-html' : '');
 
-function resetZpJdState() {
-  zpJdState.attempted = 0;
-  zpJdState.filled = 0;
-  zpJdState.failed = 0;
-  zpJdState.skipped = 0;
-  zpJdState.streak = 0;
-  zpJdState.stopped = '';
-  zpJdState.lastError = '';
+function resetJdFillState() {
+  jdFillState.attempted = 0;
+  jdFillState.filled = 0;
+  jdFillState.failed = 0;
+  jdFillState.skipped = 0;
+  jdFillState.streak = 0;
+  jdFillState.stopped = '';
+  jdFillState.lastError = '';
 }
 
-/** 单次请求详情接口：超时 / 网络异常 / 非 2xx 一律返回 {ok:false,error}，**绝不抛出** */
-async function fetchZhaopinJobDetail(number) {
+/** 平台显示名（诊断文案用；勿在正文里散写平台名） */
+const PLATFORM_LABEL = { boss: 'BOSS直聘', liepin: '猎聘', zhaopin: '智联', job51: '前程无忧' }[PLATFORM] || PLATFORM;
+
+/**
+ * 单次请求（**绝不抛出**）：超时 / 网络异常 / 非 2xx 一律返回 {ok:false,error}。
+ * @param {string} url
+ * @param {'json'|'text'} as
+ * @returns {Promise<{ok:boolean, data?:any, error?:string}>}
+ */
+async function fetchDetailSource(url, as) {
   const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
-  const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, ZP_JD_TIMEOUT_MS) : null;
+  const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch {} }, JD_FILL_TIMEOUT_MS) : null;
   try {
-    const res = await fetch(ADAPTERS.zhaopinJobDetailUrl(number), {
+    const res = await fetch(url, {
       method: 'GET',
-      headers: { Accept: 'application/json' },
+      // 猎聘详情页 HTML：显式声明接受 HTML，且带 Referer 让平台按「站内跳转」处理（与点卡打开同源同权限）
+      headers: as === 'text'
+        ? { Accept: 'text/html,application/xhtml+xml' }
+        : { Accept: 'application/json' },
+      credentials: 'include', // 同源带 Cookie：未登录时平台会回登录页 → 我们按「解析无 JD」静默跳过，不绕登录
       signal: ctrl ? ctrl.signal : undefined,
     });
     if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
-    return { ok: true, data: await res.json() };
+    return { ok: true, data: as === 'text' ? await res.text() : await res.json() };
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e) };
   } finally {
@@ -2512,78 +3080,107 @@ async function fetchZhaopinJobDetail(number) {
 }
 
 /** 熔断 / 达上限时的一次性诊断回传（带上当前岗位，避免实时面板标题被清空） */
-function notifyZpJdStop(reason, job) {
+function notifyJdFillStop(reason, job) {
   notify('collect-progress', {
     phase: 'jd-enrich-warn',
-    index: zpJdState.attempted,
+    index: jdFillState.attempted,
     title: String(job?.title || ''),
     company: String(job?.company || ''),
-    status: `智联 JD 补齐已停止：${reason}（已补 ${zpJdState.filled} 条 / 尝试 ${zpJdState.attempted} 条，岗位仍按卡片文本入库）`,
+    status: `${PLATFORM_LABEL} JD 补齐已停止：${reason}（已补 ${jdFillState.filled} 条 / 尝试 ${jdFillState.attempted} 条，岗位仍按卡片文本入库）`,
   });
 }
 
 /**
- * 按岗位补齐 JD 与详情字段（智联）。返回是否补到 JD。
+ * 按岗位补齐 JD 与详情字段。返回是否补到 JD。
  * 只对能力表声明的平台生效（`ADAPTERS.PLATFORM_DETAIL_API_FILL`），调用点不硬编码平台名。
+ * @param {object} job extractJobFromCardOnly 产出的卡片岗位对象（就地覆盖 description 等字段）
+ * @returns {Promise<boolean>}
  */
-async function enrichZhaopinJobDetail(job) {
+async function enrichJobDetail(job) {
   if (!job || !ADAPTERS.PLATFORM_DETAIL_API_FILL[PLATFORM]) return false;
-  if (zpJdState.stopped || collectCtl.stopped) return false;
-  if (zpJdState.attempted >= ZP_JD_MAX_PER_RUN) {
-    zpJdState.stopped = `本次已达单次补齐上限 ${ZP_JD_MAX_PER_RUN} 条`;
-    notifyZpJdStop(zpJdState.stopped, job);
+  if (jdFillState.stopped || collectCtl.stopped) return false;
+  if (jdFillState.attempted >= JD_FILL_MAX_PER_RUN) {
+    jdFillState.stopped = `本次已达单次补齐上限 ${JD_FILL_MAX_PER_RUN} 条`;
+    notifyJdFillStop(jdFillState.stopped, job);
     return false;
   }
-  const number = ADAPTERS.zhaopinJobNumber(job.jobId || job.url);
-  if (!number) { zpJdState.skipped += 1; return false; } // 无平台岗位号（哈希兜底身份）→ 保持卡片文本
-  zpJdState.attempted += 1;
-  const r = await fetchZhaopinJobDetail(number);
+
+  // ① 按平台取「详情来源 URL」与解析器；取不到岗位号（哈希兜底身份）→ 保持卡片文本
+  let url = '';
+  if (JD_FILL_CHANNEL === 'zhaopin-json') {
+    const number = ADAPTERS.zhaopinJobNumber(job.jobId || job.url);
+    if (!number) { jdFillState.skipped += 1; return false; }
+    url = ADAPTERS.zhaopinJobDetailUrl(number);
+  } else if (JD_FILL_CHANNEL === 'liepin-html') {
+    url = ADAPTERS.liepinJobDetailUrl(job.jobId || job.url);
+    if (!url) { jdFillState.skipped += 1; return false; }
+  } else {
+    return false;
+  }
+
+  jdFillState.attempted += 1;
+  const as = JD_FILL_CHANNEL === 'liepin-html' ? 'text' : 'json';
+  const r = await fetchDetailSource(url, as);
   if (!r.ok) {
-    zpJdState.failed += 1;
-    zpJdState.streak += 1;
-    zpJdState.lastError = r.error;
-    if (zpJdState.streak >= ZP_JD_FAIL_STREAK_LIMIT) {
-      zpJdState.stopped = `连续 ${zpJdState.streak} 次请求失败（最后错误：${zpJdState.lastError}）`;
-      notifyZpJdStop(zpJdState.stopped, job);
+    jdFillState.failed += 1;
+    jdFillState.streak += 1;
+    jdFillState.lastError = r.error;
+    if (jdFillState.streak >= JD_FILL_FAIL_STREAK_LIMIT) {
+      jdFillState.stopped = `连续 ${jdFillState.streak} 次请求失败（最后错误：${jdFillState.lastError}）`;
+      notifyJdFillStop(jdFillState.stopped, job);
     }
     return false;
   }
-  zpJdState.streak = 0;
-  await sleep(ZP_JD_GAP_MS + Math.random() * 220);
-  const parsed = ADAPTERS.parseZhaopinJobDetail(r.data);
+  // 注意：请求成功**不代表这批 JD 可用** —— 连续失败计数只在「载荷可解析」后才重置（见下方）。
+  await sleep(JD_FILL_GAP_MS + Math.random() * 220);
+
+  const parsed = JD_FILL_CHANNEL === 'liepin-html'
+    ? ADAPTERS.parseLiepinJobDetailHtml(r.data)
+    : ADAPTERS.parseZhaopinJobDetail(r.data);
   if (!parsed) {
-    // 接口通了但载荷结构不符（平台改版）→ 计入失败，连续多次即熔断，不让它静默空转
-    zpJdState.failed += 1;
-    zpJdState.lastError = '详情接口载荷结构不符（无 detailedPosition）';
-    if (zpJdState.failed >= ZP_JD_FAIL_STREAK_LIMIT && !zpJdState.stopped) {
-      zpJdState.stopped = `连续 ${zpJdState.failed} 次载荷不可解析`;
-      notifyZpJdStop(zpJdState.stopped, job);
+    // 通道通了但载荷结构不符（平台改版 / 登录墙 HTML / 该岗位没写 JD）→ 计入失败，连续多次即熔断
+    jdFillState.failed += 1;
+    jdFillState.streak += 1;
+    jdFillState.lastError = JD_FILL_CHANNEL === 'liepin-html'
+      ? '详情页未解析出 JD 正文（页面结构变更或登录墙）'
+      : '详情接口载荷结构不符（无 detailedPosition）';
+    // 熔断判据必须是**连续**失败（streak），不能用累计 failed —— 否则一批岗位里零星几条
+    // 「平台本就没写 JD / 载荷缺字段」就足以把整批补 JD 提前熔断，后续岗位 JD 全缺（见审查 #80）。
+    if (jdFillState.streak >= JD_FILL_FAIL_STREAK_LIMIT && !jdFillState.stopped) {
+      jdFillState.stopped = `连续 ${jdFillState.streak} 次载荷不可解析`;
+      notifyJdFillStop(jdFillState.stopped, job);
     }
     return false;
   }
-  const jd = String(parsed.description || '').trim().slice(0, ZP_JD_DESCRIPTION_MAX);
+  jdFillState.streak = 0; // 载荷成功解析：重置连续失败计数
+  const jd = String(parsed.description || '').trim().slice(0, JD_FILL_DESCRIPTION_MAX);
   if (jd) job.description = jd;
-  // 技能 / 福利 / HR 只在接口确实给到时覆盖（DOM 侧这些字段本为空，不存在覆盖掉有效值的风险）
-  if (parsed.skills.length) job.skills = parsed.skills;
-  if (parsed.welfare.length) job.welfare = parsed.welfare;
+  // 技能 / 福利 / HR 只在详情确实给到时覆盖（DOM 侧这些字段本为空，不存在覆盖掉有效值的风险）
+  // 标题 / 薪资 / 地点同理：只在详情页给到**非空**值时覆盖（列表卡这三项已由 DOM 稳定抓到，
+  // 详情页是更权威的来源但缺值时不回吐空串，避免把卡片已抓到的好值打回空）。
+  if (Array.isArray(parsed.skills) && parsed.skills.length) job.skills = parsed.skills;
+  if (Array.isArray(parsed.welfare) && parsed.welfare.length) job.welfare = parsed.welfare;
   if (parsed.recruiterName) job.recruiterName = parsed.recruiterName;
   if (parsed.recruiterTitle) job.recruiterTitle = parsed.recruiterTitle;
-  if (!jd) { zpJdState.skipped += 1; return false; } // 该岗位本身没写 JD → 保留卡片文本兜底
-  zpJdState.filled += 1;
+  if (parsed.salary) job.salary = parsed.salary;
+  if (parsed.location) job.location = parsed.location;
+  if (parsed.company) job.company = parsed.company;
+  if (!jd) { jdFillState.skipped += 1; return false; } // 该岗位本身没写 JD → 保留卡片文本兜底
+  jdFillState.filled += 1;
   return true;
 }
 
 /** 采集收尾时汇总补 JD 结果（但凡有尝试或「无岗位号」都会回传，避免「这批岗位缺 JD」无解释） */
-function reportZpJdSummary() {
-  if (!zpJdState.attempted && !zpJdState.skipped) return;
+function reportJdFillSummary() {
+  if (!jdFillState.attempted && !jdFillState.skipped) return;
   notify('collect-progress', {
     phase: 'jd-enrich-summary',
-    index: zpJdState.attempted,
-    status: `智联 JD 补齐：成功 ${zpJdState.filled} 条 / 尝试 ${zpJdState.attempted} 条`
-      + (zpJdState.failed ? `，失败 ${zpJdState.failed} 条` : '')
+    index: jdFillState.attempted,
+    status: `${PLATFORM_LABEL} JD 补齐：成功 ${jdFillState.filled} 条 / 尝试 ${jdFillState.attempted} 条`
+      + (jdFillState.failed ? `，失败 ${jdFillState.failed} 条` : '')
       // skipped = 卡片拿不到岗位号（如主进程注解未覆盖的滚动加载卡）或该岗位本身没写 JD
-      + (zpJdState.skipped ? `，未补 ${zpJdState.skipped} 条（卡片无岗位号或岗位无 JD，已按卡片文本入库）` : '')
-      + (zpJdState.stopped ? `｜已提前停止：${zpJdState.stopped}` : ''),
+      + (jdFillState.skipped ? `，未补 ${jdFillState.skipped} 条（卡片无岗位号或岗位无 JD，已按卡片文本入库）` : '')
+      + (jdFillState.stopped ? `｜已提前停止：${jdFillState.stopped}` : ''),
   });
 }
 
@@ -2591,7 +3188,11 @@ async function visualCollectListOnly(opts = {}) {
   collectCtl.paused = false;
   collectCtl.stopped = false;
   collectCtl.settleMs = Math.max(400, Number(opts.settleMs) || 1200);
-  const settleMs = collectCtl.settleMs;
+  // 审查 #10：采集节奏（ms/步）必须**每步实时读取** —— collect-control 的 speed（加速/减速）
+  // 写的是 collectCtl.settleMs，而原实现把它在采集开始时捕获为函数内局部常量，
+  // 运行期没有任何读者改读 collectCtl.settleMs → 用户点「加速/减速」是**死控制**。
+  // 现改为每次使用都取当前值（保留 400ms 下限，与 collect-control 的写入口径一致）。
+  const settleMsNow = () => Math.max(400, Number(collectCtl.settleMs) || 1200);
   const maxJobs = Math.max(1, Number(opts.maxJobs) || 1000);
   const autoScroll = opts.autoScroll !== false;
   const scrollRounds = Math.max(0, Number(opts.scrollRounds) || 0);
@@ -2600,7 +3201,7 @@ async function visualCollectListOnly(opts = {}) {
   const processed = new Set();
   let processedCount = 0;
   let emptyRounds = 0;
-  resetZpJdState(); // 每轮采集重置 JD 补齐计数 / 熔断状态
+  resetJdFillState(); // 每轮采集重置 JD 补齐计数 / 熔断状态
   notify('collect-progress', { phase: 'start', index: 0, total: 0, maxJobs, platform: PLATFORM, status: `准备中（${PLATFORM} · 列表级采集）` });
 
   // 一次性 DOM 诊断（与 BOSS 同口径，选择器取自适配表）
@@ -2633,7 +3234,7 @@ async function visualCollectListOnly(opts = {}) {
     if (initialWaitCount === 1 || initialWaitCount % 4 === 0) {
       notify('collect-progress', { phase: 'waiting-list', index: 0, total: 0, processed: 0, maxJobs, status: `等待列表渲染（已 ${Math.round((Date.now() - listWaitStartedAt) / 1000)}s / 上限 ${Math.round(listTimeoutMs / 1000)}s，页面 ${String(document.readyState)}）` });
     }
-    await sleep(settleMs * 0.6);
+    await sleep(settleMsNow() * 0.6);
   }
 
   // 主循环：逐卡滚动 + 高亮 + 回传（**不点击卡片** —— 见函数头注释）
@@ -2645,7 +3246,7 @@ async function visualCollectListOnly(opts = {}) {
     let cards = [];
     try { cards = collectCards(); } catch (e) {
       notify('collect-progress', { phase: 'collect-error', index: 0, total: 0, processed: processedCount, maxJobs, status: `卡片查询异常：${String(e?.message || e).slice(0, 80)}` });
-      await sleep(settleMs);
+      await sleep(settleMsNow());
       continue;
     }
     const pending = cards.filter((c) => {
@@ -2663,7 +3264,7 @@ async function visualCollectListOnly(opts = {}) {
         break;
       }
       scrollRoundsUsed += 1;
-      const { grew, atBottom } = await scrollJobListLoadMore(processed, { settleMs });
+      const { grew, atBottom } = await scrollJobListLoadMore(processed, { settleMs: settleMsNow() });
       if (atBottom) {
         notify('collect-progress', { phase: 'list-bottom', index: 0, total: cards.length, processed: processedCount, maxJobs, status: '已滚动到列表底部，加载完毕' });
         break;
@@ -2681,19 +3282,20 @@ async function visualCollectListOnly(opts = {}) {
     processed.add(key);
     const identity = cardIdentity(card);
     await smoothScrollIntoView(card);
-    highlightElement(card, settleMs);
+    highlightElement(card, settleMsNow());
     notify('collect-progress', { phase: 'scroll', index: processedCount + 1, total: cards.length, processed: processedCount, maxJobs, title: identity.title, company: identity.company, status: '滚动中' });
-    await sleep(settleMs);
+    await sleep(settleMsNow());
     if (collectCtl.stopped) break;
     await waitWhilePaused();
     const job = extractJobFromCardOnly(card);
-    // 补齐详情 JD / 技能 / 福利 / HR（智联经平台详情接口；其它平台能力表未声明 → 直接返回 false）
-    await enrichZhaopinJobDetail(job);
+    // 补齐详情 JD / 技能 / 福利 / HR（智联经 JSON 详情接口、猎聘经同源详情页 HTML；
+    // 其它平台能力表未声明 → 直接返回 false）
+    await enrichJobDetail(job);
     processedCount += 1;
     notify('collect-progress', { phase: 'done', index: processedCount, total: cards.length, processed: processedCount, maxJobs, title: job.title, company: job.company, status: '完成', job });
-    await sleep(settleMs);
+    await sleep(settleMsNow());
   }
-  reportZpJdSummary();
+  reportJdFillSummary();
   notify('collect-done', { listUrl: location.href, processed: processedCount, total: processedCount, maxJobs });
 }
 
@@ -2774,7 +3376,7 @@ ipcRenderer.on('webview-command', (_e, arg) => {
 
 // ===== 非 BOSS 平台投递（platform-apply）：猎聘/智联/51job 新标签页 DOM 投递 =====
 // 口径对齐 get_jobs / Auto-JobHunter / AgentMesh-JobAgent（多项目交叉验证）：
-//  - liepin greetAuto：点「聊一聊」即触发 App 预设招呼语（无需打字）；IM 会话打开=成功。
+//  - liepin chat：点「聊一聊」，输入并发送本岗位招呼语，确认新增本人文字消息后计成功。
 //  - zhaopin resume：点「投递」，投递弹层文本含「申请成功」=成功；「达到上限」→停。
 //  - job51 resume：点「投递」，成功弹层=成功；「需要到企业招聘平台单独申请」=站外网申→跳过。
 // 安全不变量：外部网申跳过、未确认不计成功、找不到目标→failed 交人工、绝不猜成功。
@@ -2834,7 +3436,18 @@ async function zhaopinContinueChat(spec) {
 }
 
 async function platformApply(args = {}) {
-  const { seq, job = {}, externalApplyHints = [] } = args;
+  if (platformApply.busy) {
+    if (String(platformApply.activeSeq) === String(args.seq)) return; // 同一 IPC 重复到达，保留首个流程的终态。
+    notify('platform-apply-result', { seq: args.seq, ok: false, stage: 'failed', needsReview: true, error: '本页面已有投递流程，已忽略重复请求，请人工核对' });
+    return;
+  }
+  platformApply.busy = true;
+  platformApply.activeSeq = args.seq;
+  try { await platformApplyOnce(args); } finally { platformApply.busy = false; }
+}
+
+async function platformApplyOnce(args = {}) {
+  const { seq, job = {}, externalApplyHints = [], greeting = '' } = args;
   const platform = String(args.platform || PLATFORM || 'boss');
   const fail = (stage, extra = {}) => notify('platform-apply-result', Object.assign({ seq, ok: false, stage }, extra));
   const ok = (extra = {}) => notify('platform-apply-result', Object.assign({ seq, ok: true, stage: 'success', method: 'dom' }, extra));
@@ -2851,21 +3464,203 @@ async function platformApply(args = {}) {
     }
 
     if (platform === 'liepin') {
-      // 已沟通/已投递过 → 直接跳过（不再点，避免重复打扰同一 HR）
-      if (findPlatformAction(['.ant-btn-round', '[class*="btn"]', '[class*="chat"]', 'button', 'a'], ['已沟通', '已投递', '聊过', '已招满'])) {
-        return fail('skip', { message: '该岗位已沟通/已投递过，跳过' });
+      // ===== 猎聘详情页：打开目标会话 → 填写本岗位招呼语 → 发送 → 核对新增消息 =====
+      //
+      // 2026-10-01 真机源码取证（用户提供的 `岗位.txt` 详情页 HTML），纠正三处旧口径：
+      //   ① **「聊一聊」是 <a> 不是 <button>** —— 主操作区
+      //      `section.job-apply-container .job-apply-operate .apply-box > a.btn-main[data-selector="chat-chat"]`；
+      //      右侧招聘者卡片还有一处分身
+      //      `div.chat-btn-box[data-nick="recruiter-info-box-chat-btn"] > button.ant-btn-round[data-selector="chat-chat"] > span`。
+      //      旧写法靠 `labelHit(['聊一聊'])` 扫 `[class*="btn"]/button/a` —— 能命中但对 `a.btn-main`
+      //      依赖泛化 `'a'` 兜底，且「已投递态」判断同样泛化 → 会把导航/页脚任意含这些词的链接误判。
+      //   ② **IM 就绪信号命名不符**：真机是 `#im-c-entry` / `.im-ui-chat-modal-container` /
+      //      `.im-ui-basic-entry`（侧栏「我的沟通」），**不存在** `.__im_basic__*`（旧写法是从
+      //      别的项目抄来的命名，在本站恒不命中 ⇒ 点完必走 15s 超时判 failed）。
+      //   ③ **风控判定不能只用行内正则**：旧写法 `/安全验证|验证码|请完成验证/` 对整页正文扫描，
+      //      岗位描述里出现这些词（风控/反欺诈岗）会被误判成风控并暂停引擎 —— 与智联分支同一教训，
+      //      这里对齐智联：**只在风控类容器内**判定。
+      //
+      // 窗口打开或按钮变「继续聊」只表示会话就绪，不能证明招呼语已发送。
+      const safeGreeting = normalizeLiepinText(greeting);
+      if (safeGreeting.length < 8) return fail('failed', { error: '猎聘招呼语为空或过短，已停止发送' });
+      const btnSelectors = [
+        // ① 主操作区「聊一聊」（真机 `<a class="btn-main" data-selector="chat-chat">`）
+        'a.btn-main[data-selector="chat-chat"]',
+        '.job-apply-operate .apply-box a.btn-main',
+        '.job-apply-operate a[data-selector="chat-chat"]',
+        // ② 招聘者卡片「聊一聊」（真机 `<button ... data-selector="chat-chat"><span>聊一聊</span></button>`）
+        'div.chat-btn-box[data-nick="recruiter-info-box-chat-btn"] button',
+        '.chat-btn-box button[data-selector="chat-chat"]',
+        // ③ 语义兜底（data-selector 是站点埋点属性，跨模板稳定）
+        '[data-selector="chat-chat"]',
+        // ④ 历史兜底：文案命中（顺序最后，避免泛化选择器抢在专用选择器之前）
+        '.ant-btn-round',
+        '.chat-btn-box button',
+      ];
+      const chatLabels = ['聊一聊', '继续聊', '继续沟通'];
+
+      // 已沟通/已投递态：**只认操作区自身的按钮态**（专用选择器 + 精确文案），
+      // 不做全页链接扫描（页脚/导航含「已投递」等词的链接会误判整条跳过）。
+      const appliedSelectors = [
+        'a.btn-main[data-selector="chat-chat"]',
+        '.job-apply-operate .apply-box a.btn-main',
+        '.job-apply-operate a[data-selector="chat-chat"]',
+        '.chat-btn-box button',
+      ];
+      const appliedLabels = ['已沟通', '已投递', '聊过了', '已招满', '继续沟通', '继续聊'];
+      const readAppliedState = () =>
+        all(appliedSelectors.join(', ')).find((el) => visible(el) && ADAPTERS.labelExactHit(textOf(el), appliedLabels))
+        || null;
+      const previousApplied = readAppliedState();
+      if (previousApplied && !ADAPTERS.labelExactHit(textOf(previousApplied), ['继续聊', '继续沟通'])) {
+        return fail('skip', { message: '该岗位已沟通/已投递过，跳过（不重复打扰同一 HR）' });
       }
-      const btn = findPlatformAction(['.ant-btn-round', '[class*="btn"]', '[class*="chat"]', 'button', 'a'], ['聊一聊']);
-      if (!btn) return fail('failed', { error: '未找到「聊一聊」按钮（岗位可能已下架/非招聘中）' });
-      notify('apply-stage', { stage: 'send_message', label: '平台自动打招呼', platform });
+
+      // 阻断面板归类（本地判定，不依赖适配表 —— `PLATFORM_APPLY_SPEC` 当前只有 zhaopin 条目，
+      // 调 `classifyBlockedText('liepin', …)` 因取不到 riskTexts 恒返回 'blocked'）：
+      //   risk  = 安全验证 / 人机校验 / 操作频繁（必须整体暂停交人工）
+      //   login = 登录墙（立即收口本平台，不逐个白试）
+      const LIEPIN_RISK_TEXTS = ['安全验证', '请完成验证', '验证码', '行为异常', '操作频繁', '访问受限'];
+      const LIEPIN_LOGIN_TEXTS = ['请先登录', '登录后', '立即登录', '扫码登录', '账号登录', '登录/注册'];
+      const classifyLiepinBlock = (t) => {
+        if (LIEPIN_RISK_TEXTS.some((k) => t.includes(k))) return 'risk';
+        if (LIEPIN_LOGIN_TEXTS.some((k) => t.includes(k)) || /登录|注册/.test(t)) return 'login';
+        return 'blocked';
+      };
+
+      const btn = previousApplied || findPlatformAction(btnSelectors, chatLabels);
+      if (!btn) {
+        // 找不到入口时先看是不是被登录墙/风控拦了，给出可定位的原因而不是笼统「未找到」
+        const blockEl = firstVisible([
+          '[class*="login"]', '[class*="passport"]', '[class*="captcha"]',
+          '[class*="geetest"]', '[class*="waf"]', '[class*="verify"]',
+        ]);
+        if (blockEl) {
+          const t = PLATFORM_NORM(textOf(blockEl)).slice(0, 120);
+          const kind = classifyLiepinBlock(t);
+          if (kind === 'risk') return fail('risk', { code: 35, message: `检测到安全验证/风控提示：${t || '请人工完成'}，已暂停` });
+          if (kind === 'login') return fail('login', { message: '猎聘未登录（详情页要求登录后才能沟通），请先在猎聘标签页完成登录' });
+          return fail('failed', { error: `详情页被阻断：${t || '平台未渲染沟通入口'}，请人工核对` });
+        }
+        // 兜底：登录墙可能没有专用容器类名 —— 用与适配表同源的登录墙文案做一次页面级判定
+        // （仅在**找不到沟通入口**时才做，正常详情页正文里不会出现这些词，避免误判）
+        const pageText = PLATFORM_NORM(document.body ? document.body.innerText : '').slice(0, 4000);
+        if (ADAPTERS.LOGIN_WALL_TEXT_RE && ADAPTERS.LOGIN_WALL_TEXT_RE.test(pageText)) {
+          return fail('login', { message: '猎聘未登录（页面出现登录提示且无沟通入口），请先在猎聘标签页完成登录' });
+        }
+        return fail('failed', { error: '未找到「聊一聊」入口（岗位可能已下架/非招聘中/详情页未加载完成）' });
+      }
+
+      const imBefore = readLiepinImState(document);
+      notify('apply-stage', { stage: 'open_chat', label: '打开目标沟通窗口', platform });
       await clickElement(btn);
-      // 成功 = IM 会话窗口打开（猎聘 App 预设招呼语自动发送，无需本机输入）
-      const okIm = await waitFor(() => $('.__im_basic__header-wrap, [class*="__im_basic__"]'), 15000, '猎聘 IM 会话窗口');
-      if (!okIm) {
-        if (/安全验证|验证码|请完成验证/.test(String(document.body?.innerText || ''))) return fail('risk', { code: 35, message: '检测到安全验证，已暂停，请人工完成' });
-        return fail('failed', { error: '点击「聊一聊」后 IM 会话未打开，请人工核对' });
+
+      // 就绪 = 唯一的新会话且有真实可编辑输入框。
+      // #im-c-entry 可能只是无尺寸挂载点；im-ui-basic-entry 是「我的沟通」入口。
+      // 检查可见会话/输入区的点击前后变化，避免漏掉后面的窗口，也不把侧栏入口算成功。
+      // 风控容器范围收窄：只在弹层/提示/校验类容器内查风控文案，不扫岗位描述正文。
+      const RISK_SCOPE = [
+        '.ant-modal', '.ant-drawer', '.ant-message', '.ant-notification',
+        '[class*="dialog"]', '[class*="toast"]',
+        '[class*="risk"]', '[class*="warning"]', '[class*="alert"]',
+        '[class*="verify"]', '[class*="captcha"]', '[class*="waf"]', '[class*="geetest"]',
+      ];
+      const riskHit = () => {
+        if (/pwaf_challenge|security-check|captcha/i.test(location.href)) return true;
+        if (firstVisible(['[class*="geetest"]', '[class*="waf"]', '[id*="captcha"]', '[class*="captcha"]'])) return true;
+        for (const el of all(RISK_SCOPE.join(', '))) {
+          if (!visible(el)) continue;
+          if (el.querySelector('textarea, [contenteditable]')) continue; // 编辑器/聊天正文里的业务词不是验证提示。
+          const t = PLATFORM_NORM(textOf(el));
+          if (t && ['安全验证', '请完成验证', '验证码', '行为异常', '操作频繁'].some((k) => t.includes(k))) return true;
+        }
+        return false;
+      };
+      const imReady = await waitFor(() => {
+        if (riskHit()) return 'risk';
+        return findNewLiepinConversation(imBefore, readLiepinImState(document));
+      }, 15000, '猎聘 IM 会话窗口');
+      if (imReady === 'risk') {
+        return fail('risk', { code: 35, message: '点击「聊一聊」后检测到安全验证/风控提示，已暂停，请人工完成' });
       }
-      return ok({ method: 'dom' });
+      if (!imReady) {
+        const state = readLiepinImState(document);
+        return fail('failed', {
+          needsReview: true,
+          imDiagnostic: { roots: state.rootsSeen, conversations: state.widgets.length, inaccessibleFrames: state.inaccessibleFrames },
+          error: '点击「聊一聊」后未能确认目标会话，已保留页面并暂停投递，请人工核对聊天窗口及按钮状态',
+        });
+      }
+      const target = imReady;
+      const currentTarget = () => readLiepinImState(document).widgets.find((widget) => widget.element === target.element && widget.heading === target.heading && widget.editor);
+      const beforeSend = readLiepinDeliveryState(target, safeGreeting);
+      if (beforeSend.matching.length) return fail('skip', { message: '目标会话已发送与当前工作台文案相同的消息，已跳过重复发送' });
+      if (beforeSend.incoming.length) return fail('skip', { message: '目标会话已有招聘方回复，请在聊天中继续沟通，已跳过首次招呼语' });
+      if (beforeSend.nonDefaultOutgoing.length) return fail('skip', { message: '目标会话已有平台默认句以外的本人消息，已跳过重复发送' });
+      if (beforeSend.editorText) {
+        return fail('failed', { needsReview: true, error: '猎聘输入框已有未发送草稿，已保留，请人工核对后发送' });
+      }
+      const input = target.editor;
+      input.scrollIntoView({ block: 'center' });
+      input.focus();
+      // 使用编辑器自身的 document/window，支持同源 iframe 与开放 shadow root。
+      if (input.matches('[contenteditable]')) {
+        const doc = input.ownerDocument, selection = doc.defaultView.getSelection();
+        const range = doc.createRange(); range.selectNodeContents(input); range.collapse(false);
+        selection.removeAllRanges(); selection.addRange(range);
+      }
+      notify('apply-stage', { stage: 'fill_message', label: '填写猎聘招呼语', platform });
+      if (riskHit()) return fail('risk', { code: 35, message: '猎聘输入前出现安全验证，已暂停' });
+      if (!currentTarget()) return fail('failed', { needsReview: true, error: '猎聘目标会话已变化，已停止发送，请人工核对' });
+      const inserted = await trustedInput('insertText', safeGreeting);
+      if (!inserted.ok) return fail('failed', { needsReview: true, error: '猎聘招呼语真实输入失败，已保留窗口，请人工核对' });
+      try {
+        input.dispatchEvent(new input.ownerDocument.defaultView.Event('input', { bubbles: true }));
+        input.dispatchEvent(new input.ownerDocument.defaultView.Event('change', { bubbles: true }));
+      } catch {}
+      let lastWritten = null;
+      let readinessReadError = false;
+      const written = await waitFor(() => {
+        if (riskHit()) return 'risk';
+        const current = currentTarget();
+        if (!current) return 'changed';
+        try {
+          const state = readLiepinDeliveryState(current, safeGreeting);
+          lastWritten = state;
+          return state.editorText === safeGreeting && state.sendButton ? state : null;
+        } catch { readinessReadError = true; return null; }
+      }, 5000, '猎聘招呼语和发送按钮就绪');
+      if (written === 'risk') return fail('risk', { code: 35, message: '猎聘输入后出现安全验证，已暂停' });
+      if (written === 'changed') return fail('failed', { needsReview: true, error: '猎聘目标会话已变化，已保留草稿并停止发送，请人工核对' });
+      if (!written) {
+        const expectedChars = safeGreeting.length;
+        const editorChars = lastWritten?.editorText.length ?? 0;
+        const textMatches = lastWritten?.editorText === safeGreeting;
+        const readiness = lastWritten?.readiness || {};
+        const details = `官方按钮 ${readiness.officialSendButtons || 0}，禁用 ${readiness.disabledOfficialSendButtons || 0}，可用 ${readiness.sendCandidates || 0}`;
+        const error = !lastWritten ? '猎聘读取输入框或发送按钮失败，已保留草稿，请人工核对'
+          : !textMatches ? `猎聘输入文字核对失败（应为 ${expectedChars} 字，读到 ${editorChars} 字），已保留草稿，请人工核对`
+            : `猎聘文案已填入，但未找到唯一可用的发送按钮（${details}），已保留草稿，请人工核对`;
+        return fail('failed', { needsReview: true, error,
+          imDiagnostic: { expectedChars, editorChars, textMatches, readinessReadError, ...readiness } });
+      }
+      if (written.matching.length || written.incoming.length || written.nonDefaultOutgoing.length) {
+        return fail('failed', { needsReview: true, error: '填写期间会话出现当前文案或实际沟通消息，已保留草稿，请人工核对' });
+      }
+      const messageBefore = new Set(written.matching);
+      notify('apply-stage', { stage: 'send_message', label: '发送猎聘招呼语', platform });
+      await clickElement(written.sendButton);
+      notify('apply-stage', { stage: 'verify_message', label: '确认猎聘文字消息', platform });
+      const sent = await waitFor(() => {
+        if (riskHit()) return 'risk';
+        const current = currentTarget();
+        if (!current) return 'changed';
+        const state = readLiepinDeliveryState(current, safeGreeting);
+        return !state.editorText && state.matching.some((el) => !messageBefore.has(el)) ? 'sent' : null;
+      }, 10000, '猎聘招呼语文字确认');
+      if (sent === 'risk') return fail('risk', { code: 35, message: '猎聘发送后出现安全验证，已暂停，请人工核对' });
+      if (sent !== 'sent') return fail('failed', { needsReview: true, error: '猎聘招呼语发送结果未确认，已保留窗口并暂停，请人工核对；程序不会自动重发' });
+      return ok({ method: 'dom', greetingConfirmed: true });
     }
 
     if (platform === 'zhaopin') {
@@ -3053,11 +3848,22 @@ ipcRenderer.on('ui-eval', (_e, arg) => {
   let res = { error: '未知操作' };
   try {
     if (op === 'query') {
-      res = { elements: uvSnapshot(selector, arg.limit), count: uvSnapshot(selector, arg.limit).length };
+      // 审查 2026-10-21 C-4：旧实现把 uvSnapshot 调了两次（两次全 DOM 扫描），
+      // 且 count 取的是「截断后」的数量。这里只扫一次：count 明确表示「本次返回的条数」
+      // （受 limit 上限约束，不是页面上的元素总数）。
+      const elements = uvSnapshot(selector, arg.limit);
+      res = { elements, count: elements.length };
     } else if (op === 'click') {
       const el = uvPick(selector, label, index);
       if (!el) res = { error: '未命中元素' };
-      else { try { (typeof el.click === 'function') ? el.click() : el.dispatchEvent(new MouseEvent('click', { bubbles: true })); } catch (e) { res = { error: '点击失败: ' + (e && e.message) }; } res = { ok: true }; }
+      else {
+        // L-6：原实现把 `res = { ok: true }` 写在 catch 之后，点击抛错也会被覆盖成成功 →
+        // 失败被静默上报为成功。成功路径才置 ok。
+        try {
+          (typeof el.click === 'function') ? el.click() : el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          res = { ok: true };
+        } catch (e) { res = { error: '点击失败: ' + (e && e.message) }; }
+      }
     } else if (op === 'type') {
       const el = uvPick(selector, label, index);
       if (!el) res = { error: '未命中输入框' };

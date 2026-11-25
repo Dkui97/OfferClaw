@@ -65,6 +65,7 @@ interface Props {
   onJobExtracted?: (job: any) => void;
   onJobListExtracted?: (data: { url: string; count: number; jobs: any[] }) => void;
   onApplyStage?: (stage: string, data: any, tabId?: string) => void;
+  onLoginState?: (data: any) => void;
   onCollectProgress?: (data: any) => void;
   onCollectDone?: (data: any) => void;
   apiRef?: React.MutableRefObject<WebviewApi | null>;
@@ -92,7 +93,7 @@ const makeTab = (url: string, title = ''): TabState => ({
 });
 
 export default function CloakView(props: Props) {
-  const { onNavigate, onJoinTask, onJobExtracted, onJobListExtracted, onApplyStage, onCollectProgress, onCollectDone, apiRef } = props;
+  const { onNavigate, onJoinTask, onJobExtracted, onJobListExtracted, onApplyStage, onLoginState, onCollectProgress, onCollectDone, apiRef } = props;
   // ===== 多平台：按设置页启用状态生成可选列表 =====
   const config0 = useSettingsStore((s) => s.config);
   const enabledPlatforms = useMemo<JobPlatform[]>(
@@ -111,10 +112,12 @@ export default function CloakView(props: Props) {
   const { tabs, activeId } = state;
 
   // P18：回调 ref（与 BrowserView 一致）。订阅仅挂载一次，事件回调经 ref 取最新 props，避免 stale closure。
-  const callbacksRef = useRef({ onNavigate, onJoinTask, onJobExtracted, onJobListExtracted, onApplyStage, onCollectProgress, onCollectDone });
+  const callbacksRef = useRef({ onNavigate, onJoinTask, onJobExtracted, onJobListExtracted, onApplyStage, onLoginState, onCollectProgress, onCollectDone });
   useEffect(() => {
-    callbacksRef.current = { onNavigate, onJoinTask, onJobExtracted, onJobListExtracted, onApplyStage, onCollectProgress, onCollectDone };
-  }, [onNavigate, onJoinTask, onJobExtracted, onJobListExtracted, onApplyStage, onCollectProgress, onCollectDone]);
+    callbacksRef.current = { onNavigate, onJoinTask, onJobExtracted, onJobListExtracted, onApplyStage, onLoginState, onCollectProgress, onCollectDone };
+  }, [onNavigate, onJoinTask, onJobExtracted, onJobListExtracted, onApplyStage, onLoginState, onCollectProgress, onCollectDone]);
+  // 页面状态探测：cloak 通道没有 ipcRenderer.invoke，用「一次性事件 + probeId」做请求/响应配对
+  const probeResolversRef = useRef(new Map<string, (v: any) => void>());
 
   const [engine, setEngine] = useState<{ ready: boolean; binary: any; lastError: string | null }>({
     ready: false,
@@ -128,6 +131,10 @@ export default function CloakView(props: Props) {
   useEffect(() => { engineRef.current = engine; }, [engine]);
   // 启动锁：异步入口并发去重（多按钮同时点只触发一次 cloakStart）
   const startingRef = useRef(false);
+  // 挂载标记（审查 #91）：轮询等待类循环必须在组件卸载后立即退出 ——
+  // 否则切页/关标签后仍会继续每 200ms 轮询（最长 90s），并向已卸载组件写状态。
+  const aliveRef = useRef(true);
+  useEffect(() => () => { aliveRef.current = false; }, []);
 
   // ===== 核心封装：所有用户级入口都先调它 =====
   // 行为：
@@ -166,7 +173,7 @@ export default function CloakView(props: Props) {
     // —— 阶段 2：启动 / 重启 ——
     if (startingRef.current) {
       const t0 = Date.now();
-      while (Date.now() - t0 < ENGINE_BOOT_TIMEOUT_MS) {
+      while (aliveRef.current && Date.now() - t0 < ENGINE_BOOT_TIMEOUT_MS) {
         await new Promise((r) => setTimeout(r, 200));
         if (engineRef.current.ready) return true;
         if (engineRef.current.lastError && !startingRef.current) return false;
@@ -239,6 +246,15 @@ export default function CloakView(props: Props) {
       if (channel === 'job-extracted') callbacksRef.current.onJobExtracted?.(payload);
       if (channel === 'job-list-extracted') callbacksRef.current.onJobListExtracted?.(payload);
       if (channel === 'apply-stage') callbacksRef.current.onApplyStage?.(payload?.stage, payload, tabId);
+      if (channel === 'login-state') callbacksRef.current.onLoginState?.(payload);
+      if (channel === 'page-status-result') {
+        const probeId = String(payload?.probeId || '');
+        const resolve = probeResolversRef.current.get(probeId);
+        if (resolve) {
+          probeResolversRef.current.delete(probeId);
+          resolve(payload);
+        }
+      }
       if (channel === 'collect-progress') callbacksRef.current.onCollectProgress?.(payload);
       if (channel === 'collect-done') callbacksRef.current.onCollectDone?.(payload);
     });
@@ -255,8 +271,8 @@ export default function CloakView(props: Props) {
         setStarting(false);
       }
     });
-    return () => { off(); offStatus && offStatus(); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => { off(); offStatus?.(); };
+     
   }, []);
 
   const activeIdRef = useRef(activeId);
@@ -284,12 +300,12 @@ export default function CloakView(props: Props) {
 
   const activeTab = tabs.find((t) => t.id === activeId) || tabs[0];
 
-  // 白名单拦截：非招聘平台网址不允许在内置隐身浏览器访问，可转系统浏览器
+  // 白名单拦截：非白名单网址不允许在内置隐身浏览器访问，可转系统浏览器
   const confirmOpenExternal = useCallback((url: string) => {
     const host = (() => { try { return new URL(url).hostname; } catch { return url; } })();
     Modal.confirm({
-      title: '该网址不在招聘平台白名单内',
-      content: `「${host}」不在白名单中。内置浏览器仅允许访问白名单内的招聘平台，可在系统浏览器中打开。`,
+      title: '该网址不在内置浏览器白名单内',
+      content: `「${host}」不在白名单中。内置浏览器仅允许访问白名单内的招聘平台与背调核查站点，可在系统浏览器中打开。`,
       okText: '在系统浏览器打开',
       cancelText: '取消',
       onOk: () => { e.openExternal?.(url); },
@@ -317,6 +333,11 @@ export default function CloakView(props: Props) {
   }, []);
 
   const closeTab = useCallback((id: string) => {
+    // 审查 #90：IPC（关闭 launcher 侧页面）**不得放在 setState 更新器内**——
+    //  ① React 18 StrictMode 会双调用更新器 → 同一页面被 close 两次；
+    //  ② 并发渲染下更新器可能被丢弃/重放 → 出现「页面关了但标签还在」（或反之）的 UI 与实际不一致。
+    // 改为：更新器保持**纯函数**（只算新状态），IPC 在更新器之外、以「已提交状态」的镜像 tabsRef 做前置判断。
+    if (!tabsRef.current.some((t) => t.id === id)) return;
     setState((s) => {
       const idx = s.tabs.findIndex((t) => t.id === id);
       if (idx < 0) return s;
@@ -327,10 +348,10 @@ export default function CloakView(props: Props) {
       }
       let activeId = s.activeId;
       if (activeId === id) activeId = tabs[Math.min(idx, tabs.length - 1)].id;
-      e.cloakPageClose?.(id);
-      syncedRef.current.delete(id);
       return { tabs, activeId };
     });
+    e.cloakPageClose?.(id);
+    syncedRef.current.delete(id);
   }, []);
 
   const closeTabById = useCallback((id?: string) => {
@@ -340,21 +361,27 @@ export default function CloakView(props: Props) {
 
   const createTab = useCallback((url: string, title: string, activate: boolean): string => {
     const tab = makeTab(url, title);
+    // 审查 #90：超限淘汰的「待关闭页面」必须先算出来（基于已提交状态镜像），
+    // IPC 放在更新器之外 —— 理由同 closeTab。
+    const cur = tabsRef.current;
+    let victimId: string | null = null;
+    if (cur.length >= MAX_TABS) {
+      const candidates = cur.filter((_, i) => i > 0);
+      if (candidates.length > 0) {
+        victimId = candidates.reduce((a, b) => (a.lastUsed <= b.lastUsed ? a : b)).id;
+      }
+    }
     setState((s) => {
       let tabs = s.tabs;
-      if (tabs.length >= MAX_TABS) {
-        const candidates = tabs.filter((_, i) => i > 0);
-        if (candidates.length > 0) {
-          const victim = candidates.reduce((a, b) => (a.lastUsed <= b.lastUsed ? a : b));
-          tabs = tabs.filter((t) => t.id !== victim.id);
-          e.cloakPageClose?.(victim.id);
-          syncedRef.current.delete(victim.id);
-        }
-      }
+      if (victimId) tabs = tabs.filter((t) => t.id !== victimId);
       let activeId = activate ? tab.id : s.activeId;
       if (!tabs.some((t) => t.id === activeId)) activeId = tabs[0]?.id ?? tab.id;
       return { tabs: [...tabs, tab], activeId };
     });
+    if (victimId) {
+      e.cloakPageClose?.(victimId);
+      syncedRef.current.delete(victimId);
+    }
     // 若引擎已就绪，立即推到 launcher；否则交给 syncedRef effect 在 ready 后兜底
     if (engineRef.current.ready) {
       e.cloakPageNew?.(tab.id, url).catch(() => {
@@ -400,6 +427,11 @@ export default function CloakView(props: Props) {
 
   const sendInTab = useCallback((id: string, channel: string, ...args: any[]) => {
     if (!id) return;
+    // M-43：CloakBrowser 通道只支持**单个 payload**（cloakPageSend(tabId, channel, payload)）。
+    // 与 BrowserView.sendInTab 的 `...args` 语义分叉会静默丢参，多参时显式告警以免无感截断。
+    if (args.length > 1) {
+      console.warn(`[CloakView] sendInTab('${channel}') 收到 ${args.length} 个参数，仅第一个会被转发（CloakBrowser 通道为单 payload）`);
+    }
     e.cloakPageSend?.(id, channel, args[0]);
   }, []);
 
@@ -418,8 +450,25 @@ export default function CloakView(props: Props) {
   const isPreloadReady = useCallback((id: string) => Boolean(id && tabsRef.current.some((t) => t.id === id) && typeof e.cloakPageSend === 'function'), []);
   // CloakBrowser 无独立加载遮罩：page 就绪统一由 isPreloadReady 表达
   const isLoading = useCallback((_id: string) => false, []);
-  // CloakBrowser 无 preload 通道，无法探测页面就绪事实（宿主会据此跳过探测、只用 isPreloadReady）
-  const pageStatus = useCallback(async (_id?: string) => ({ error: 'cloak 通道不支持页面状态探测' }), []);
+  // CloakBrowser 通道没有 ipcRenderer.invoke：用 probeId + 一次性 page-status-result 事件做请求/响应。
+  // 探测字段与 webview.cjs 的 page-status 对齐（readyState / cards / bodyLen / url），
+  // 让宿主以「页面自身事实」判定就绪，而不是只能靠 isPreloadReady 猜。
+  const pageStatus = useCallback(async (id?: string) => {
+    const target = id || activeIdRef.current;
+    if (!target || !tabsRef.current.some((t) => t.id === target)) return { error: '目标标签页不存在' };
+    const probeId = `cloak_ps_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    return new Promise<any>((resolve) => {
+      const timer = window.setTimeout(() => {
+        probeResolversRef.current.delete(probeId);
+        resolve({ error: '页面状态探测超时（cloak 通道无响应）' });
+      }, 3000);
+      probeResolversRef.current.set(probeId, (payload: any) => {
+        window.clearTimeout(timer);
+        resolve(payload);
+      });
+      sendInTab(target, 'page-status-probe', { probeId });
+    });
+  }, [sendInTab]);
 
   useEffect(() => {
     if (apiRef) apiRef.current = {
